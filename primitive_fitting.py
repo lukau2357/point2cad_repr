@@ -1,34 +1,44 @@
 import torch
 import numpy as np
+import fitting_utils
+import time
+
 from scipy.optimize import minimize, least_squares
 from typing import Tuple, Optional, Dict
 
 def sqrt_guard(x, tol = 1e-6):
     return (max(x, tol)) ** 0.5
 
-def fit_plane(points: torch.Tensor):
-    c = points.mean(dim = 0)
-    X = points - c
+def fit_plane_numpy(points : np.ndarray):
+    start = time.time()
     
-    U, S, Vh = torch.linalg.svd(X, full_matrices = False)
+    c = points.mean(axis = 0)
+    X = points - c
+
+    U, S, Vh = np.linalg.svd(X, full_matrices = False)
     # Right eigenspace is 3x3
     # Normal vector of plane spanned by first two eigenvectors is exactly the third, reamining eigenvector!
     a = Vh[-1]
     d = a @ c
 
-    return a, d
+    end = time.time()
 
-def fit_plane_numpy(points : np.ndarray):
-    c = points.mean(axis = 0)
-    X = points - c
-
-    U, S, Vh = np.linalg.svd(X, full_matrices = False)
-    a = Vh[-1]
-    d = a @ c
-
-    return a, d
+    res = {
+        "surface_type": "plane",
+        "error": fitting_utils.plane_error(points, a, d),
+        "params": {
+            "a": a,
+            "d": d
+        },
+        "metadata": {
+            "fitting_time_seconds": end - start
+        }
+    }
+    
+    return res
 
 def fit_sphere_numpy(points: np.ndarray, rcond : float = 1e-5, sqrt_tol : float = 1e-6):
+    start = time.time()
     A = np.concatenate((2 * points, np.ones((points.shape[0], 1))), axis = 1)
     y = (points ** 2).sum(axis = 1)
     w, _, rank, _ = np.linalg.lstsq(A, y, rcond = rcond)
@@ -37,9 +47,23 @@ def fit_sphere_numpy(points: np.ndarray, rcond : float = 1e-5, sqrt_tol : float 
     radius = w[3] + (center ** 2).sum()
     radius = sqrt_guard(radius, tol = sqrt_tol)
 
-    return center, radius
+    end = time.time()
+    res = {
+        "surface_type": "sphere",
+        "error": fitting_utils.sphere_error(points, center, radius),
+        "params": {
+            "center": center,
+            "radius": radius
+        },
+        "metadata": {
+            "fitting_time_seconds": end - start
+        }
+    }
+
+    return res
 
 def fit_cylinder(data, guess_angles=None):
+    # TODO: Taken from original Point2CAD implementation just for comparison, will likely be removed!
     """Fit a list of data points to a cylinder surface. The algorithm implemented
     here is from David Eberly's paper "Fitting 3D Data with a Cylinder" from
     https://www.geometrictools.com/Documentation/CylinderFitting.pdf
@@ -127,6 +151,7 @@ def fit_cylinder(data, guess_angles=None):
 
         return np.sqrt(sum(np.dot(c - X, np.dot(P, c - X)) for X in Xs) / n)
 
+    start = time.time()
     Xs, t = preprocess_data(data)
 
     # Set the start points
@@ -150,8 +175,9 @@ def fit_cylinder(data, guess_angles=None):
             best_fit = fitted
 
     w = direction(best_fit.x[0], best_fit.x[1])
+    end = time.time()
 
-    return w, C(w, Xs) + t, r(w, Xs), best_fit.fun
+    return w, C(w, Xs) + t, r(w, Xs), best_fit.fun, end - start
 
 def fit_cylinder_optimized(data, guess_angles = None, sqrt_tol : float = 1e-6):
     """Optimized vectorized cylinder fitting. Based on Eberly's least squares cylinder fitting algorithm: https://www.geometrictools.com/Documentation/LeastSquaresFitting.pdf
@@ -168,7 +194,7 @@ def fit_cylinder_optimized(data, guess_angles = None, sqrt_tol : float = 1e-6):
     def preprocess_data(Xs_raw):
         """Convert to matrix form and center"""
         X = np.array(Xs_raw)  # n × 3 matrix
-        X_mean = X.mean(axis=0)
+        X_mean = X.mean(axis = 0)
         X_centered = X - X_mean
         return X_centered, X_mean
     
@@ -234,6 +260,7 @@ def fit_cylinder_optimized(data, guess_angles = None, sqrt_tol : float = 1e-6):
         perp_dist_sq = np.sum(d @ P * d, axis = 1).mean()
         return sqrt_guard(perp_dist_sq, tol = sqrt_tol)
 
+    start = time.time()
     X, t = preprocess_data(data)
     
     # Multiple initial points for better stability. Refine further perhaps...
@@ -255,41 +282,28 @@ def fit_cylinder_optimized(data, guess_angles = None, sqrt_tol : float = 1e-6):
             best_fit = fitted
     
     w = direction(best_fit.x[0], best_fit.x[1])
-    return w, C_vectorized(w, X) + t, r_vectorized(w, X), best_fit.fun, best_fit.nit
+    center = C_vectorized(w, X) + t
+    radius = r_vectorized(w, X)
+    end = time.time()
 
-def plane_error(points, a, d):
-    assert np.allclose(np.linalg.norm(a), 1, rtol = 1e-6)
+    res = {
+        "surface_type": "cylinder",
+        "error": fitting_utils.cylinder_error(data, center, w, radius),
+        "params": {
+            "a": w,
+            "center": center,
+            "radius": radius
+        },
+        "metadata": {
+            "best_fit": best_fit.fun, # Not actually least squares fitness, just reparametrized axis component.
+            "optimizer_iterations": best_fit.nit,
+            "fitting_time_seconds": end - start,
+            "optimizer_converged": best_fit.success
+        }
+    }
 
-    shifted = points - d
-    projections = shifted - np.dot(shifted, a) * a
-    projections += a * d
-    
-    return np.linalg.norm(projections - points).mean()
-
-def sphere_error(points, center, radius):
-    return np.abs(np.linalg.norm(points - center) - radius).mean()
-
-def cylinder_error(points, center, axis, radius):
-    assert np.allclose(np.linalg.norm(axis), 1, rtol = 1e-6)
-
-    shifted = points - center
-    orth_projection = shifted - np.dot(shifted, axis) * axis
-    orth_distance = np.linalg.norm(orth_projection)
-
-    return np.abs(orth_distance - radius).mean()
-
-def cone_error(points : np.ndarray, vertex: np.ndarray, axis: np.ndarray, theta: float):  
-    assert np.allclose(np.linalg.norm(axis), 1, rtol = 1e-6)
-     
-    d = points - vertex
-    t = d @ axis
-    
-    d_perp = d - t[:, np.newaxis] * axis
-    r_perp = np.linalg.norm(d_perp, axis = 1)
-    
-    distances = np.abs(r_perp * np.cos(theta) - np.abs(t) * np.sin(theta))
-    
-    return np.mean(distances)
+    # return w, C_vectorized(w, X) + t, r_vectorized(w, X), best_fit.fun, best_fit.nit
+    return res
 
 def cone_residuals(params: np.ndarray, points: np.ndarray) -> np.ndarray:
     # n = points.shape[0]
@@ -311,7 +325,8 @@ def cone_jacobian(params: np.ndarray, points: np.ndarray) -> np.ndarray:
     axis = params[1:4]
     vertex = params[4:7]
     
-    axis_unit = axis / np.linalg.norm(axis)
+    axis_norm = np.linalg.norm(axis)
+    axis_unit = axis / axis_norm
     
     n = len(points)
     J = np.zeros((n, 7))
@@ -319,11 +334,12 @@ def cone_jacobian(params: np.ndarray, points: np.ndarray) -> np.ndarray:
     d = points - vertex
     M = np.cos(theta)**2 * np.eye(3) - np.outer(axis_unit, axis_unit)
     
-    d_norm_sq = np.sum(d * d, axis = 1)
+    d_norm_sq = np.sum(d * d, axis=1)
     J[:, 0] = -np.sin(2 * theta) * d_norm_sq
-    
+
     axis_dot_d = d @ axis_unit
-    J[:, 1:4] = -2 * axis_dot_d[:, np.newaxis] * d
+    d_perp = d - axis_dot_d[:, np.newaxis] * axis_unit
+    J[:, 1:4] = (-2 * axis_dot_d[:, np.newaxis] * d_perp) / axis_norm
     
     M_d = d @ M.T
     J[:, 4:7] = -2 * M_d
@@ -331,11 +347,15 @@ def cone_jacobian(params: np.ndarray, points: np.ndarray) -> np.ndarray:
     return J
 
 def fit_cone(points: np.ndarray, initial_guess: Optional[np.ndarray] = None) -> Dict:
+    start = time.time()
+
     residual_fn = lambda p: cone_residuals(p, points)
     jacobian_fn = lambda p: cone_jacobian(p, points)
     
     if initial_guess is not None:
         initial_guesses = [initial_guess]
+
+    # TODO: Improve initial points, take a look at Eberly's paper.
     else:
         centroid = points.mean(axis = 0)
         
@@ -347,15 +367,18 @@ def fit_cone(points: np.ndarray, initial_guess: Optional[np.ndarray] = None) -> 
     
     best_result = None
     best_cost = np.inf
-    
+    lower_bounds = [0, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf]
+    upper_bounds = [np.pi / 2, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf]
+
     for x0 in initial_guesses:
         try:
             result = least_squares(
                 residual_fn,
                 x0,
                 jac = jacobian_fn,
-                method = "lm",
-                # ftol = 1e-10,
+                method = "trf",
+                bounds = (lower_bounds, upper_bounds),
+                ftol = 1e-10,
                 # xtol = 1e-10,
                 # gtol = 1e-10,
                 # max_nfev = 1000
@@ -366,30 +389,47 @@ def fit_cone(points: np.ndarray, initial_guess: Optional[np.ndarray] = None) -> 
                 best_result = result
         except:
             continue
+
+    end = time.time()
     
     if best_result is None:
         return {
-            "success": False,
-            "vertex": None,
-            "axis": None,
-            "theta": None,
-            "error": None
-        }
+        "surface_type": "cone",
+        "error": float("inf"),
+        "params": {
+            "a": np.zeros(3),
+            "v": np.zeros(3),
+            "theta": 0
+        },
+        "metadata": {
+            "fitting_time_seconds": end - start,
+            "best_fit": float("inf"),
+            "optimizer_converged": False,
+            "optimizer_iterations": float("inf") # this is just an approximation!
+            }
+        }   
     
     theta_opt = best_result.x[0]
     axis_opt = best_result.x[1:4]
     vertex_opt = best_result.x[4:7]
     
     axis_opt = axis_opt / np.linalg.norm(axis_opt)
-    theta_opt = np.clip(theta_opt, 0.0, np.pi / 2)
-    
-    return {
-        "success": True,
-        "vertex": vertex_opt,
-        "axis": axis_opt,
-        "theta": theta_opt,
-        "error": best_result.cost,
-        "iterations": best_result.nfev,
-        "optimality": best_result.optimality,
-        "error": cone_error(points, vertex_opt, axis_opt, theta_opt)
+    # theta_opt = np.clip(theta_opt, 0.0, np.pi / 2)
+
+    res = {
+        "surface_type": "cone",
+        "error": fitting_utils.cone_error(points, vertex_opt, axis_opt, theta_opt),
+        "params": {
+            "a": axis_opt,
+            "v": vertex_opt,
+            "theta": theta_opt
+        },
+        "metadata": {
+            "fitting_time_seconds": end - start,
+            "best_fit": best_result.cost,
+            "optimizer_converged": best_result.success,
+            "optimizer_iterations": best_result.nfev # this is just an approximation!
+        }
     }
+
+    return res

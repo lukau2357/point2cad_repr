@@ -4,14 +4,15 @@ import open3d as o3d
 import matplotlib.pyplot as plt
 import time
 import torch
+import fitting_utils
 
-from primitive_fitting import fit_plane, fit_plane_numpy, fit_sphere_numpy, fit_cylinder, fit_cylinder_optimized, fit_cone
+from primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder, fit_cylinder_optimized, fit_cone
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEVICE = "cpu"
 
 if __name__ == "__main__":
-    path = os.path.join("sample_clouds", "abc_00470.xyzc")
+    path = os.path.join("sample_clouds", "abc_00949.xyzc")
     data = np.loadtxt(path)
     points = data[:, :3]
     clusters = data[:, -1].astype(int)
@@ -32,43 +33,40 @@ if __name__ == "__main__":
 
     for cluster_id in unique_clusters:
         cluster = data[data[:, 3] == cluster_id][:, :3]
-        start_t = time.time()
+        print(f"Processing cluster with id {cluster_id}.")
         print(f"Number of points in the current cluster: {cluster.shape[0]}")
-        a_t, d_t = fit_plane(torch.tensor(cluster, device = DEVICE))
-        end_t = time.time()
 
-        start_np = time.time()
-        a_np, d_np = fit_plane_numpy(cluster)
-        end_np = time.time()
+        res_plane = fit_plane_numpy(cluster)
+        print(f"Time taken for plane fitting: {res_plane['metadata']['fitting_time_seconds']} seconds.")
+        print(f"Plane error: {res_plane['error']}")
 
-        time_t = end_t - start_t
-        time_np = end_np - start_np
+        res_sphere = fit_sphere_numpy(cluster)
+        print(f"Time taken for sphere fitting: {res_sphere['metadata']['fitting_time_seconds']} seconds.")
+        print(f"Sphere error: {res_sphere['error']}")
 
-        # print(f"Normal vectors norm difference: {np.linalg.norm(a_t.cpu().numpy() - a_np)}")
-        # print(f"Distance parameter absolute difference: {abs(d_t - d_np)}")
-        # print(f"Numpy vs Torch fitting time difference: {time_np - time_t}")
-
-        start_c = time.time()
-        res = fit_cylinder(cluster)
-        print(res)
+        res_native = fit_cylinder(cluster)
         end_c = time.time()
-        print(f"Cylinder fitting time: {end_c - start_c} seconds.")
+        print(f"Cylinder fitting time with native code: {res_native[-1]} seconds.")
+        print(f"Native cylinder error: {fitting_utils.cylinder_error(cluster, res_native[1], res_native[0], res_native[2])}")
 
-        start_cc = time.time()
-        res = fit_cylinder_optimized(cluster)
-        print(res)
-        end_cc = time.time()
-        print(f"Cylinder fitting time with optimized code: {end_cc - start_cc} seconds.")
+        res_optimized = fit_cylinder_optimized(cluster)
+        print(f"Cylinder fitting time with optimized code: {res_optimized['metadata']['fitting_time_seconds']} seconds.")
+        print(f"Optimized cylinder error: {res_optimized['error']}")
+        axis_cylinder_native, center_cylinder_native, radius_cylinder_native, _, _ = res_native
 
-        speedup = (end_c - start_c) / (end_cc - start_cc)
+        print(f"L2 difference between axis vectors: {np.linalg.norm(axis_cylinder_native - res_optimized['params']['a'])}")
+        print(f"L2 difference between center points: {np.linalg.norm(center_cylinder_native - res_optimized['params']['center'])}")
+        print(f"Difference in fitted radii: {abs(radius_cylinder_native - res_optimized['params']['radius'])}")
+
+        speedup = (res_native[-1]) / res_optimized["metadata"]["fitting_time_seconds"]
         print(f"Speedup factor: {speedup}")
+        print(f"Cylinder convergence status: {res_optimized['metadata']['optimizer_converged']}")
 
-        cone_start = time.time()
-        cone_res = fit_cone(points)
-        print(cone_res)
-        cone_end = time.time()
-        print(f"Time taken for cone fitting: {cone_end - cone_start} seconds.")
-
+        cone_res = fit_cone(cluster)
+        print(f"Time taken for cone fitting: {cone_res["metadata"]["fitting_time_seconds"]} seconds.")
+        print(f"Cone error: {cone_res['error']}")
+        print(f"Obtained cone angle: {cone_res['params']['theta']}")
+        print(f"Cone convergence status: {cone_res['metadata']['optimizer_converged']}\n")
     # O3D point cloud:
     # https://www.open3d.org/docs/release/python_api/open3d.geometry.PointCloud.html#open3d.geometry.PointCloud.points
     pcd = o3d.geometry.PointCloud()
