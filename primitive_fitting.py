@@ -1,13 +1,13 @@
 import torch
 import numpy as np
-import fitting_utils
+import primitive_fitting_utils
 import time
 
 from scipy.optimize import minimize, least_squares
 from typing import Tuple, Optional, Dict
 
-def sqrt_guard(x, tol = 1e-6):
-    return (max(x, tol)) ** 0.5
+# def sqrt_guard(x, tol = 1e-6):
+#     return (max(x, tol)) ** 0.5
 
 def fit_plane_numpy(points : np.ndarray):
     start = time.time()
@@ -25,7 +25,7 @@ def fit_plane_numpy(points : np.ndarray):
 
     res = {
         "surface_type": "plane",
-        "error": fitting_utils.plane_error(points, a, d),
+        "error": primitive_fitting_utils.plane_error(points, a, d),
         "params": {
             "a": a,
             "d": d
@@ -37,7 +37,9 @@ def fit_plane_numpy(points : np.ndarray):
     
     return res
 
-def fit_sphere_numpy(points: np.ndarray, rcond : float = 1e-5, sqrt_tol : float = 1e-6):
+def fit_sphere_numpy(points: np.ndarray, rcond : float = 1e-6):
+    # rcond - cutoff ratio for singular values of the matrix of the system, A in this case.
+    # singular values smaller than rcond * largest_sv will be treated as 0.
     start = time.time()
     A = np.concatenate((2 * points, np.ones((points.shape[0], 1))), axis = 1)
     y = (points ** 2).sum(axis = 1)
@@ -45,12 +47,13 @@ def fit_sphere_numpy(points: np.ndarray, rcond : float = 1e-5, sqrt_tol : float 
 
     center = w[:3]
     radius = w[3] + (center ** 2).sum()
-    radius = sqrt_guard(radius, tol = sqrt_tol)
+    # radius = sqrt_guard(radius, tol = sqrt_tol)
+    radius = radius ** 0.5
 
     end = time.time()
     res = {
         "surface_type": "sphere",
-        "error": fitting_utils.sphere_error(points, center, radius),
+        "error": primitive_fitting_utils.sphere_error(points, center, radius),
         "params": {
             "center": center,
             "radius": radius
@@ -62,7 +65,7 @@ def fit_sphere_numpy(points: np.ndarray, rcond : float = 1e-5, sqrt_tol : float 
 
     return res
 
-def fit_cylinder(data, guess_angles=None):
+def fit_cylinder(data, guess_angles = None):
     # TODO: Taken from original Point2CAD implementation just for comparison, will likely be removed!
     """Fit a list of data points to a cylinder surface. The algorithm implemented
     here is from David Eberly's paper "Fitting 3D Data with a Cylinder" from
@@ -179,7 +182,7 @@ def fit_cylinder(data, guess_angles=None):
 
     return w, C(w, Xs) + t, r(w, Xs), best_fit.fun, end - start
 
-def fit_cylinder_optimized(data, guess_angles = None, sqrt_tol : float = 1e-6):
+def fit_cylinder_optimized(data, guess_angles = None):
     """Optimized vectorized cylinder fitting. Based on Eberly's least squares cylinder fitting algorithm: https://www.geometrictools.com/Documentation/LeastSquaresFitting.pdf
        As oposed to original point2cad implementation, we use vectorized expression for dramatic increase in execution time.
     """
@@ -258,7 +261,8 @@ def fit_cylinder_optimized(data, guess_angles = None, sqrt_tol : float = 1e-6):
         c = C_vectorized(w, X)
         d = X - c
         perp_dist_sq = np.sum(d @ P * d, axis = 1).mean()
-        return sqrt_guard(perp_dist_sq, tol = sqrt_tol)
+        # return sqrt_guard(perp_dist_sq, tol = sqrt_tol)
+        return perp_dist_sq ** 0.5
 
     start = time.time()
     X, t = preprocess_data(data)
@@ -288,7 +292,7 @@ def fit_cylinder_optimized(data, guess_angles = None, sqrt_tol : float = 1e-6):
 
     res = {
         "surface_type": "cylinder",
-        "error": fitting_utils.cylinder_error(data, center, w, radius),
+        "error": primitive_fitting_utils.cylinder_error(data, center, w, radius),
         "params": {
             "a": w,
             "center": center,
@@ -418,7 +422,7 @@ def fit_cone(points: np.ndarray, initial_guess: Optional[np.ndarray] = None) -> 
 
     res = {
         "surface_type": "cone",
-        "error": fitting_utils.cone_error(points, vertex_opt, axis_opt, theta_opt),
+        "error": primitive_fitting_utils.cone_error(points, vertex_opt, axis_opt, theta_opt),
         "params": {
             "a": axis_opt,
             "v": vertex_opt,
