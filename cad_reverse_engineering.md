@@ -158,7 +158,7 @@ $$
 x^{T}Qx + a^{T}x + b
 $$
 
-## Flaws/bugs in Point2CAD implementation. Differences from the original implementation
+## Flaws/bugs in Point2CAD implementation. Differences from the original implementation, general notes...
 * For SIREN layers, the use $sinc(x) = \frac{sin(\pi x)}{\pi x}$ activation, instead of ordinary sine. SIREN paper precisely derived modified initialization for linear layers, this initialization is not theoretically justified for $sinc$, yet they still use it in Point2CAD implementation. (https://github.com/prs-eth/point2cad/blob/main/point2cad/layers.py#L77)
 
 * Further experiments with cone fitting, is current mathematical setup the best? The official implementation uses actual distances with double absolute values, and they use LM optimization algorithm that does not support giving bounds for the half-angle that should lie in $(0, \pi / 2)$. The TRF algorithm seemingly gave better results, and it does support bounds. Investigate mathematical details behind both algorithms, and further think about cone fitting intricacies!
@@ -175,6 +175,24 @@ $$
 * Point2CAD parallelism: each cluster is fitted in parallel, but 4 INR are fitted sequentially on a single process. Perhaps paralellize this operation as well? Relevant code lines: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/main.py#L14, https://github.com/prs-eth/point2cad/blob/main/point2cad/fitting_one_surface.py#L17
 
 * Paper sent by the professor does not containt Point2CAD as a reference, which is a bit concerning. I found one paper way back that goes from meshes to NURBS - https://ieeexplore.ieee.org/document/10824954/
+
+* Cylinder fitting with numpy vector operations gives the same results as the original cylinder fitting algorithm, while being up to 180 times faster! For instance, for abc_00470.xyzc, for the cluster of ~7.9k points, native algorithm took 9.5 seconds, while the optimizer numpy version took 0.05 seconds. 
+
+* Default number of points for creating INR mesh seems to be 10000. (https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L355). That is mesh_dim ** 2.
+
+* INR mesh generation does not include trimming, which is not the case for primitive types? Intentional inconsistency, or a bug?
+
+## Mesh operations
+    '''
+    Meshing scheme:
+    (i,j) -------- (i,j+1)                                                                                                                                                                
+    |  \            |                                                                                                                                                                   
+    |    \    T2    |                                                                                                                                                                   
+    |  T1  \        |                                                                                                                                                                   
+    |        \      |                                                                                                                                                                   
+    (i+1,j) ---- (i+1,j+1)
+
+* From the perspective of the UV space, it is guaranteed that all triangles formed like this are regular. However, after decoding to 3D we do not have this guarantee. Perhaps additional post-processing operations should be performed after constructing a mesh.
 
 ## Misc
 * Outer product quadratic form partial derivative wrt. outer product vector (derived by hand):
@@ -200,3 +218,46 @@ $$
 
 * A useful blog that explains how sphere fitting can be linearized. This implementation uses the same algorithm, write it down mathematically in the master thesis report.
 https://jekel.me/2015/Least-Squares-Sphere-Fit/
+
+* Open3D + PyVista:
+```
+Open3D + PyVista (no Trimesh)                                                                                                                                                         
+                                                                                                                                                                                        
+  Yes, this works. Your pipeline:                                                                                                                                                       
+                                                                                                                                                                                        
+  # 1. Construct mesh with Open3D                                                                                                                                                       
+  o3d_mesh = sample_inr_mesh_o3d(...)                                                                                                                                                   
+                                                                                                                                                                                        
+  # 2. Convert to PyVista for intersection operations                                                                                                                                   
+  o3d.io.write_triangle_mesh("/tmp/mesh.ply", o3d_mesh)                                                                                                                                 
+  pv_mesh = pv.read("/tmp/mesh.ply")                                                                                                                                                    
+                                                                                                                                                                                        
+  # Or directly (without temp file):                                                                                                                                                    
+  pv_mesh = pv.wrap(o3d_mesh)  # May need: pv.utilities.helpers.wrap                                                                                                                    
+                                                                                                                                                                                        
+  Actually, the cleanest conversion:                                                                                                                                                    
+                                                                                                                                                                                        
+  import pyvista as pv                                                                                                                                                                  
+  import numpy as np                                                                                                                                                                    
+
+  vertices = np.asarray(o3d_mesh.vertices)
+  faces = np.asarray(o3d_mesh.triangles)
+
+  # PyVista expects faces as [n_verts, v0, v1, v2, n_verts, v0, v1, v2, ...]
+  pv_faces = np.hstack([[3] + list(f) for f in faces])
+  pv_mesh = pv.PolyData(vertices, pv_faces)
+```
+
+```
+N - number of consecutive points taken
+M - total points
+x <- (N, 1, 3)
+y <- (1, M, 3)
+
+Broadcasting: (N, M, 3)
+
+z <- ((x - y) ** 2).sum(dim = -1) => (N, M)
+_, indices <- z.topk(5, largest = False) Pairs of points closest to each other.
+
+
+```

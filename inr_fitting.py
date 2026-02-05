@@ -3,9 +3,12 @@ import numpy as np
 import math
 import tqdm
 import time
+import open3d as o3d
 
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import TensorDataset, DataLoader
+from color_config import get_surface_color
+from primitive_fitting_utils import tesselate_mesh
 
 def encoder_to_uv(output, is_closed):
     # [B, 2] => [B, 1], depending on open/closed parameter configuration
@@ -32,6 +35,7 @@ def uv_to_decoder(output, is_closed):
 def inr_recon_loss(X, Xhat):
     # Does not do a reduce operation, should be done manually if needed!
     return torch.abs(X - Xhat).sum(dim = -1)
+    # return ((X - Xhat) ** 2).sum(dim = -1)
 
 def inr_error(data_loader, model):
     # The loss that they are using is L1, but to compute the fitness error for INR they actually use L2
@@ -170,6 +174,8 @@ class INRDecoder(torch.nn.Module):
 class INRNetwork(torch.nn.Module):
     def __init__(self, hidden_dim, fraction_siren, is_u_closed, is_v_closed, use_shortcut = False):
         super().__init__()
+        self.is_u_closed = is_u_closed
+        self.is_v_closed = is_v_closed
         self.encoder = INREncoder(hidden_dim, fraction_siren, is_u_closed, is_v_closed, use_shortcut = use_shortcut)
         self.decoder = INRDecoder(hidden_dim, fraction_siren, is_u_closed, is_v_closed, use_shortcut = use_shortcut)
     
@@ -199,28 +205,34 @@ class INRNetwork(torch.nn.Module):
         Xhat = self.decoder(uv)        
         return Xhat
     
-    def sample_inr(self, N, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = 0.2):
+    def sample_points(self, mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = 0.1):
+        # Resulting samples will be of shape [mesh_dim^2, 3]
         uv_length = uv_bb_max - uv_bb_min
         uv_bb_min -= uv_length * uv_margin
         uv_bb_max += uv_length * uv_margin
 
-        if self.encoder.is_u_closed:
-            uv_bb_min[0] = max(uv_bb_min[0], -1)
-            uv_bb_max[0] = min(uv_bb_max[0], 1)
+        # Should always do clipping regardless of closeness?
+        # if self.is_u_closed:
+        uv_bb_min[0] = max(uv_bb_min[0], -1)
+        uv_bb_max[0] = min(uv_bb_max[0], 1)
 
-        if self.encoder.is_v_closed:
-            uv_bb_min[1] = max(uv_bb_min[1], -1)
-            uv_bb_max[1] = min(uv_bb_max[1], 1)
+        # if self.is_v_closed:
+        uv_bb_min[1] = max(uv_bb_min[1], -1)
+        uv_bb_max[1] = min(uv_bb_max[1], 1)
         
         device = next(self.parameters()).device
 
+        # Cartesian product essentially
+        # torch.meshgrid(a, b, indexing = 'xy') produces two tensors, each of shape
+        # (b.shape[0], a.shape[0]) - the requirement is that the input tensors are either scalars or 1D tensors.
+
         u, v = torch.meshgrid(
-            torch.linspace(uv_bb_min[0], uv_bb_max[0], N, device = device),
-            torch.linspace(uv_bb_min[1], uv_bb_max[0], N, device = device),
+            torch.linspace(uv_bb_min[0], uv_bb_max[0], mesh_dim, device = device),
+            torch.linspace(uv_bb_min[1], uv_bb_max[1], mesh_dim, device = device),
             indexing = "xy"
         )
 
-        uv = torch.stack((u, v), dim = 2)
+        uv = torch.stack((u, v), dim = 2).reshape(-1, 2)
         with torch.no_grad():
             X = self.forward_decoder(uv)
             cluster_mean = torch.tensor(cluster_mean, device = device)
@@ -228,6 +240,10 @@ class INRNetwork(torch.nn.Module):
             X = X * cluster_scale + cluster_mean
         
         return X
+
+    def sample_mesh(self, mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = 0.1):
+        points = self.sample_points(mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = uv_margin)
+        return tesselate_mesh(points.cpu().numpy(), mesh_dim, mesh_dim)
 
 class LinearWarmupCosineAnnealingLR(_LRScheduler):
     def __init__(self, optimizer, warmup_steps, max_steps, eta_min = 0.0, last_epoch = -1):
@@ -346,7 +362,6 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
                 yield X
 
     best_model = None
-    uv_comb = None
 
     dl_generator = get_next_item()
     for u in [True, False]:
@@ -361,17 +376,13 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
                                            noise_magnitude_uv = noise_magnitude_uv)
             if best_model is None or best_model["error"] > current_model["error"]:
                 best_model = current_model
-                uv_comb = (u, v)
     
-    best_model["params"]["network_parameters"]["is_u_closed"] = uv_comb[0]
-    best_model["params"]["network_parameters"]["is_v_closed"] = uv_comb[1]
     best_model["params"]["cluster_mean"] = cluster_mean
     best_model["params"]["cluster_scale"] = cluster_scale
-
     model = best_model["params"]["model"]
-    uvs = []
 
     # One more forward pass through the best model to obtain UV bounding boxes.
+    uvs = []
     with torch.no_grad():
         for X in dl:
             X = X[0]
@@ -400,10 +411,22 @@ if __name__ == "__main__":
     torch.cuda.manual_seed(41)
     np.random.seed(41)
 
-    cluster = np.random.randn(500, 3).astype(np.float32)
-    result = fit_inr(cluster, network_parameters, device, max_steps = 1500)
-    is_u_closed = result["params"]["network_parameters"]["is_u_closed"]
-    is_v_closed = result["params"]["network_parameters"]["is_v_closed"]
+    cluster = np.random.rand(400, 3).astype(np.float32)
+    e = np.array([1, 0, 0], dtype = np.float32)
+    cluster = cluster - np.dot(cluster, e)[:, np.newaxis] * e
 
+    result = fit_inr(cluster, network_parameters, device, max_steps = 1000)
+    model = result["params"]["model"]
     print(f"INR error: {result['error']}")
-    print(f"Best UV combination: ({is_u_closed}, {is_v_closed})")
+    print(f"Openness: {model.is_u_closed} {model.is_v_closed}")
+
+    mesh = model.sample_mesh(100, 
+                             result["params"]["uv_bb_min"], 
+                             result["params"]["uv_bb_max"], 
+                             result["params"]["cluster_mean"], 
+                             result["params"]["cluster_scale"])
+    
+    color = get_surface_color("inr")
+
+    mesh.paint_uniform_color(color)
+    o3d.visualization.draw_geometries([mesh])
