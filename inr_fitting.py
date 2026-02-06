@@ -8,7 +8,7 @@ import open3d as o3d
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import TensorDataset, DataLoader
 from color_config import get_surface_color
-from primitive_fitting_utils import tesselate_mesh
+from primitive_fitting_utils import triangulate_and_mesh, sample_plane, sample_sphere
 
 def encoder_to_uv(output, is_closed):
     # [B, 2] => [B, 1], depending on open/closed parameter configuration
@@ -222,16 +222,13 @@ class INRNetwork(torch.nn.Module):
         
         device = next(self.parameters()).device
 
-        # Cartesian product essentially
-        # torch.meshgrid(a, b, indexing = 'xy') produces two tensors, each of shape
-        # (b.shape[0], a.shape[0]) - the requirement is that the input tensors are either scalars or 1D tensors.
-
         u, v = torch.meshgrid(
             torch.linspace(uv_bb_min[0], uv_bb_max[0], mesh_dim, device = device),
             torch.linspace(uv_bb_min[1], uv_bb_max[1], mesh_dim, device = device),
-            indexing = "xy"
+            indexing = "ij"
         )
 
+        # Cartesian product of two linspaces, where the first coordinate moves faster.
         uv = torch.stack((u, v), dim = 2).reshape(-1, 2)
         with torch.no_grad():
             X = self.forward_decoder(uv)
@@ -243,7 +240,7 @@ class INRNetwork(torch.nn.Module):
 
     def sample_mesh(self, mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = 0.1):
         points = self.sample_points(mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = uv_margin)
-        return tesselate_mesh(points.cpu().numpy(), mesh_dim, mesh_dim)
+        return triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr")
 
 class LinearWarmupCosineAnnealingLR(_LRScheduler):
     def __init__(self, optimizer, warmup_steps, max_steps, eta_min = 0.0, last_epoch = -1):
@@ -410,12 +407,14 @@ if __name__ == "__main__":
     torch.manual_seed(41)
     torch.cuda.manual_seed(41)
     np.random.seed(41)
+    np_rng = np.random.default_rng(41)
 
-    cluster = np.random.rand(400, 3).astype(np.float32)
-    e = np.array([1, 0, 0], dtype = np.float32)
-    cluster = cluster - np.dot(cluster, e)[:, np.newaxis] * e
+    a = np.ones(3, dtype = np.float32) / (3 ** 0.5)
+    d = 3
+    f = np.ones(3, dtype = np.float32) / ((3 ** 0.5) / 3)
+    plane_samples = sample_plane(20, a, d, f, np_rng)
 
-    result = fit_inr(cluster, network_parameters, device, max_steps = 1000)
+    result = fit_inr(plane_samples, network_parameters, device, max_steps = 1000)
     model = result["params"]["model"]
     print(f"INR error: {result['error']}")
     print(f"Openness: {model.is_u_closed} {model.is_v_closed}")

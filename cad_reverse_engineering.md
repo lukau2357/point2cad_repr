@@ -1,6 +1,6 @@
 Triangle mesh:
 
-$V = \{ v_i \in \mathbb{R}^{3}\}_{i=1}^{N}$, $E = \{ (i, j) \mid v_i, v_j \in V\}$, $F = \{(i, j, k) \mid v_i, v_j, v_k \in \mathbb{R}^3\}$. Mesh is defined as a set of vertices, edges and faces. A triangular face defines a planar sufrace patch:
+$V = \{ v_i \in \mathbb{R}^{3}\}_{i=1}^{N}$, $E = \{ (i, j) \mid v_i, v_j \in V\}$, $F = \{(i, j, k) \mid v_i, v_j, v_k \in \mathbb{R}^3\}$. Mesh is defined as a set of vertices, edges and faces. A triangular face defines a planar surface patch:
 $$
 F(u, v) = (1 - u - v) v_i + u v_j + v v_k, u, v \geq 0, u + v \leq 1
 $$
@@ -11,9 +11,9 @@ $$
 ## Point2CAD curve fitting
 In Point2CAD, the first stage after being provided a clustering of a set of 3D points is primitive curve fitting. Firstly, they fit the following parametric models:
 
-* Place parametrized by $(n, d)$, $n$ is the normal vector of unit norm, and $d$ is the distance to the origin. Every point $u$ from the plane must satisfy $un^{T} = d$.
+* Plane parametrized by $(n, d)$, $n$ is the normal vector of unit norm, and $d$ is the distance to the origin. Every point $u$ from the plane must satisfy $un^{T} = d$.
 
-* Sphere, $(c, r)$ $c$ is the center of the sphere and $r$ is it's radius.
+* Sphere, $(c, r)$ $c$ is the center of the sphere and $r$ is its radius.
 
 * Cylinder, $(a, c, r)$ center $c$, unit length vector $a$ that describes the axis of the cylinder, and $r$ is the cylinder radius.
 
@@ -23,7 +23,7 @@ Additionally, they fit an **INR** implicit neural representation surface to a gi
 
 ![no figure](./figures/inr_1.png)
 
-Regardless of openness/closedness, the latent space ends up being a unit square $[-1, 1]^{2}$. In the code, they also talke about **lifted latent space**, those are coordiantes $(u_1, u_2, v_1, v_2)$, this is important for loss components not included in the paper, it's arguable if these components are even important - if they were important for SOTA results they would have surely added them to the paper. Regardless, the main component of the loss function is reconstruction error. There are 2 additional loss components not included in the original paper:
+Regardless of openness/closedness, the latent space ends up being a unit square $[-1, 1]^{2}$. In the code, they also talk about **lifted latent space**, those are coordinates $(u_1, u_2, v_1, v_2)$, this is important for loss components not included in the paper, it's arguable if these components are even important - if they were important for SOTA results they would have surely added them to the paper. Regardless, the main component of the loss function is reconstruction error. There are 2 additional loss components not included in the original paper:
 
 * **UV tightness** TODO
 * **Metric learning** - We give pseudocode for computing this component:
@@ -44,9 +44,9 @@ Basically this is a contrastive component, real points close to one another shou
 
 So, after this procedure we obtain 5 different surfaces for a given cluster of points. For INR, the error is simply reconstruction error, for other 4 primitive surfaces, we project all real points to the interpolated surface, and we measure the distance between the given point and the projection. We take **the simplest surface with lowest error**. Now what does this mean precisely? If INR achieves the lowest error (and it usually will), we will check if the minimum error of remaining 4 surfaces is within a given error margin, if it is we take the simpler surface - otherwise we settle with INR (**slightly more logic behind the choosing procedure, but this is the main idea, elaborate futher**). (https://github.com/prs-eth/point2cad/blob/main/point2cad/fitting_one_surface.py#L96). 
 
-Instead of using analytical representations for all surfaces, the authors instead use triangle mesh representations. Using analytical representations could potentially lead to very numeircally unstable calculations. A triangle mesh is created by first sampling points from the given surface and then creating a triangle mesh from it. In particular, for INR, we take the $uv$ bounding box for the current cluster - determined by the minimum and maximum values in both coordinates, recall that the latent space is $[-1, 1]^{2}$. Next, we extend the bounding box by 10%, and from this extended bounding box we sample sufficient number of points, for which we create a triangle mesh.
+Instead of using analytical representations for all surfaces, the authors instead use triangle mesh representations. Using analytical representations could potentially lead to very numerically unstable calculations. A triangle mesh is created by first sampling points from the given surface and then creating a triangle mesh from it. In particular, for INR, we take the $uv$ bounding box for the current cluster - determined by the minimum and maximum values in both coordinates, recall that the latent space is $[-1, 1]^{2}$. Next, we extend the bounding box by 10%, and from this extended bounding box we sample sufficient number of points, for which we create a triangle mesh.
 
-During training of the INR, they optionally add noise to encoder/decoder inputs, in order to make the network more robust to small pertubations:
+During training of the INR, they optionally add noise to encoder/decoder inputs, in order to make the network more robust to small perturbations:
 ```
 langevin_noise_schedule = (num_fit_steps - step - 1) / (num_fit_steps - 1)
 x_input = x
@@ -93,7 +93,7 @@ https://github.com/vsitzmann/siren/blob/master/modules.py#L630
 
 If a skip connection is turned on, then an additional learnable weight parameter is added - controls the strength of the skip connection, the weight affects the downstream path of the network. Dimensionality of the hidden layer is 64, with evenly distributed neurons among SIREN and SiLU blocks.
 
-## Analytical formulas for sufraces
+## Analytical formulas for surfaces
 * Scalar projection of vector $a$ to vector $b$: 
 
 $$||a|| \cos \theta = |||a|| \frac{a^{T}b}{||a|| ||b||} = \frac{a^{T}b}{||b||}.
@@ -108,14 +108,14 @@ $$
 
 It's easy to verify that $orth_b(a)^{T}b = (a - \frac{a^T{b}}{||b||^{2}}b)^{T}b = a^{T}b - \frac{b^{T}b^{T}a}{||b||^{2}}b = a^{T}b - \frac{||b||^{2}a^{T}b}{||b||^2} = a^{T}b - a^{T}b = 0$
 
-* **Hyperplane**: describ ed by a set of points satsifying $a^{T}x = d$, where $a \in \mathbb{R}^{n}$ is the direction vector typically of unit length, and $d \in \mathbb{R}$. Only in the case of $d = 0$ can we construct a corresponding linear opeartor.
+* **Hyperplane**: described by a set of points satisfying $a^{T}x = d$, where $a \in \mathbb{R}^{n}$ is the direction vector typically of unit length, and $d \in \mathbb{R}$. Only in the case of $d = 0$ can we construct a corresponding linear operator.
 
 * Projecting a vector to a plane: if we do $orth_a(x)$ we will obtain a vector perpendicular to $a$, but we need to satisfy the hyperplane condition, so we add $ad$ to the orthogonal projection to satisfy the requirement $a^{T}x = d$. The final formula is:
 $$
 proj\_plane_{a, d}(x) = orth_a(x) + ad
 $$
 
-* Plane reconstruction error: $||proj\_plane_{a, d}(x) - x||_2^{2}$. For a set of ground trugh points take the mean over this expression.
+* Plane reconstruction error: $||proj\_plane_{a, d}(x) - x||_2^{2}$. For a set of ground truth points take the mean over this expression.
 
 * Hypersphere: $\sum_{i=1}^{N}(x_i - a_i)^{2} = r$, where $r > 0$ is the radius parameter, and $a \in \mathbb{R}^{n}$ is the center point.
 
@@ -159,18 +159,18 @@ x^{T}Qx + a^{T}x + b
 $$
 
 ## Flaws/bugs in Point2CAD implementation. Differences from the original implementation, general notes...
-* For SIREN layers, the use $sinc(x) = \frac{sin(\pi x)}{\pi x}$ activation, instead of ordinary sine. SIREN paper precisely derived modified initialization for linear layers, this initialization is not theoretically justified for $sinc$, yet they still use it in Point2CAD implementation. (https://github.com/prs-eth/point2cad/blob/main/point2cad/layers.py#L77)
+* For SIREN layers, they use $sinc(x) = \frac{sin(\pi x)}{\pi x}$ activation, instead of ordinary sine. SIREN paper precisely derived modified initialization for linear layers, this initialization is not theoretically justified for $sinc$, yet they still use it in Point2CAD implementation. (https://github.com/prs-eth/point2cad/blob/main/point2cad/layers.py#L77)
 
 * Further experiments with cone fitting, is current mathematical setup the best? The official implementation uses actual distances with double absolute values, and they use LM optimization algorithm that does not support giving bounds for the half-angle that should lie in $(0, \pi / 2)$. The TRF algorithm seemingly gave better results, and it does support bounds. Investigate mathematical details behind both algorithms, and further think about cone fitting intricacies!
 
-* Default learning rate for INR is 1e-1, we will try with slightly lower learning rate 1e-2. Use as mutch GPU memory as possible, in our implementation resolved by `automatic_batch_size` function in inr.py. 
+* Default learning rate for INR is 1e-1, we will try with slightly lower learning rate 1e-2. Use as much GPU memory as possible, in our implementation resolved by `automatic_batch_size` function in inr.py. 
 
 * Default noise magnitude for both 3D and UV seems to be 0.005: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L313
 
 * Our INR implementation vs actual INR implementation:
 ![no figure](./figures/ours_vs_theirs_inr.png)
 
-* Error threshold for simple sufraces, kept the same for current implementation. Instead of additive error threshold, look at ratio between INR error and simple error. Instead of absolute error threshold for fixing degenerate cones, look at ratio between plane error and cone error. Mention that unlike in the original implementation, we sidestep INR fitting unless it is absolutely necessary.
+* Error threshold for simple surfaces, kept the same for current implementation. Instead of additive error threshold, look at ratio between INR error and simple error. Instead of absolute error threshold for fixing degenerate cones, look at ratio between plane error and cone error. Mention that unlike in the original implementation, we sidestep INR fitting unless it is absolutely necessary.
 
 * Point2CAD parallelism: each cluster is fitted in parallel, but 4 INR are fitted sequentially on a single process. Perhaps paralellize this operation as well? Relevant code lines: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/main.py#L14, https://github.com/prs-eth/point2cad/blob/main/point2cad/fitting_one_surface.py#L17
 
@@ -182,8 +182,19 @@ $$
 
 * INR mesh generation does not include trimming, which is not the case for primitive types? Intentional inconsistency, or a bug?
 
+* We implemented UV grid generation for every surface type such that the first coordinate moves slow, and the second coordinate moves fast. This is not consistent across the original Point2CAD codebase.
+
 ## Mesh operations
-    '''
+* How to represent a continuous parametrized surface with a mesh? There are several steps:
+    * Sample a finite number of points from the surface. There are different sampling algorithms for different surface types, we will not be going over them in this section. For INR sampling, we sample in the UV space from the bounding box extended by a given margin on both sides of the box, and then pass those points through the decoder.
+
+    * The sampled set of points needs to be triangulated. For all sampling algorithms, we typically create a 2D grid-like manifold which is then projected to the given surfae such that grid-like structure is preserved - allowing us to trivially compute the triangulation of the given point set, as illustrated on the figure below. There are 2 approaches: one proposed in the Point2CAD paper, and the other used by this implementation. It is worth noting that Point2CAD paper did not explicitly state the trimming algorithm, it was inferred from the codebase to work as follows:
+
+    * First upsample the INPUT set of points - not points sampled on the surface but the actual ground truth points. The full algorithm can be found in (https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_utils.py#L66), but essentially it divides the input cluster into batches, for each batch and each point in the batch 5 closest points are computed (the implementation actually includes a bug because if we are considering points closest to $x$, $x$ itself will always be included, from the way they compute pairwise distances). After computing this for every point in the cluster (batching is just a memory optimization technique), means of 5 closest points for all points are computed and added to the original cluster, thereby adding $N$ new points. This process can be repeated arbitrarily, in each iteration doubling the size of the input cluster. After that they iterate over the cells of the UV grid, for each 2x2 block they compute the average point, and measure if the distance from the average point to the closest point of the newly upsampled cluster is within the given margin, if it is the corresponding neighboring points are included in the triangulation, otherwise they are masked out and ignored during triangulation.
+
+    * Our algorithms differs slightly, we do not perform any upsampling, but our masking rule is different. Instead of looking for the closest point in the cluster, we look at topk distances (k = 5, but configurable). We argue that this has the same effect as upsampling the input cluster if the input cluster is sparsem we simply extend our search radius. From here, the triangulation procedure is the same.
+
+```
     Meshing scheme:
     (i,j) -------- (i,j+1)                                                                                                                                                                
     |  \            |                                                                                                                                                                   
@@ -191,8 +202,20 @@ $$
     |  T1  \        |                                                                                                                                                                   
     |        \      |                                                                                                                                                                   
     (i+1,j) ---- (i+1,j+1)
+```
+
+* Before performing the actual triangulation however, we must trim the sampled grid to match the input cluster - we do not want large deviations from the ground trugh points.  
 
 * From the perspective of the UV space, it is guaranteed that all triangles formed like this are regular. However, after decoding to 3D we do not have this guarantee. Perhaps additional post-processing operations should be performed after constructing a mesh.
+
+## Surface sampling algorithms
+* INR - Forward the input cluster thorugh the encoder to obtain UV space bounding box coordinates. From here, for each axis of the bounding box extend it by the given margin (the paper says 10%, but the actual implementation uses 20%, https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L355). Construct a grid in the UV space - we use `torch.meshgrid` in combination with `torch.linspace` and forward those points through the decoder to obtain INR samples. One last note, the paper assumes that a well trained INR decoder will preserve the grid like pattern in the 3D space allowing for easier triangulation, however there are no theoretical guarantees for this... Perhaps doing Delaunay triangulation manually would be best solution? However, Delaunay triangulation in 3D produces tetrahedras (simplex in 3D). Additionally, Point2CAD implementation of INR to mesh does not include the trimming step on the UV grid, add this in the reproduction?
+
+* Plane - Sample $r_1, r_2$ from $U(0, 1)$, plug them to the plane equation and compute the missing coordinate $x$ as $x = \frac{d - a[1]r_1 - a[2]r_2}{a[0] + \epsilon}$, The point $(x, r_1, r_2)$ belongs to the plane, or at least approximately. Convert this to a plane vector by subtracting $ad$ from it. To obtain $(x, y)$ orthonormal basis that generates the plane simply compute $y = x \times a$. Now $(x, y)$ is the orthonormal basis that spans the plane, compute a grid over $[-scale, scale]^2$ and pass it through the $xy$ span, while also adding the mean of the original cluster projected to the plane parametrized by $(a, d)$.
+
+* Sphere - 
+* Cylinder - 
+* Cone - 
 
 ## Misc
 * Outer product quadratic form partial derivative wrt. outer product vector (derived by hand):
@@ -220,15 +243,13 @@ $$
 https://jekel.me/2015/Least-Squares-Sphere-Fit/
 
 * Open3D + PyVista:
-```
-Open3D + PyVista (no Trimesh)                                                                                                                                                         
-                                                                                                                                                                                        
-  Yes, this works. Your pipeline:                                                                                                                                                       
-                                                                                                                                                                                        
-  # 1. Construct mesh with Open3D                                                                                                                                                       
+Open3D + PyVista (no Trimesh)                                                                                                            
+Yes, this works. Your pipeline:                                                                                                          
+```                                      
+  1. Construct mesh with Open3D                                                                                                                                                       
   o3d_mesh = sample_inr_mesh_o3d(...)                                                                                                                                                   
                                                                                                                                                                                         
-  # 2. Convert to PyVista for intersection operations                                                                                                                                   
+  2. Convert to PyVista for intersection operations                                                                                                                                   
   o3d.io.write_triangle_mesh("/tmp/mesh.ply", o3d_mesh)                                                                                                                                 
   pv_mesh = pv.read("/tmp/mesh.ply")                                                                                                                                                    
                                                                                                                                                                                         
@@ -258,6 +279,5 @@ Broadcasting: (N, M, 3)
 
 z <- ((x - y) ** 2).sum(dim = -1) => (N, M)
 _, indices <- z.topk(5, largest = False) Pairs of points closest to each other.
-
 
 ```

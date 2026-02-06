@@ -50,6 +50,10 @@ if __name__ == "__main__":
         for cid in clusters
     ])
 
+    meshes = []
+    device = "cuda:0"
+    np_rng = np.random.default_rng(41)
+
     for cluster_id in unique_clusters:
         cluster = data[data[:, 3] == cluster_id][:, :3].astype(np.float32)
         print(f"Processing cluster with id {cluster_id}.")
@@ -58,11 +62,20 @@ if __name__ == "__main__":
         # cylinder_benchmark(cluster)
         # continue
 
-        fit_surface(cluster, inr_network_parameters = {
+        fitting_result = fit_surface(cluster, {
             "hidden_dim": 64,
             "use_shortcut": True,
             "fraction_siren": 0.5
-        })
+        }, np_rng, device,
+            plane_mesh_kwargs = {"mesh_dim": 100, "mesh_mask_threshold": 0.1},
+            sphere_mesh_kwargs = {"dim_theta": 100, "dim_lambda": 100, "mesh_mask_threshold": 0.1},
+            cylinder_mesh_kwargs = {"dim_theta": 100, "dim_height": 50, "mesh_mask_threshold": 0.1},
+            cone_mesh_kwargs = {"dim_theta": 100, "dim_height": 100, "mesh_mask_threshold": 0.1}
+        )
+
+        print(f"Best surface: {fitting_result['result']['surface_type']}")
+        print(f"Error: {fitting_result['result']['error']}")
+        meshes.append(fitting_result["mesh"])
 
     # O3D point cloud:
     # https://www.open3d.org/docs/release/python_api/open3d.geometry.PointCloud.html#open3d.geometry.PointCloud.points
@@ -75,4 +88,4 @@ if __name__ == "__main__":
     
     # Draw geometries:
     # https://www.open3d.org/docs/release/python_api/open3d.visualization.draw_geometries.html
-    o3d.visualization.draw_geometries([pcd])
+    o3d.visualization.draw_geometries(meshes)
