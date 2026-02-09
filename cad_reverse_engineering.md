@@ -184,6 +184,8 @@ $$
 
 * We implemented UV grid generation for every surface type such that the first coordinate moves slow, and the second coordinate moves fast. This is not consistent across the original Point2CAD codebase.
 
+* MAE seems to produce visually better results compared to MSE, although we did not quantify this precisely, just an observation from a couple of examples.
+
 ## Mesh operations
 * How to represent a continuous parametrized surface with a mesh? There are several steps:
     * Sample a finite number of points from the surface. There are different sampling algorithms for different surface types, we will not be going over them in this section. For INR sampling, we sample in the UV space from the bounding box extended by a given margin on both sides of the box, and then pass those points through the decoder.
@@ -207,6 +209,13 @@ $$
 * Before performing the actual triangulation however, we must trim the sampled grid to match the input cluster - we do not want large deviations from the ground trugh points.  
 
 * From the perspective of the UV space, it is guaranteed that all triangles formed like this are regular. However, after decoding to 3D we do not have this guarantee. Perhaps additional post-processing operations should be performed after constructing a mesh.
+
+* Actually, we ended up using a different distance metric for UV grid trimming alltogether. First, for each point in the cluster, we compute it's closest point (excluding itself of course), and keep the measured distance. Then we compute a median over these distances. Now, a grid cell $u, v$ is kept iff:
+```
+min([distance(mean(u, v) - x) for x in cluster]) < median * threshold_multiplier
+```
+
+We set the threshold to 2 for now.
 
 ## Surface sampling algorithms
 * INR - Forward the input cluster thorugh the encoder to obtain UV space bounding box coordinates. From here, for each axis of the bounding box extend it by the given margin (the paper says 10%, but the actual implementation uses 20%, https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L355). Construct a grid in the UV space - we use `torch.meshgrid` in combination with `torch.linspace` and forward those points through the decoder to obtain INR samples. One last note, the paper assumes that a well trained INR decoder will preserve the grid like pattern in the 3D space allowing for easier triangulation, however there are no theoretical guarantees for this... Perhaps doing Delaunay triangulation manually would be best solution? However, Delaunay triangulation in 3D produces tetrahedras (simplex in 3D). Additionally, Point2CAD implementation of INR to mesh does not include the trimming step on the UV grid, add this in the reproduction?

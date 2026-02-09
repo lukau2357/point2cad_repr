@@ -35,7 +35,6 @@ if __name__ == "__main__":
     data = np.loadtxt(path)
     points = data[:, :3]
     clusters = data[:, -1].astype(int)
-
     unique_clusters = np.unique(clusters)
     num_clusters = len(unique_clusters)
 
@@ -46,35 +45,38 @@ if __name__ == "__main__":
     }
 
     colors = np.array([
-        plt.cm.tab20(cluster_id_to_color_idx[cid])[:3]
-        for cid in clusters
+            plt.cm.tab20(cluster_id_to_color_idx[cid])[:3]
+            for cid in clusters
     ])
 
     meshes = []
     device = "cuda:0"
     np_rng = np.random.default_rng(41)
+    torch.manual_seed(41)
+    torch.cuda.manual_seed(41)
 
     for cluster_id in unique_clusters:
         cluster = data[data[:, 3] == cluster_id][:, :3].astype(np.float32)
         print(f"Processing cluster with id {cluster_id}.")
         print(f"Number of points in the current cluster: {cluster.shape[0]}")
 
-        # cylinder_benchmark(cluster)
-        # continue
-
         fitting_result = fit_surface(cluster, {
             "hidden_dim": 64,
             "use_shortcut": True,
             "fraction_siren": 0.5
         }, np_rng, device,
-            plane_mesh_kwargs = {"mesh_dim": 100, "mesh_mask_threshold": 0.1},
-            sphere_mesh_kwargs = {"dim_theta": 100, "dim_lambda": 100, "mesh_mask_threshold": 0.1},
-            cylinder_mesh_kwargs = {"dim_theta": 100, "dim_height": 50, "mesh_mask_threshold": 0.1},
-            cone_mesh_kwargs = {"dim_theta": 100, "dim_height": 100, "mesh_mask_threshold": 0.1}
+            plane_cone_ratio_threshold = 4,
+            cone_theta_tolerance_degrees = 10,
+            plane_mesh_kwargs = {"mesh_dim": 100, "threshold_multiplier": 2},
+            sphere_mesh_kwargs = {"dim_theta": 100, "dim_lambda": 100, "threshold_multiplier": 2},
+            cylinder_mesh_kwargs = {"dim_theta": 100, "dim_height": 50, "threshold_multiplier": 2},
+            cone_mesh_kwargs = {"dim_theta": 100, "dim_height": 100, "threshold_multiplier": 2},
+            inr_mesh_kwargs = {"mesh_dim": 100, "uv_margin": 0.2}
         )
 
         print(f"Best surface: {fitting_result['result']['surface_type']}")
         print(f"Error: {fitting_result['result']['error']}")
+        # if fitting_result['surface_id'] == 3:
         meshes.append(fitting_result["mesh"])
 
     # O3D point cloud:
@@ -88,4 +90,6 @@ if __name__ == "__main__":
     
     # Draw geometries:
     # https://www.open3d.org/docs/release/python_api/open3d.visualization.draw_geometries.html
+    meshes.append(pcd)
     o3d.visualization.draw_geometries(meshes)
+    # o3d.visualization.draw_geometries([pcd])

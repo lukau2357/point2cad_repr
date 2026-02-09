@@ -8,7 +8,7 @@ import open3d as o3d
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import TensorDataset, DataLoader
 from color_config import get_surface_color
-from primitive_fitting_utils import triangulate_and_mesh, sample_plane, sample_sphere
+from primitive_fitting_utils import triangulate_and_mesh, grid_trimming
 
 def encoder_to_uv(output, is_closed):
     # [B, 2] => [B, 1], depending on open/closed parameter configuration
@@ -37,7 +37,7 @@ def inr_recon_loss(X, Xhat):
     return torch.abs(X - Xhat).sum(dim = -1)
     # return ((X - Xhat) ** 2).sum(dim = -1)
 
-def inr_error(data_loader, model):
+def inr_error(data_loader, model, cluster_mean, cluster_scale):
     # The loss that they are using is L1, but to compute the fitness error for INR they actually use L2
     # Explicit training loss definition: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L319
     # Error inference: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L835
@@ -47,7 +47,8 @@ def inr_error(data_loader, model):
         for batch in data_loader:
             X = batch[0]
             Xhat, _ = model.forward(X)
-            current_error = inr_recon_loss(X, Xhat)
+            # Measure INR error on original data, consistent with error measuring for cannonical algorithms
+            current_error = inr_recon_loss(X * cluster_scale + cluster_mean, Xhat * cluster_scale + cluster_mean)
             batch_errors.append(current_error.cpu().numpy())
     
     return np.array(batch_errors).mean()
@@ -212,13 +213,13 @@ class INRNetwork(torch.nn.Module):
         uv_bb_max += uv_length * uv_margin
 
         # Should always do clipping regardless of closeness?
-        # if self.is_u_closed:
-        uv_bb_min[0] = max(uv_bb_min[0], -1)
-        uv_bb_max[0] = min(uv_bb_max[0], 1)
+        if self.is_u_closed:
+            uv_bb_min[0] = max(uv_bb_min[0], -1)
+            uv_bb_max[0] = min(uv_bb_max[0], 1)
 
-        # if self.is_v_closed:
-        uv_bb_min[1] = max(uv_bb_min[1], -1)
-        uv_bb_max[1] = min(uv_bb_max[1], 1)
+        if self.is_v_closed:
+            uv_bb_min[1] = max(uv_bb_min[1], -1)
+            uv_bb_max[1] = min(uv_bb_max[1], 1)
         
         device = next(self.parameters()).device
 
@@ -238,9 +239,12 @@ class INRNetwork(torch.nn.Module):
         
         return X
 
-    def sample_mesh(self, mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = 0.1):
+    def sample_mesh(self, mesh_dim, uv_bb_min, uv_bb_max, cluster, cluster_mean, cluster_scale, uv_margin = 0.1):
+        device = next(self.parameters()).device
         points = self.sample_points(mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = uv_margin)
-        return triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr")
+        # mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device)
+        mask = None
+        return triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr", mask = mask)
 
 class LinearWarmupCosineAnnealingLR(_LRScheduler):
     def __init__(self, optimizer, warmup_steps, max_steps, eta_min = 0.0, last_epoch = -1):
@@ -267,7 +271,7 @@ class LinearWarmupCosineAnnealingLR(_LRScheduler):
             for base_lr in self.base_lrs
         ]
 
-def fit_inr_single(network_parameters, device, dl, dl_generator,
+def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, cluster_scale,
             is_u_closed = False,
             is_v_closed = False,
             max_steps = 1000, 
@@ -292,10 +296,12 @@ def fit_inr_single(network_parameters, device, dl, dl_generator,
 
         X = next(dl_generator)
         X_original = X[0]
-        X_noised = X_original + noise_magnitude_3d * noise_schedule * torch.randn_like(X_original)
+        noise_x = torch.randn(size = X_original.shape, device = device)
+        X_noised = X_original + noise_magnitude_3d * noise_schedule * noise_x
 
         uv = model.forward_encoder(X_noised)
-        uv = uv + noise_magnitude_uv * noise_schedule * torch.randn_like(uv)
+        noise_uv = torch.randn(size = uv.shape, device = device)
+        uv = uv + noise_magnitude_uv * noise_schedule * noise_uv
 
         Xhat = model.forward_decoder(uv)
         recon_loss = inr_recon_loss(X_original, Xhat).mean()
@@ -307,7 +313,7 @@ def fit_inr_single(network_parameters, device, dl, dl_generator,
     torch.cuda.synchronize()
     end = time.time()
 
-    error = inr_error(dl, model)
+    error = inr_error(dl, model, cluster_mean, cluster_scale)
 
     result = {
         "surface_type": "inr",
@@ -347,7 +353,8 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
     # When passing points through the INR during inference/sampling, do not forget to account for 1e-6 factor for numerical
     # stability!
     cluster = (cluster - cluster_mean) / (cluster_scale + 1e-6)
-
+    cluster_mean_torch = torch.tensor(cluster_mean, dtype = torch.float32).to(device)
+    cluster_scale_torch = torch.tensor(cluster_scale, dtype = torch.float32).to(device)
     cluster = torch.tensor(cluster, device = device)
     dataset = TensorDataset(cluster)
     # TODO: Implement reproducibility for the DataLoader!
@@ -363,7 +370,7 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
     dl_generator = get_next_item()
     for u in [True, False]:
         for v in [True, False]:
-            current_model = fit_inr_single(network_parameters, device, dl, dl_generator,
+            current_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,
                                            is_u_closed = u, 
                                            is_v_closed = v,
                                            max_steps = max_steps,
@@ -394,38 +401,3 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
     best_model["params"]["uv_bb_max"] = uv_bb_max
 
     return best_model
-
-if __name__ == "__main__":
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    network_parameters = {
-        "hidden_dim": 64,
-        "fraction_siren": 0.5,
-        "use_shortcut": False
-    }
-
-    # TODO: This should be enough for reproducibility?
-    torch.manual_seed(41)
-    torch.cuda.manual_seed(41)
-    np.random.seed(41)
-    np_rng = np.random.default_rng(41)
-
-    a = np.ones(3, dtype = np.float32) / (3 ** 0.5)
-    d = 3
-    f = np.ones(3, dtype = np.float32) / ((3 ** 0.5) / 3)
-    plane_samples = sample_plane(20, a, d, f, np_rng)
-
-    result = fit_inr(plane_samples, network_parameters, device, max_steps = 1000)
-    model = result["params"]["model"]
-    print(f"INR error: {result['error']}")
-    print(f"Openness: {model.is_u_closed} {model.is_v_closed}")
-
-    mesh = model.sample_mesh(100, 
-                             result["params"]["uv_bb_min"], 
-                             result["params"]["uv_bb_max"], 
-                             result["params"]["cluster_mean"], 
-                             result["params"]["cluster_scale"])
-    
-    color = get_surface_color("inr")
-
-    mesh.paint_uniform_color(color)
-    o3d.visualization.draw_geometries([mesh])

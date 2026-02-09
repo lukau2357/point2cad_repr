@@ -35,24 +35,29 @@ def rotation_matrix_a_to_b(A, B):
 
     return R
 
-def grid_trimming(cluster, vertices, size_u, size_v, device, threshold = 0.02, k = 5):
-    grid = vertices.reshape(size_u, size_v, -1) # [size_u, size_v, -1], restore [u, v] shape in first two dimensions
-    grid = grid[:, :, np.newaxis, :] # [size_u, size_v, 1, -1]
-    grid = grid.transpose((3, 2, 0, 1)) # [-1, 1, size_u, size_v] to match Conv2d convention
+def grid_trimming(cluster, vertices, size_u, size_v, device, threshold_multiplier = 3.0):
+    grid = vertices.reshape(size_u, size_v, -1)
+    grid = grid[:, :, np.newaxis, :]
+    grid = grid.transpose((3, 2, 0, 1))
     grid = torch.tensor(grid, device = device)
     filter = torch.tensor([[0.25, 0.25], [0.25, 0.25]], dtype = torch.float32, device = device).unsqueeze(0).unsqueeze(0)
-    
-    cell_means = torch.nn.functional.conv2d(grid, filter) # [-1, 1, size_u - 1, size_v - 1]
-    cell_means = cell_means.permute(1, 2, 3, 0).squeeze(0) # [size_u - 1, size_v - 1, 3]
+
+    cell_means = torch.nn.functional.conv2d(grid, filter)
+    cell_means = cell_means.permute(2, 3, 1, 0).squeeze(-2)
     cluster = torch.tensor(cluster, dtype = torch.float32, device = device)
+
+    cluster_dists = torch.cdist(cluster, cluster)
+    cluster_dists.fill_diagonal_(float("inf"))
+    median_spacing = cluster_dists.min(dim = -1).values.median().item()
+    threshold = threshold_multiplier * median_spacing
 
     cell_means = cell_means.reshape((-1, 3))
     D = torch.cdist(cell_means, cluster)
-    values, _ = torch.topk(D, k, dim = -1, largest = False) # [(size_u - 1) * (size_v - 1), k]
-    values = values[:, -1] < threshold
-    values = values.reshape((size_u - 1, size_v - 1))
-
-    return values
+    min_dists = D.min(dim = -1).values
+    mask = min_dists < threshold
+    mask = mask.reshape((size_u - 1, size_v - 1))
+    print(f"Survived: {mask.sum()} Killed: {mask.numel() - mask.sum()}")
+    return mask
 
 def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
     """
@@ -86,8 +91,8 @@ def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
 
             # Reverse orientation for back-side rendering
             # Remove potentially if it harms performance?
-            triangles.append([v0, v2, v1])
-            triangles.append([v0, v3, v2])
+            # triangles.append([v0, v2, v1])
+            # triangles.append([v0, v3, v2])
 
     mesh = o3d.geometry.TriangleMesh()
     mesh.triangles = o3d.utility.Vector3iVector(np.array(triangles))
@@ -128,12 +133,12 @@ def cone_error(points : np.ndarray, vertex: np.ndarray, axis: np.ndarray, theta:
     errors = np.abs(h * np.sin(theta) - r * np.cos(theta))
     return np.mean(errors)
 
-def sample_plane(mesh_dim, a, d, mean, np_rng, scale = 0.75):
-    x = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
-    y = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
+def sample_plane(mesh_dim, a, d, cluster, np_rng):
+    # x = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
+    # y = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
     # Cartesian product of x and y, the second coordinate moves faster.
-    grid = np.array(list(itertools.product(x, y)))
-    
+    # grid = np.array(list(itertools.product(x, y)))
+    mean = cluster.mean(axis = 0)
     mean_projected = mean - (np.dot(a, mean) - d) * a
     r1, r2 = np_rng.uniform(low = 0, high = 1, size = (2,)).astype(np.float32)
     # Compute random point x from the plane, following the plane equation
@@ -147,20 +152,20 @@ def sample_plane(mesh_dim, a, d, mean, np_rng, scale = 0.75):
     y = np.cross(a, x)
     y = y / np.linalg.norm(y)
 
+    x_cords = (cluster - mean) @ x[:, np.newaxis]
+    y_cords = (cluster - mean) @ y[:, np.newaxis]
+    x_grid = np.linspace(x_cords.min(), x_cords.max(), mesh_dim)
+    y_grid = np.linspace(y_cords.min(), y_cords.max(), mesh_dim)
+    grid = np.array(list(itertools.product(x_grid, y_grid)))
     # Return a linear span over the given basis, centered at the mean of the cluster 
     # projected to the plane.
     return (x * grid[:, 0:1] + y * grid[:, 1:2] + mean_projected).astype(np.float32)
 
 def generate_plane_mesh(mesh_dim, a, d, cluster, np_rng, device,
-                        mesh_mask_threshold = 0.02,
-                        mesh_topk_metric = 5,
-                        point_sampling_scale = 0.75):
-    
-    cluster_mean = cluster.mean(axis = 0)
-    vertices = sample_plane(mesh_dim, a, d, cluster_mean, np_rng, scale = point_sampling_scale)
+                        threshold_multiplier = 3.0):
+    vertices = sample_plane(mesh_dim, a, d, cluster, np_rng)
     mask = grid_trimming(cluster, vertices, mesh_dim, mesh_dim, device,
-                         threshold = mesh_mask_threshold, 
-                         k = mesh_topk_metric)
+                         threshold_multiplier = threshold_multiplier)
     mesh = triangulate_and_mesh(vertices, mesh_dim, mesh_dim, "plane", mask = mask)
     return mesh
 
@@ -184,13 +189,10 @@ def sample_sphere(dim_theta, dim_lambda, radius, center):
     return points.astype(np.float32)
 
 def generate_sphere_mesh(dim_theta, dim_lambda, radius, center, cluster, device,
-                         mesh_mask_threshold = 0.02,
-                         mesh_topk_metric = 5):
-    
+                         threshold_multiplier = 3.0):
     vertices = sample_sphere(dim_theta, dim_lambda, radius, center)
     mask = grid_trimming(cluster, vertices, dim_theta, dim_lambda, device,
-                         threshold = mesh_mask_threshold, 
-                         k = mesh_topk_metric)
+                         threshold_multiplier = threshold_multiplier)
     mesh = triangulate_and_mesh(vertices, dim_theta, dim_lambda, "sphere", mask = mask)
     return mesh
 
@@ -228,14 +230,12 @@ def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_
     return points.astype(np.float32)
 
 def generate_cylinder_mesh(dim_theta, dim_height, radius, center, axis, cluster, device,
-                           mesh_mask_threshold = 0.02,
-                           mesh_topk_metric = 5,
+                           threshold_multiplier = 3.0,
                            cylinder_height_margin = 0.1):
     vertices = sample_cylinder(dim_theta, dim_height, radius, center, axis, cluster,
                                height_margin = cylinder_height_margin)
-    mask = grid_trimming(cluster, vertices, dim_theta, 2 * dim_height, device, 
-                         threshold = mesh_mask_threshold,
-                         k = mesh_topk_metric)
+    mask = grid_trimming(cluster, vertices, dim_theta, 2 * dim_height, device,
+                         threshold_multiplier = threshold_multiplier)
     mesh = triangulate_and_mesh(vertices, dim_theta, 2 * dim_height, "cylinder", mask = mask)
     return mesh
 
@@ -291,13 +291,12 @@ def sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, heig
     return points
 
 def generate_cone_mesh(dim_theta, dim_height, vertex, axis, theta, cluster_points, device,
-                       mesh_mask_threshold = 0.02,
-                       mesh_topk_metric = 5,
+                       threshold_multiplier = 3.0,
                        cone_height_margin = 0.1,
-                       cone_single_sided = True
-                       ):
+                       cone_single_sided = True):
     vertices = sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, height_margin = cone_height_margin, single_sided = cone_single_sided)
-    mask = grid_trimming(cluster_points, vertices, dim_theta, dim_height, device, threshold = mesh_mask_threshold, k = mesh_topk_metric)
+    mask = grid_trimming(cluster_points, vertices, dim_theta, dim_height, device,
+                         threshold_multiplier = threshold_multiplier)
     mesh = triangulate_and_mesh(vertices, dim_theta, dim_height, "cone", mask = mask)
     return mesh
 
@@ -310,5 +309,5 @@ if __name__ == "__main__":
     cone_axis = np.array([0, 0, 1], dtype=np.float32)
     half_angle = np.pi / 4 # 30 degrees
     dummy_cluster = np_rng.standard_normal((500, 3))
-    mesh = generate_cone_mesh(100, 100, vertex, cone_axis, half_angle, cluster_points, "cuda:0", mesh_mask_threshold = 1e3)
+    mesh = generate_cone_mesh(100, 100, vertex, cone_axis, half_angle, cluster_points, "cuda:0")
     o3d.visualization.draw_geometries([mesh])
