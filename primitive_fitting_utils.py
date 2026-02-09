@@ -91,8 +91,8 @@ def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
 
             # Reverse orientation for back-side rendering
             # Remove potentially if it harms performance?
-            # triangles.append([v0, v2, v1])
-            # triangles.append([v0, v3, v2])
+            triangles.append([v0, v2, v1])
+            triangles.append([v0, v3, v2])
 
     mesh = o3d.geometry.TriangleMesh()
     mesh.triangles = o3d.utility.Vector3iVector(np.array(triangles))
