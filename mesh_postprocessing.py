@@ -19,16 +19,27 @@ def save_unclipped_meshes(trimesh_meshes, surface_types, out_path):
     colored_meshes = []
     pm_meshes = []
 
+    import sys
     for s in range(len(trimesh_meshes)):
         tri_mesh = trimesh_meshes[s]
+        verts = np.array(tri_mesh.vertices, dtype = np.float64)
+        faces = np.array(tri_mesh.faces, dtype = np.int32)
+        # print(f"[DEBUG] Surface {s} ({surface_types[s]}): "
+        #       f"verts={verts.shape}, faces={faces.shape}, "
+        #       f"has_nan={np.any(np.isnan(verts))}, "
+        #       f"face_max={faces.max() if faces.size > 0 else -1}, "
+        #       f"num_verts={len(verts)}", flush=True)
         tri_mesh.visual.face_colors = _surface_color_rgba(surface_types[s])
         colored_meshes.append(tri_mesh)
+        if faces.size == 0:
+            # print(f"[DEBUG] Skipping surface {s}: no faces", flush=True)
+            continue
+        # print(f"[DEBUG] Calling pymesh.form_mesh for surface {s}...", flush=True)
+        sys.stdout.flush()
         pm_meshes.append(
-            pymesh.form_mesh(
-                np.array(tri_mesh.vertices, dtype = np.float64),
-                np.array(tri_mesh.faces, dtype = np.int32)
-            )
+            pymesh.form_mesh(verts, faces)
         )
+        # print(f"[DEBUG] pymesh.form_mesh OK for surface {s}", flush=True)
 
     combined = trimesh.util.concatenate(colored_meshes)
     combined.export(out_path)
@@ -135,6 +146,11 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
 
         # np.array(counter_nearest) is of shape (K, 2). First entry is the cluster_id, the second entry
         # is the number of supporting points
+        nonzero_indices = np.nonzero(area_per_point)[0]
+        if len(nonzero_indices) == 0:
+            print(f"Warning: surface {p} has only zero-area components.")
+            clipped_meshes.append(trimesh.Trimesh())
+            continue
         result_indices = np.array(counter_nearest)[:, 0][
             np.logical_and(
                 # Compare each area_per_point with the first non-zero element of area_per_point multiplier by area_multiplier
@@ -142,12 +158,16 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
                 # of points closest to it. Allowance is best_area_per_point * 2 (default value of area_multiplier)
                 # but this is parametrizable. Remember, smaller area_per_point is better
                 # Of course, we disallow fragments with zero area - covered by the second condition.
-                area_per_point < area_per_point[np.nonzero(area_per_point)[0][0]] * area_multiplier,
+                area_per_point < area_per_point[nonzero_indices[0]] * area_multiplier,
                 area_per_point != 0,
             )
         ]
 
         result_submesh_list = [submeshes_cur[item] for item in result_indices]
+        if len(result_submesh_list) == 0:
+            print(f"Warning: surface {p} has no surviving components after area filtering.")
+            clipped_meshes.append(trimesh.Trimesh())
+            continue
         clipped_mesh = trimesh.util.concatenate(result_submesh_list)
         clipped_mesh.visual.face_colors = _surface_color_rgba(surface_types[p])
         clipped_meshes.append(clipped_mesh)
@@ -158,6 +178,8 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
 
 def save_topology(clipped_meshes, out_path):
     # Reference: io_utils.py:124-171
+    import vtk
+    vtk.vtkObject.GlobalWarningDisplayOff()
     pv_meshes = [pv.wrap(item) for item in clipped_meshes]
     pv_combinations = list(itertools.combinations(pv_meshes, 2))
 

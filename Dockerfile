@@ -65,18 +65,19 @@ RUN mkdir -p ${ROOT_PYMESH} && \
     sed -i 's/^test = Tester().test$/# Removed: Tester dropped in numpy 2.0/' "$PYMESH_INIT" && \
     python -c "import pymesh; print('PyMesh OK')"
 
-# ---------- Project dependencies (modern numpy allowed) ----------
+# ---------- Project dependencies (numpy<2.0 for PyMesh compatibility) ----------
 RUN pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cu126
 
 RUN pip install --no-cache-dir --ignore-installed \
-    numpy \
+    "numpy<2.0" \
     scipy \
     open3d \
     pyvista \
     matplotlib \
     tqdm \
-    trimesh
+    trimesh \
+    rtree
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

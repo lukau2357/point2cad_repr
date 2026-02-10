@@ -102,8 +102,12 @@ def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
     color = get_surface_color(surface_type)
     mesh.paint_uniform_color(color)
 
-    # Return both Open3D meshhes and Trimesh meshes for ease of postporcessing and visualization of all algorithmic steps.
-    trimesh_mesh = trimesh.Trimesh(vertices, np.array(triangles))
+    # Trimesh mesh uses only single-sided faces (no reversed duplicates) for post-processing.
+    # PyMesh would choke on overlapping coplanar faces from the double-sided O3D mesh.
+    # If we consider triangle addition order in the previous loop, it suffices to take triangles
+    # with index i % 4 < 2.
+    single_sided = [t for i, t in enumerate(triangles) if i % 4 < 2]
+    trimesh_mesh = trimesh.Trimesh(vertices, np.array(single_sided) if single_sided else np.zeros((0, 3), dtype=np.int32))
     return mesh, trimesh_mesh
 
 def plane_error(points, a, d):

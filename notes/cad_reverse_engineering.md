@@ -186,6 +186,85 @@ $$
 
 * MAE seems to produce visually better results compared to MSE, although we did not quantify this precisely, just an observation from a couple of examples.
 
+* For pymesh compatibility, we had to downgrade numpy to 1.26.4 from 2.4.2. Interestingly, when running cylinder fitting benchmark, the 2.4.2 algorithm seems to be faster than the 1.26.4 - speedup rate for 1.26. is at most 95x original, while the speedup rate for 2.4.2 is at most x180.
+
+```
+Results for 1.26.4, point cloud 00470:
+Processing cluster with id 0.
+Number of points in the current cluster: 1028
+Cylinder fitting time with native code: 1.312288522720337 seconds.
+Native cylinder error: 6.1924631501943335
+Cylinder fitting time with optimized code: 0.015154600143432617 seconds.
+Optimized cylinder error: 6.192463160219301
+L2 difference between axis vectors: 2.8749021979984843e-09
+L2 difference between center points: 1.0760264825014586e-09
+Difference in fitted radii: 3.6776270917471265e-08
+Speedup factor: 86.59341126126834
+Cylinder convergence status: True
+
+Processing cluster with id 1.
+Number of points in the current cluster: 1028
+Cylinder fitting time with native code: 1.37461519241333 seconds.
+Native cylinder error: 6.278240067479877
+Cylinder fitting time with optimized code: 0.014910221099853516 seconds.
+Optimized cylinder error: 6.27824007727802
+L2 difference between axis vectors: 2.7150469907790152e-09
+L2 difference between center points: 1.7108744413858427e-09
+Difference in fitted radii: 3.493474665106078e-08
+Speedup factor: 92.1928107710512
+Cylinder convergence status: True
+
+Processing cluster with id 2.
+Number of points in the current cluster: 7944
+Cylinder fitting time with native code: 8.848136186599731 seconds.
+Native cylinder error: 8.766859389410952
+Cylinder fitting time with optimized code: 0.09309148788452148 seconds.
+Optimized cylinder error: 8.766859385768539
+L2 difference between axis vectors: 3.005802308669373e-09
+L2 difference between center points: 7.706171920834368e-08
+Difference in fitted radii: 9.678309709215682e-09
+Speedup factor: 95.04774698171872
+Cylinder convergence status: True
+-------------------------------------------------
+
+Results for 2.4.2, same point cloud 
+Processing cluster with id 0.
+Number of points in the current cluster: 1028
+Cylinder fitting time with native code: 1.3476369380950928 seconds.
+Native cylinder error: 6.192463151128931
+Cylinder fitting time with optimized code: 0.014451265335083008 seconds.
+Optimized cylinder error: 6.192463153605287
+L2 difference between axis vectors: 5.531611314312923e-09
+L2 difference between center points: 5.424249790173678e-09
+Difference in fitted radii: 1.3034938461942147e-08
+Speedup factor: 93.25390592777127
+Cylinder convergence status: True
+
+Processing cluster with id 1.
+Number of points in the current cluster: 1028
+Cylinder fitting time with native code: 1.4048054218292236 seconds.
+Native cylinder error: 6.278240083319068
+Cylinder fitting time with optimized code: 0.013335227966308594 seconds.
+Optimized cylinder error: 6.278240073891429
+L2 difference between axis vectors: 2.384984506082963e-09
+L2 difference between center points: 1.10363456165582e-09
+Difference in fitted radii: 3.4862900122334395e-08
+Speedup factor: 105.34543731674175
+Cylinder convergence status: True
+
+Processing cluster with id 2.
+Number of points in the current cluster: 7944
+Cylinder fitting time with native code: 9.239214897155762 seconds.
+Native cylinder error: 8.766859379767004
+Cylinder fitting time with optimized code: 0.05113625526428223 seconds.
+Optimized cylinder error: 8.7668593897137
+L2 difference between axis vectors: 1.3302909079742042e-08
+L2 difference between center points: 2.8461569417601113e-07
+Difference in fitted radii: 3.8652856915177836e-08
+Speedup factor: 180.67836311841143
+Cylinder convergence status: True
+```
+
 ## Mesh operations
 * How to represent a continuous parametrized surface with a mesh? There are several steps:
     * Sample a finite number of points from the surface. There are different sampling algorithms for different surface types, we will not be going over them in this section. For INR sampling, we sample in the UV space from the bounding box extended by a given margin on both sides of the box, and then pass those points through the decoder.
