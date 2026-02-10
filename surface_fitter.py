@@ -10,6 +10,8 @@ SURFACE_CYLINDER = 2
 SURFACE_CONE = 3
 SURFACE_INR = 4
 
+SURFACE_NAMES = {0: "plane", 1: "sphere", 2: "cylinder", 3: "cone", 4: "inr"}
+
 def ratio(x, y, eps = 1e-8):
     return (x + eps) / (y + eps)
 
@@ -148,12 +150,12 @@ def fit_surface(cluster,
                 mesh = resolve_mesh(cone_results, results[cone_results], cluster, np_rng, device,
                             plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
 
-                return {"surface_id": cone_results, "result": results[cone_results], "mesh": mesh}
-        
+                return {"surface_id": cone_results, "result": results[cone_results], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
+
         else:
             mesh = resolve_mesh(simple_min, results[simple_min], cluster, np_rng, device,
             plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
-            return {"surface_id": simple_min, "result": results[simple_min], "mesh": mesh}
+            return {"surface_id": simple_min, "result": results[simple_min], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
         
     inr_result = fit_inr(cluster, inr_network_parameters, device = device, **inr_fit_kwargs)
     results.append(inr_result)

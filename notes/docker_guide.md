@@ -190,15 +190,28 @@ The PyMesh build step takes a long time (20-40 minutes). Docker caches each laye
 Interactive session with GPU access:
 
 ```bash
-docker run -it --gpus all -v $(pwd):/work point2cad bash
+docker run -it --gpus all -v $(pwd):/work point2cad_repr bash
+
+docker run --rm -it --gpus all -e DISPLAY=${DISPLAY} -v $(pwd):/work point2cad_repr bash
 ```
 
 One-shot execution:
 
 ```bash
-docker run --rm --gpus all -v $(pwd):/work point2cad python /work/main.py
+docker run --rm --gpus all -v $(pwd):/work point2cad_repr python /work/main.py
 ```
 
 ### Python Version Compatibility
 
 The container uses Python 3.10 while the host venv uses Python 3.12. The project code is compatible with both — it uses no 3.11+ features (`match/case`, `ExceptionGroup`, `except*`, `type` aliases, or lowercase generic annotations at runtime). The only difference is that package versions inside the container may differ from the host (pip resolves versions compatible with 3.10).
+
+## Docker commands
+```
+docker ps - lists active containers
+
+docker image ls - lists images present on the local system
+
+docker build -t <tag> . - Builds an image from the Dockerfile in the current directory with the given tag
+
+docker run --rm -it --gpus all -e DISPLAY=${DISPLAY} -v $(pwd):/work <image_name> <command>
+```

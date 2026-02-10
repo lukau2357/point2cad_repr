@@ -1,7 +1,6 @@
 import numpy as np
 import itertools
 import open3d as o3d
-import scipy
 import torch
 import trimesh
 
@@ -103,12 +102,9 @@ def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
     color = get_surface_color(surface_type)
     mesh.paint_uniform_color(color)
 
-    if surface_type == "inr":
-        trimesh_mesh = trimesh.Trimesh(vertices, np.array(triangles))
-        return mesh, trimesh_mesh
-
-    else:
-        return mesh
+    # Return both Open3D meshhes and Trimesh meshes for ease of postporcessing and visualization of all algorithmic steps.
+    trimesh_mesh = trimesh.Trimesh(vertices, np.array(triangles))
+    return mesh, trimesh_mesh
 
 def plane_error(points, a, d):
     assert np.allclose(np.linalg.norm(a), 1, rtol = 1e-6)
@@ -145,6 +141,8 @@ def sample_plane(mesh_dim, a, d, cluster, np_rng):
     # y = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
     # Cartesian product of x and y, the second coordinate moves faster.
     # grid = np.array(list(itertools.product(x, y)))
+
+    # Better to compute the grid from the input cluster!
     mean = cluster.mean(axis = 0)
     mean_projected = mean - (np.dot(a, mean) - d) * a
     r1, r2 = np_rng.uniform(low = 0, high = 1, size = (2,)).astype(np.float32)

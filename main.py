@@ -7,7 +7,14 @@ import torch
 import primitive_fitting_utils
 
 from primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder, fit_cylinder_optimized, fit_cone
-from surface_fitter import fit_surface
+from surface_fitter import fit_surface, SURFACE_NAMES
+
+try:
+    import mesh_postprocessing
+    HAS_PYMESH = True
+except ImportError:
+    HAS_PYMESH = False
+    print("PyMesh not available. Post-processing (clipping/topology) will be skipped.")
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEVICE = "cpu"
@@ -50,6 +57,10 @@ if __name__ == "__main__":
     ])
 
     meshes = []
+    trimesh_meshes = []
+    surface_types = []
+    cluster_points_list = []
+
     device = "cuda:0"
     np_rng = np.random.default_rng(41)
     torch.manual_seed(41)
@@ -74,22 +85,46 @@ if __name__ == "__main__":
             inr_mesh_kwargs = {"mesh_dim": 100, "uv_margin": 0.2}
         )
 
+        surface_type_name = SURFACE_NAMES[fitting_result["surface_id"]]
         print(f"Best surface: {fitting_result['result']['surface_type']}")
         print(f"Error: {fitting_result['result']['error']}")
-        # if fitting_result['surface_id'] == 3:
-        meshes.append(fitting_result["mesh"])
 
-    # O3D point cloud:
-    # https://www.open3d.org/docs/release/python_api/open3d.geometry.PointCloud.html#open3d.geometry.PointCloud.points
+        meshes.append(fitting_result["mesh"])
+        trimesh_meshes.append(fitting_result["trimesh_mesh"])
+        surface_types.append(surface_type_name)
+        cluster_points_list.append(cluster)
+
+    # Visualize fitted meshes with point cloud
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.colors = o3d.utility.Vector3dVector(colors)
+    o3d.visualization.draw_geometries(meshes + [pcd])
 
-    # O3D utilities:
-    # https://www.open3d.org/docs/release/python_api/open3d.utility.Vector3dVector.html
-    
-    # Draw geometries:
-    # https://www.open3d.org/docs/release/python_api/open3d.visualization.draw_geometries.html
-    meshes.append(pcd)
-    o3d.visualization.draw_geometries(meshes)
-    # o3d.visualization.draw_geometries([pcd])
+    # Post-processing: clipping and topology extraction (requires PyMesh)
+    if HAS_PYMESH:
+        out_dir = os.path.join(os.path.dirname(path), "output")
+        os.makedirs(out_dir, exist_ok = True)
+
+        unclipped_path = os.path.join(out_dir, "unclipped.ply")
+        clipped_path = os.path.join(out_dir, "clipped.ply")
+        topology_path = os.path.join(out_dir, "topology.json")
+
+        pm_meshes = mesh_postprocessing.save_unclipped_meshes(
+            trimesh_meshes, surface_types, unclipped_path
+        )
+        print(f"Unclipped meshes saved to {unclipped_path}")
+
+        clipped_meshes = mesh_postprocessing.save_clipped_meshes(
+            pm_meshes, cluster_points_list, surface_types, clipped_path
+        )
+        print(f"Clipped meshes saved to {clipped_path}")
+
+        mesh_postprocessing.save_topology(clipped_meshes, topology_path)
+        print(f"Topology saved to {topology_path}")
+
+        # Visualize clipped result
+        clipped_o3d = o3d.io.read_triangle_mesh(clipped_path)
+        clipped_o3d.compute_vertex_normals()
+        o3d.visualization.draw_geometries([clipped_o3d, pcd])
+    else:
+        print("Skipping post-processing (PyMesh not available). Run inside Docker container.")

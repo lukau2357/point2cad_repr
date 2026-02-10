@@ -7,15 +7,21 @@ import itertools
 import json
 
 from collections import Counter
+from color_config import get_surface_color
 
-def save_unclipped_meshes(trimesh_meshes, color_list, out_path):
+def _surface_color_rgba(surface_type):
+    # Convert surface type string to trimesh-compatible RGBA uint8 array
+    rgb = get_surface_color(surface_type)
+    return np.array([*(rgb * 255).astype(np.uint8), 255], dtype=np.uint8)
+
+def save_unclipped_meshes(trimesh_meshes, surface_types, out_path):
     # Reference: io_utils.py:13-33
     colored_meshes = []
     pm_meshes = []
 
     for s in range(len(trimesh_meshes)):
         tri_mesh = trimesh_meshes[s]
-        tri_mesh.visual.face_colors = color_list[s]
+        tri_mesh.visual.face_colors = _surface_color_rgba(surface_types[s])
         colored_meshes.append(tri_mesh)
         pm_meshes.append(
             pymesh.form_mesh(
@@ -28,13 +34,14 @@ def save_unclipped_meshes(trimesh_meshes, color_list, out_path):
     combined.export(out_path)
     return pm_meshes
 
-def save_clipped_meshes(pm_meshes, clusters, color_list, out_path, area_multiplier = 2.0):
+def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multiplier = 2.0):
     # Reference: io_utils.py:36-121
 
     # Step 1: Merge all surface meshes, tracking face provenance.
     # https://github.com/PyMesh/PyMesh/blob/main/python/pymesh/meshutils/merge_meshes.py
     pm_merged = pymesh.merge_meshes(pm_meshes)
-    # For each new face, face_sources is the index of the original face the new face originated from.
+    # For each new face, face_sources contains the index of the input mesh/surface from which the new face originated from.
+    # (Surface level mapping)
     face_sources_merged = pm_merged.get_attribute("face_sources").astype(np.int32)
 
     # Step 2: Resolve self-intersections.
@@ -44,11 +51,14 @@ def save_clipped_meshes(pm_meshes, clusters, color_list, out_path, area_multipli
     # Step 3: Remove duplicate vertices.
     pm_resolved, _ = pymesh.remove_duplicated_vertices(pm_resolved_ori, tol = 1e-6, importance = None)
 
-    # Two-level provenance: resolved face -> merged face -> original surface.
-    # After resolving self-intersections (edge computation), for each new face return the ID of the face 
-    # that contained it in the original mesh.
+    # For each face after self intersection resolution, returns the index of the face from which the new face was subdivided from
+    # If no subdivision is performed, the the face points to itself.
+    # Two-level provenance: resolved face -> merged face -> original surface/mesh
     face_sources_resolved_ori = pm_resolved_ori.get_attribute("face_sources").astype(np.int32)
     # Track original face from the obtained merged face
+    # length of face_sources_from_fit - length of faces after self-intersections are resolved.
+    # This maps the new faces after self intersetction resolution to the faces before merging, via the exaplined
+    # two-level provenance!
     face_sources_from_fit = face_sources_merged[face_sources_resolved_ori]
 
     # Step 4: Connected component decomposition.
@@ -78,7 +88,11 @@ def save_clipped_meshes(pm_meshes, clusters, color_list, out_path, area_multipli
     ]
 
     indices_sources = [
-        face_sources_from_fit[connected_node_labels == item][0]
+        # face_sources_from_fit[connected_node_labels == item] - all input meshes that correspond to the current component
+        # selects the first one as representative. Reasoning behind this, is this correct?
+        # Naturally, a single connected component should be covered by exactly one input mesh?
+        # TODO: Actually a rough first-pass grouping, analyze this more!!!
+        face_sources_from_fit[connected_node_labels == item][0] 
         for item in np.array(most_common_groupids)
     ]
 
@@ -86,7 +100,9 @@ def save_clipped_meshes(pm_meshes, clusters, color_list, out_path, area_multipli
     clipped_meshes = []
 
     for p in range(len(clusters)):
+        # (cluster_size, 3)
         one_cluster_points = clusters[p]
+        # All meshes associated with the current cluster, which are regular AFTER processing so far.
         submeshes_cur = [
             x for x, y in zip(submeshes, np.array(indices_sources) == p)
             if y and len(x.faces) > 2
@@ -96,8 +112,12 @@ def save_clipped_meshes(pm_meshes, clusters, color_list, out_path, area_multipli
             print(f"Warning: surface {p} has no valid components after clipping.")
             clipped_meshes.append(trimesh.Trimesh())
             continue
-
+        
+        # https://trimesh.org/trimesh.proximity.html#trimesh.proximity.closest_point
+        # Then for each point of the cluster extract the id of the closest mesh in submesh_cur
+        # The resulting array is of shape (cluster_size)
         nearest_submesh = np.argmin(
+            # Inner array is (cluster_size, len(submesh_cur))
             np.array([
                 trimesh.proximity.closest_point(item, one_cluster_points)[1]
                 for item in submeshes_cur
@@ -106,12 +126,22 @@ def save_clipped_meshes(pm_meshes, clusters, color_list, out_path, area_multipli
         )
 
         counter_nearest = Counter(nearest_submesh).most_common()
+        # Compute the ratio submesh_area / number of points it contains - area per point
+        # This is of shape [K], where K <= len(submesh_cur)
+        # Well fitting submesh should have low area per point.
         area_per_point = np.array([
             submeshes_cur[item[0]].area / item[1] for item in counter_nearest
         ])
 
+        # np.array(counter_nearest) is of shape (K, 2). First entry is the cluster_id, the second entry
+        # is the number of supporting points
         result_indices = np.array(counter_nearest)[:, 0][
             np.logical_and(
+                # Compare each area_per_point with the first non-zero element of area_per_point multiplier by area_multiplier
+                # First element of area_per_point will contain the best fitting fragment/submesh, with respect to the number
+                # of points closest to it. Allowance is best_area_per_point * 2 (default value of area_multiplier)
+                # but this is parametrizable. Remember, smaller area_per_point is better
+                # Of course, we disallow fragments with zero area - covered by the second condition.
                 area_per_point < area_per_point[np.nonzero(area_per_point)[0][0]] * area_multiplier,
                 area_per_point != 0,
             )
@@ -119,7 +149,7 @@ def save_clipped_meshes(pm_meshes, clusters, color_list, out_path, area_multipli
 
         result_submesh_list = [submeshes_cur[item] for item in result_indices]
         clipped_mesh = trimesh.util.concatenate(result_submesh_list)
-        clipped_mesh.visual.face_colors = color_list[p]
+        clipped_mesh.visual.face_colors = _surface_color_rgba(surface_types[p])
         clipped_meshes.append(clipped_mesh)
 
     clipped = trimesh.util.concatenate(clipped_meshes)
