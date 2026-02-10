@@ -42,6 +42,7 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 &
 RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 60 \
         --slave /usr/bin/g++ g++ /usr/bin/g++-9
 
+# ---------- Build PyMesh with numpy<2.0 constraint ----------
 ENV ROOT_PYMESH=/opt/pymesh
 RUN mkdir -p ${ROOT_PYMESH} && \
     cd ${ROOT_PYMESH} && \
@@ -51,17 +52,24 @@ RUN mkdir -p ${ROOT_PYMESH} && \
     git submodule update --init && \
     sed -i '43s|cwd="/root/PyMesh/docker/patches"|cwd="'${ROOT_PYMESH}'/docker/patches"|' \
         ${ROOT_PYMESH}/docker/patches/patch_wheel.py && \
-    pip install -r ${ROOT_PYMESH}/python/requirements.txt && \
+    echo "numpy<2.0" > /tmp/numpy-constraint.txt && \
+    pip install -c /tmp/numpy-constraint.txt -r ${ROOT_PYMESH}/python/requirements.txt && \
     python setup.py bdist_wheel && \
     rm -rf build_3.10 third_party/build && \
     python ${ROOT_PYMESH}/docker/patches/patch_wheel.py dist/pymesh2*.whl && \
     pip install dist/pymesh2*.whl && \
-    python -c "import pymesh; pymesh.test()"
+    # Patch pymesh to remove numpy.testing.Tester (removed in numpy 2.0)
+    # Locate __init__.py via site-packages (without importing pymesh)
+    PYMESH_INIT=$(python -c "import site; print(site.getsitepackages()[0])")/pymesh/__init__.py && \
+    sed -i 's/^from numpy.testing import Tester$/# Removed: Tester dropped in numpy 2.0/' "$PYMESH_INIT" && \
+    sed -i 's/^test = Tester().test$/# Removed: Tester dropped in numpy 2.0/' "$PYMESH_INIT" && \
+    python -c "import pymesh; print('PyMesh OK')"
 
+# ---------- Project dependencies (modern numpy allowed) ----------
 RUN pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cu126
 
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --ignore-installed \
     numpy \
     scipy \
     open3d \

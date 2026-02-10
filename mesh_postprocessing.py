@@ -45,26 +45,38 @@ def save_clipped_meshes(pm_meshes, clusters, color_list, out_path, area_multipli
     pm_resolved, _ = pymesh.remove_duplicated_vertices(pm_resolved_ori, tol = 1e-6, importance = None)
 
     # Two-level provenance: resolved face -> merged face -> original surface.
+    # After resolving self-intersections (edge computation), for each new face return the ID of the face 
+    # that contained it in the original mesh.
     face_sources_resolved_ori = pm_resolved_ori.get_attribute("face_sources").astype(np.int32)
+    # Track original face from the obtained merged face
     face_sources_from_fit = face_sources_merged[face_sources_resolved_ori]
 
     # Step 4: Connected component decomposition.
     tri_resolved = trimesh.Trimesh(vertices = pm_resolved.vertices, faces = pm_resolved.faces)
+    # Face adjacency matrix of the deduplicated merged mesh. Using Trimesh API for reamining operations.
     face_adjacency = tri_resolved.face_adjacency
+    # https://trimesh.org/trimesh.graph.html#trimesh.graph.connected_component_labels
+    # Mesh graph node are faces, and two faces are adjacent if they share the same edge/line. This computes 
+    # the connected components of this graph - which can be interpreted as a dual graph of the input. 
+    # So the number of vertices is the number of faces - each face gets adjoined a connected component label!
     connected_node_labels = trimesh.graph.connected_component_labels(
         edges = face_adjacency, node_count = len(tri_resolved.faces)
     )
 
+    # Order connected components by number of faces in descending order.
     most_common_groupids = [item[0] for item in Counter(connected_node_labels).most_common()]
 
     # Step 5: Extract submeshes and assign each to its source surface.
     submeshes = [
         trimesh.Trimesh(
+            # Some vertices might not end up in the current submesh?
             vertices = np.array(tri_resolved.vertices),
+            # Extract all faces belonging to the current connected component
             faces = np.array(tri_resolved.faces)[np.where(connected_node_labels == item)]
         )
         for item in most_common_groupids
     ]
+
     indices_sources = [
         face_sources_from_fit[connected_node_labels == item][0]
         for item in np.array(most_common_groupids)
