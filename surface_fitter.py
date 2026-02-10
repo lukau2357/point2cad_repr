@@ -174,4 +174,7 @@ def fit_surface(cluster,
     mesh = resolve_mesh(resulting_min, results[resulting_min], cluster, np_rng, device,
                         plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
 
-    return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh}
+    if resulting_min == SURFACE_INR:
+        return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
+
+    return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh[0], "trimesh_mesh": mesh[1]}

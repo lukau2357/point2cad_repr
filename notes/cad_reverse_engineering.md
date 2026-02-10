@@ -21,7 +21,7 @@ In Point2CAD, the first stage after being provided a clustering of a set of 3D p
 
 Additionally, they fit an **INR** implicit neural representation surface to a given set of points. INR is an autoencoder neural network, the encoder maps 3D points into a 2D latent space, and the decoder takes these latent representations and maps them back to the original 3D space. Before we continue, let us define what an open/closed parametrization of a surface means. Consider cylindric coordinates: $(Rcos\theta, Rsin\theta, h)$. This is a 2D parametrization, $\theta \in [0, 2\pi]$ and $h \in [0, H]$. This parametrization is **closed** in $\theta$ - periodic, and **open** in $h$ - non-periodic. Our INR generates a latent parametrization of the surface, in the form of $(u, v)$ coordinates. However, we do not know in advance if the optimal surface should be open/closed in $uv$, so the authors fit all 4 possible combinations of openness/closedness in $uv$. The INR neural network accomodates for this: (https://github.com/prs-eth/point2cad/blob/main/point2cad/fitting_one_surface.py#L758, https://github.com/prs-eth/point2cad/blob/main/point2cad/fitting_one_surface.py#L772).
 
-![no figure](./figures/inr_1.png)
+![no figure](../figures/inr_1.png)
 
 Regardless of openness/closedness, the latent space ends up being a unit square $[-1, 1]^{2}$. In the code, they also talk about **lifted latent space**, those are coordinates $(u_1, u_2, v_1, v_2)$, this is important for loss components not included in the paper, it's arguable if these components are even important - if they were important for SOTA results they would have surely added them to the paper. Regardless, the main component of the loss function is reconstruction error. There are 2 additional loss components not included in the original paper:
 
@@ -168,7 +168,7 @@ $$
 * Default noise magnitude for both 3D and UV seems to be 0.005: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L313
 
 * Our INR implementation vs actual INR implementation:
-![no figure](./figures/ours_vs_theirs_inr.png)
+![no figure](../figures/ours_vs_theirs_inr.png)
 
 * Error threshold for simple surfaces, kept the same for current implementation. Instead of additive error threshold, look at ratio between INR error and simple error. Instead of absolute error threshold for fixing degenerate cones, look at ratio between plane error and cone error. Mention that unlike in the original implementation, we sidestep INR fitting unless it is absolutely necessary.
 

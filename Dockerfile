@@ -2,11 +2,13 @@ FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get -y update --fix-missing && \
-    apt-get install -y \
+RUN apt -y update --fix-missing && \
+    apt install -y \
         gosu \
         gcc \
         g++ \
+        gcc-9 \
+        g++-9 \
         git \
         cmake \
         libgmp-dev \
@@ -18,23 +20,27 @@ RUN apt-get -y update --fix-missing && \
         libxrender1 \
         libspatialindex-dev \
         software-properties-common \
+        curl \
         zip \
         unzip \
         patchelf && \
     add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y \
+    apt update && \
+    apt install -y \
         python3.10 \
         python3.10-dev \
         python3.10-venv \
         python3.10-distutils && \
-    apt-get clean && \
+    apt clean && \
     rm -rf /var/lib/apt/lists/*
 
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
-    python -m ensurepip --upgrade && \
-    pip install --upgrade pip setuptools wheel
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python && \
+    pip install --upgrade setuptools wheel
+
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 60 \
+        --slave /usr/bin/g++ g++ /usr/bin/g++-9
 
 ENV ROOT_PYMESH=/opt/pymesh
 RUN mkdir -p ${ROOT_PYMESH} && \
@@ -61,7 +67,8 @@ RUN pip install --no-cache-dir \
     open3d \
     pyvista \
     matplotlib \
-    tqdm
+    tqdm \
+    trimesh
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

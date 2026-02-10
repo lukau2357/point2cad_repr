@@ -3,11 +3,10 @@ import numpy as np
 import math
 import tqdm
 import time
-import open3d as o3d
+import trimesh
 
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import TensorDataset, DataLoader
-from color_config import get_surface_color
 from primitive_fitting_utils import triangulate_and_mesh, grid_trimming
 
 def encoder_to_uv(output, is_closed):
@@ -244,8 +243,10 @@ class INRNetwork(torch.nn.Module):
         points = self.sample_points(mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = uv_margin)
         # mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device)
         mask = None
-        return triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr", mask = mask)
-
+        meshes = triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr", mask = mask)
+        # Contains Open3D mesh and Trimesh mesh for INR in particular
+        return meshes
+    
 class LinearWarmupCosineAnnealingLR(_LRScheduler):
     def __init__(self, optimizer, warmup_steps, max_steps, eta_min = 0.0, last_epoch = -1):
         assert max_steps > warmup_steps, "max_steps must be greater than warmup_steps"

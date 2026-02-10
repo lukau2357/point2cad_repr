@@ -3,6 +3,7 @@ import itertools
 import open3d as o3d
 import scipy
 import torch
+import trimesh
 
 from color_config import get_surface_color
 
@@ -101,7 +102,13 @@ def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
     mesh.compute_vertex_normals()
     color = get_surface_color(surface_type)
     mesh.paint_uniform_color(color)
-    return mesh
+
+    if surface_type == "inr":
+        trimesh_mesh = trimesh.Trimesh(vertices, np.array(triangles))
+        return mesh, trimesh_mesh
+
+    else:
+        return mesh
 
 def plane_error(points, a, d):
     assert np.allclose(np.linalg.norm(a), 1, rtol = 1e-6)
