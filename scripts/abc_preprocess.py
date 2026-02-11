@@ -3,6 +3,7 @@ import glob
 import os
 import yaml
 import numpy as np
+import json
 from collections import Counter
 
 def find_model_files(abc_dir, model_id):
@@ -150,6 +151,10 @@ def list_available_models(abc_dir, max_display = 20):
         print(f"  First {max_display}: {complete[:max_display]}")
     else:
         print(f"  IDs: {complete}")
+
+    with open("../output/tmp_models.json", "w+", encoding = "utf-8") as f:
+        json.dump(complete, f, indent = 4)
+    
     return complete
 
 def export_xyzc(points, labels, output_path):

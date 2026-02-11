@@ -35,7 +35,7 @@ def rotation_matrix_a_to_b(A, B):
 
     return R
 
-def grid_trimming(cluster, vertices, size_u, size_v, device, threshold_multiplier = 3.0):
+def grid_trimming(cluster, vertices, size_u, size_v, device, threshold_multiplier = 3.0, spacing_percentile = 90):
     grid = vertices.reshape(size_u, size_v, -1)
     grid = grid[:, :, np.newaxis, :]
     grid = grid.transpose((3, 2, 0, 1))
@@ -48,8 +48,9 @@ def grid_trimming(cluster, vertices, size_u, size_v, device, threshold_multiplie
 
     cluster_dists = torch.cdist(cluster, cluster)
     cluster_dists.fill_diagonal_(float("inf"))
-    median_spacing = cluster_dists.min(dim = -1).values.median().item()
-    threshold = threshold_multiplier * median_spacing
+    nn_dists = cluster_dists.min(dim = -1).values
+    spacing = torch.quantile(nn_dists, spacing_percentile / 100.0).item()
+    threshold = threshold_multiplier * spacing
 
     cell_means = cell_means.reshape((-1, 3))
     D = torch.cdist(cell_means, cluster)
@@ -182,10 +183,12 @@ def sample_plane(mesh_dim, a, d, cluster, np_rng, sampling_deviation = 0.1):
 
 def generate_plane_mesh(mesh_dim, a, d, cluster, np_rng, device,
                         plane_sampling_deviation = 0.1,
-                        threshold_multiplier = 3.0):
+                        threshold_multiplier = 3.0,
+                        spacing_percentile = 90):
     vertices = sample_plane(mesh_dim, a, d, cluster, np_rng, sampling_deviation = plane_sampling_deviation)
     mask = grid_trimming(cluster, vertices, mesh_dim, mesh_dim, device,
-                         threshold_multiplier = threshold_multiplier)
+                         threshold_multiplier = threshold_multiplier,
+                         spacing_percentile = spacing_percentile)
     mesh = triangulate_and_mesh(vertices, mesh_dim, mesh_dim, "plane", mask = mask)
     return mesh
 
@@ -209,10 +212,12 @@ def sample_sphere(dim_theta, dim_lambda, radius, center):
     return points.astype(np.float32)
 
 def generate_sphere_mesh(dim_theta, dim_lambda, radius, center, cluster, device,
-                         threshold_multiplier = 3.0):
+                         threshold_multiplier = 3.0,
+                         spacing_percentile = 90):
     vertices = sample_sphere(dim_theta, dim_lambda, radius, center)
     mask = grid_trimming(cluster, vertices, dim_theta, dim_lambda, device,
-                         threshold_multiplier = threshold_multiplier)
+                         threshold_multiplier = threshold_multiplier,
+                         spacing_percentile = spacing_percentile)
     mesh = triangulate_and_mesh(vertices, dim_theta, dim_lambda, "sphere", mask = mask)
     return mesh
 
@@ -253,11 +258,13 @@ def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_
 
 def generate_cylinder_mesh(dim_theta, dim_height, radius, center, axis, cluster, device,
                            threshold_multiplier = 3.0,
-                           cylinder_height_margin = 0.1):
+                           cylinder_height_margin = 0.1,
+                           spacing_percentile = 90):
     vertices = sample_cylinder(dim_theta, dim_height, radius, center, axis, cluster,
                                height_margin = cylinder_height_margin)
     mask = grid_trimming(cluster, vertices, dim_theta, 2 * dim_height, device,
-                         threshold_multiplier = threshold_multiplier)
+                         threshold_multiplier = threshold_multiplier,
+                         spacing_percentile = spacing_percentile)
     mesh = triangulate_and_mesh(vertices, dim_theta, 2 * dim_height, "cylinder", mask = mask)
     return mesh
 
@@ -317,10 +324,12 @@ def sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, heig
 def generate_cone_mesh(dim_theta, dim_height, vertex, axis, theta, cluster_points, device,
                        threshold_multiplier = 3.0,
                        cone_height_margin = 0.1,
-                       cone_single_sided = True):
+                       cone_single_sided = True,
+                       spacing_percentile = 90):
     vertices = sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, height_margin = cone_height_margin, single_sided = cone_single_sided)
     mask = grid_trimming(cluster_points, vertices, dim_theta, dim_height, device,
-                         threshold_multiplier = threshold_multiplier)
+                         threshold_multiplier = threshold_multiplier,
+                         spacing_percentile = spacing_percentile)
     mesh = triangulate_and_mesh(vertices, dim_theta, dim_height, "cone", mask = mask)
     return mesh
 

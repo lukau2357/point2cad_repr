@@ -53,11 +53,17 @@ def cylinder_benchmark(cluster):
     print(f"Cylinder convergence status: {res_optimized['metadata']['optimizer_converged']}\n")
 
 if __name__ == "__main__":
-    out_dir = "output"
+    import argparse
+    parser = argparse.ArgumentParser(description = "Point2CAD reproduction pipeline")
+    parser.add_argument("--input", type = str, required = False, help = "Path to .xyzc input file")
+    parser.add_argument("--output_dir", type = str, default = "output", help = "Output directory")
+    args = parser.parse_args()
+
+    out_dir = args.output_dir
 
     # Docker mode: run full pipeline and save all output files
     if HAS_PYMESH:
-        path = os.path.join("sample_clouds", "abc_00470.xyzc")
+        path = args.input
         data = np.loadtxt(path)
         points = data[:, :3]
         if NORMALIZE_POINTS:
@@ -142,7 +148,7 @@ if __name__ == "__main__":
         print(f"Unclipped meshes saved to {unclipped_path}")
 
         clipped_meshes = mesh_postprocessing.save_clipped_meshes(
-            pm_meshes, cluster_points_list, surface_types, clipped_path, area_multiplier = 1.1
+            pm_meshes, cluster_points_list, surface_types, clipped_path, area_multiplier = 1.5
         )
         print(f"Clipped meshes saved to {clipped_path}")
 

@@ -93,7 +93,7 @@ def cone_special_handling(results, errors, simple_error_threshold, plane_cone_ra
     # If cone is near a degenerate cone, try the next best simple surface
     cone_diff_pi2 = abs(cone_angle - np.pi / 2)
     cone_diff_0 = cone_angle
-    print(f"0 diff: {cone_diff_0} PI/2 diff: {cone_diff_pi2}")
+    
     if abs(cone_angle - np.pi / 2) < cone_theta_tolerance_rad or cone_angle < cone_theta_tolerance_rad:
         simple_min = np.argmin(errors[:-1])
 
