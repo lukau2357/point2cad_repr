@@ -165,13 +165,13 @@ def sample_plane(mesh_dim, a, d, cluster, np_rng, sampling_deviation = 0.1):
     y_cords = (cluster - mean) @ y[:, np.newaxis]
 
     x_min = x_cords.min()
-    x_min += x_min * sampling_deviation
+    x_min -= abs(x_min) * sampling_deviation
     x_max = x_cords.max()
-    x_max += x_max * sampling_deviation
+    x_max += abs(x_max) * sampling_deviation
     y_min = y_cords.min()
-    y_min += y_min * sampling_deviation
+    y_min -= abs(y_min) * sampling_deviation
     y_max = y_cords.max()
-    y_max += y_max * sampling_deviation
+    y_max += abs(y_max) * sampling_deviation
 
     x_grid = np.linspace(x_min, x_max, mesh_dim)
     y_grid = np.linspace(y_min, y_max, mesh_dim)
@@ -231,8 +231,8 @@ def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_
 
     min_proj = np.squeeze(projection[arg_min_proj])
     max_proj = np.squeeze(projection[arg_max_proj])
-    min_proj += min_proj * height_margin
-    max_proj += max_proj * height_margin
+    min_proj -= abs(min_proj) * height_margin
+    max_proj += abs(max_proj) * height_margin
 
     theta = np.arange(dim_theta - 1, dtype = np.float32) * np.pi * 2 / dim_theta
     theta = np.concatenate([theta, np.array([2 * np.pi])])

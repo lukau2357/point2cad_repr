@@ -297,13 +297,19 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
 
         X = next(dl_generator)
         X_original = X[0]
-        noise_x = torch.randn(size = X_original.shape, device = device)
-        X_noised = X_original + noise_magnitude_3d * noise_schedule * noise_x
+        if noise_magnitude_3d == 0:
+            X_noised = X_original
+        
+        else:
+            noise_x = torch.randn(size = X_original.shape, device = device)
+            X_noised = X_original + noise_magnitude_3d * noise_schedule * noise_x
 
         uv = model.forward_encoder(X_noised)
-        noise_uv = torch.randn(size = uv.shape, device = device)
-        uv = uv + noise_magnitude_uv * noise_schedule * noise_uv
 
+        if noise_magnitude_uv != 0:
+            noise_uv = torch.randn(size = uv.shape, device = device)
+            uv = uv + noise_magnitude_uv * noise_schedule * noise_uv
+        
         Xhat = model.forward_decoder(uv)
         recon_loss = inr_recon_loss(X_original, Xhat).mean()
         recon_loss.backward()

@@ -214,9 +214,10 @@ def save_topology(clipped_meshes, out_path):
 
         if len(row_indices) > 0 and len(col_indices) > 0:
             corners = [
-                (sample0[item[0]] + sample1[item[1]]) / 2
-                for item in zip(row_indices, col_indices)
+               (sample0[item[0]] + sample1[item[1]]) / 2
+               for item in zip(row_indices, col_indices)
             ]
+            # corners = [sample0[idx] for idx in row_indices]
             intersection_corners.extend(corners)
 
     intersections["corners"] = [arr.tolist() for arr in intersection_corners]

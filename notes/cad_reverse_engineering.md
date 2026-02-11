@@ -267,6 +267,8 @@ Cylinder convergence status: True
 
 * Mention that cylindere benchmark is not comprehensive, in the sense that it does not measure execution time for various point clouds. However, we hypothesize that the speedup will increase as the number of cylinder fitness function evaluations increases - that is where vectorized numpy operations are introduced. If the input point cloud deviates from the cylinder significantlly, more convergence steps will be necessary, thereby requiring more function evaluations with (un)optimized operations.
 
+* Another critical hyperparameter seems to be the number of steps for training the INR. For the two sample point clouds, we found that training the INR for 1500 steps (as opposed to 1000 setps) produced better results. Try increasing this to 2000 perhaps?
+
 ## About misleading paper name
 * On the paper title — yes, it's arguably misleading. "Point2CAD" implies you get a CAD model (a B-Rep solid you can import into SolidWorks/Fusion 360, edit parametrically, export to  STEP). What you actually get is a topology graph — intersection curves and corner points between surface patches. That's a necessary intermediate step toward B-Rep construction, but  it's not a CAD model. You can't manufacture from it, you can't do boolean operations on it, you can't edit features. The gap between "topology of trimmed surface patches" and "actual CAD solid" is substantial — it requires constructing trimmed NURBS patches, stitching them into a watertight shell, and encoding it in a B-Rep kernel like OpenCascade.
 
@@ -372,5 +374,10 @@ Broadcasting: (N, M, 3)
 
 z <- ((x - y) ** 2).sum(dim = -1) => (N, M)
 _, indices <- z.topk(5, largest = False) Pairs of points closest to each other.
-
 ```
+
+* o3d.utility.Vector3dVector - Can represent ordinary 3d vectors/points
+* o3d.utility.Vector3iVector - Collection of 2D vectors (int32), representing linked points. Useful for representing triangles.
+* o3d.utlity.Vector2iVector - Collection of 3D vectors (int32), representing linked points. Useful for representing lines.
+
+* Downloading ABC dataset chunks handle: https://archive.nyu.edu/handle/2451/43778. Supposedly, we require META/FEAT and OBJ files to generate segmented point clouds from here.
