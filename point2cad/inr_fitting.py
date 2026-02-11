@@ -7,7 +7,7 @@ import trimesh
 
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import TensorDataset, DataLoader
-from primitive_fitting_utils import triangulate_and_mesh, grid_trimming
+from .primitive_fitting_utils import triangulate_and_mesh, grid_trimming
 
 def encoder_to_uv(output, is_closed):
     # [B, 2] => [B, 1], depending on open/closed parameter configuration

@@ -7,7 +7,7 @@ import itertools
 import json
 
 from collections import Counter
-from color_config import get_surface_color
+from .color_config import get_surface_color
 
 def _surface_color_rgba(surface_type):
     # Convert surface type string to trimesh-compatible RGBA uint8 array

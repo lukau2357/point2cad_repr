@@ -4,13 +4,13 @@ import open3d as o3d
 import matplotlib.pyplot as plt
 import time
 import torch
-import primitive_fitting_utils
+import point2cad.primitive_fitting_utils as primitive_fitting_utils
 
-from primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder, fit_cylinder_optimized, fit_cone
-from surface_fitter import fit_surface, SURFACE_NAMES
+from point2cad.primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder, fit_cylinder_optimized, fit_cone
+from point2cad.surface_fitter import fit_surface, SURFACE_NAMES
 
 try:
-    import mesh_postprocessing
+    import point2cad.mesh_postprocessing as mesh_postprocessing
     HAS_PYMESH = True
 except ImportError:
     HAS_PYMESH = False

@@ -1,8 +1,8 @@
 import numpy as np
 
-from inr_fitting import fit_inr
-from primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder_optimized, fit_cone
-from primitive_fitting_utils import generate_plane_mesh, generate_sphere_mesh, generate_cylinder_mesh, generate_cone_mesh
+from .inr_fitting import fit_inr
+from .primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder_optimized, fit_cone
+from .primitive_fitting_utils import generate_plane_mesh, generate_sphere_mesh, generate_cylinder_mesh, generate_cone_mesh
 
 SURFACE_PLANE = 0
 SURFACE_SPHERE = 1

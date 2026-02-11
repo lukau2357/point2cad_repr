@@ -4,7 +4,7 @@ import open3d as o3d
 import torch
 import trimesh
 
-from color_config import get_surface_color
+from .color_config import get_surface_color
 
 def rotation_matrix_a_to_b(A, B):
     """

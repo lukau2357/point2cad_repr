@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-import primitive_fitting_utils
+from . import primitive_fitting_utils
 import time
 
 from scipy.optimize import minimize, least_squares
