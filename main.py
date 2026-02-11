@@ -19,7 +19,7 @@ except ImportError:
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEVICE = "cpu"
 
-NORMALIZE_POINTS = False
+NORMALIZE_POINTS = True
 
 def normalize_points(points):
     points = points - np.mean(points, axis = 0, keepdims = True)
@@ -97,16 +97,17 @@ if __name__ == "__main__":
 
             fitting_result = fit_surface(cluster, {
                 "hidden_dim": 64,
-                "use_shortcut": False,
+                "use_shortcut": True,
                 "fraction_siren": 0.5
             }, np_rng, device,
                 plane_cone_ratio_threshold = 4,
                 cone_theta_tolerance_degrees = 10,
-                plane_mesh_kwargs = {"mesh_dim": 100, "threshold_multiplier": 2},
-                sphere_mesh_kwargs = {"dim_theta": 100, "dim_lambda": 100, "threshold_multiplier": 2},
-                cylinder_mesh_kwargs = {"dim_theta": 100, "dim_height": 50, "threshold_multiplier": 2},
-                cone_mesh_kwargs = {"dim_theta": 100, "dim_height": 100, "threshold_multiplier": 2},
-                inr_mesh_kwargs = {"mesh_dim": 100, "uv_margin": 0.2}
+                inr_fit_kwargs = {"max_steps": 1500, "noise_magnitude_3d": 0.05, "noise_magnitude_uv": 0.05, "initial_lr": 1e-1},
+                plane_mesh_kwargs = {"mesh_dim": 200, "threshold_multiplier": 2, "plane_sampling_deviation": 0.4},
+                sphere_mesh_kwargs = {"dim_theta": 200, "dim_lambda": 200, "threshold_multiplier": 2},
+                cylinder_mesh_kwargs = {"dim_theta": 200, "dim_height": 100, "threshold_multiplier": 2, "cylinder_height_margin": 0.4},
+                cone_mesh_kwargs = {"dim_theta": 200, "dim_height": 200, "threshold_multiplier": 2, "cone_height_margin": 0.4},
+                inr_mesh_kwargs = {"mesh_dim": 200, "uv_margin": 0.2, "threshold_multiplier": 1.5}
             )
 
             surface_type_name = SURFACE_NAMES[fitting_result["surface_id"]]
@@ -141,7 +142,7 @@ if __name__ == "__main__":
         print(f"Unclipped meshes saved to {unclipped_path}")
 
         clipped_meshes = mesh_postprocessing.save_clipped_meshes(
-            pm_meshes, cluster_points_list, surface_types, clipped_path
+            pm_meshes, cluster_points_list, surface_types, clipped_path, area_multiplier = 1.1
         )
         print(f"Clipped meshes saved to {clipped_path}")
 
@@ -177,9 +178,10 @@ if __name__ == "__main__":
                 o3d_mesh.compute_vertex_normals()
                 return o3d_mesh
 
-            # Build geometry lists for both windows
+            # Build geometry lists for three windows
             unclipped_geoms = []
             clipped_geoms = []
+            topo_geoms = []
 
             if os.path.exists(unclipped_path):
                 unclipped_geoms.append(trimesh_to_o3d(unclipped_path))
@@ -199,38 +201,47 @@ if __name__ == "__main__":
                     ls.points = o3d.utility.Vector3dVector(pts)
                     ls.lines = o3d.utility.Vector2iVector(lines)
                     ls.paint_uniform_color([0.3, 0.3, 0.3])
-                    clipped_geoms.append(ls)
+                    topo_geoms.append(ls)
 
                 corners = topo.get("corners", [])
                 if len(corners) > 0:
                     corner_pcd = o3d.geometry.PointCloud()
                     corner_pcd.points = o3d.utility.Vector3dVector(np.array(corners))
                     corner_pcd.paint_uniform_color([0.15, 0.15, 0.15])
-                    clipped_geoms.append(corner_pcd)
+                    topo_geoms.append(corner_pcd)
 
-            # Show both windows in parallel using poll_events loop
+            # Three parallel windows
             vis1 = o3d.visualization.Visualizer()
-            vis1.create_window(window_name="Unclipped meshes + point cloud", width=960, height=720, left=0, top=50)
+            vis1.create_window(window_name = "Unclipped + point cloud", width = 640, height = 720, left = 0, top = 50)
             for g in unclipped_geoms:
                 vis1.add_geometry(g)
             vis1.get_render_option().mesh_show_back_face = True
             vis1.get_render_option().point_size = 2.0
 
             vis2 = o3d.visualization.Visualizer()
-            vis2.create_window(window_name="Clipped meshes + topology", width=960, height=720, left=960, top=50)
+            vis2.create_window(window_name = "Clipped meshes", width = 640, height = 720, left = 640, top = 50)
             for g in clipped_geoms:
                 vis2.add_geometry(g)
             vis2.get_render_option().mesh_show_back_face = True
 
-            running1, running2 = True, True
-            while running1 and running2:
+            vis3 = o3d.visualization.Visualizer()
+            vis3.create_window(window_name = "Topology", width = 640, height = 720, left = 1280, top = 50)
+            for g in topo_geoms:
+                vis3.add_geometry(g)
+
+            running1, running2, running3 = True, True, True
+            while running1 and running2 and running3:
                 if running1:
                     running1 = vis1.poll_events()
                     vis1.update_renderer()
                 if running2:
                     running2 = vis2.poll_events()
                     vis2.update_renderer()
+                if running3:
+                    running3 = vis3.poll_events()
+                    vis3.update_renderer()
                 time.sleep(0.01)
 
             vis1.destroy_window()
             vis2.destroy_window()
+            vis3.destroy_window()

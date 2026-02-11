@@ -214,4 +214,6 @@ docker image ls - lists images present on the local system
 docker build -t <tag> . - Builds an image from the Dockerfile in the current directory with the given tag
 
 docker run --rm -it --gpus all -e DISPLAY=${DISPLAY} -v $(pwd):/work <image_name> <command>
+docker run --rm -it --gpus all -v $(pwd):/work <image_name> <command>
+docker run --rm -it --gpus all -v $(pwd):/work point2cad_repr bash
 ```

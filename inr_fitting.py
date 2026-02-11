@@ -238,10 +238,10 @@ class INRNetwork(torch.nn.Module):
         
         return X
 
-    def sample_mesh(self, mesh_dim, uv_bb_min, uv_bb_max, cluster, cluster_mean, cluster_scale, uv_margin = 0.1):
+    def sample_mesh(self, mesh_dim, uv_bb_min, uv_bb_max, cluster, cluster_mean, cluster_scale, uv_margin = 0.1, threshold_multiplier = 3):
         device = next(self.parameters()).device
         points = self.sample_points(mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = uv_margin)
-        # mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device)
+        mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device, threshold_multiplier = threshold_multiplier)
         mask = None
         meshes = triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr", mask = mask)
         # Contains Open3D mesh and Trimesh mesh for INR in particular

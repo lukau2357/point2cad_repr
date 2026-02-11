@@ -86,7 +86,7 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
 
     # Order connected components by number of faces in descending order.
     most_common_groupids = [item[0] for item in Counter(connected_node_labels).most_common()]
-
+    
     # Step 5: Extract submeshes and assign each to its source surface.
     submeshes = [
         trimesh.Trimesh(
@@ -113,7 +113,8 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
     for p in range(len(clusters)):
         # (cluster_size, 3)
         one_cluster_points = clusters[p]
-        # All meshes associated with the current cluster, which are regular AFTER processing so far.
+        # All submeshes associated with the current cluster/fitted surface/original mesh
+        # Which are not degenerate, have at most 2 faces.
         submeshes_cur = [
             x for x, y in zip(submeshes, np.array(indices_sources) == p)
             if y and len(x.faces) > 2
@@ -205,6 +206,10 @@ def save_topology(clipped_meshes, out_path):
         sample0 = np.array(intersection_curves[ci]["pv_points"])
         sample1 = np.array(intersection_curves[cj]["pv_points"])
         dists = scipy.spatial.distance.cdist(sample0, sample1)
+        # Zero positions are indicated by two separate arrays
+        # Row indices - contain i positions of zeros
+        # Col indices - contain j positions of zeros
+        # These should not be averaged?
         row_indices, col_indices = np.where(dists == 0)
 
         if len(row_indices) > 0 and len(col_indices) > 0:
@@ -217,4 +222,4 @@ def save_topology(clipped_meshes, out_path):
     intersections["corners"] = [arr.tolist() for arr in intersection_corners]
 
     with open(out_path, "w") as f:
-        json.dump(intersections, f)
+        json.dump(intersections, f, indent = 4)

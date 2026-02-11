@@ -56,7 +56,7 @@ def grid_trimming(cluster, vertices, size_u, size_v, device, threshold_multiplie
     min_dists = D.min(dim = -1).values
     mask = min_dists < threshold
     mask = mask.reshape((size_u - 1, size_v - 1))
-    print(f"Survived: {mask.sum()} Killed: {mask.numel() - mask.sum()}")
+    # print(f"Survived: {mask.sum()} Killed: {mask.numel() - mask.sum()}")
     return mask
 
 def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
@@ -140,7 +140,7 @@ def cone_error(points : np.ndarray, vertex: np.ndarray, axis: np.ndarray, theta:
     errors = np.abs(h * np.sin(theta) - r * np.cos(theta))
     return np.mean(errors)
 
-def sample_plane(mesh_dim, a, d, cluster, np_rng):
+def sample_plane(mesh_dim, a, d, cluster, np_rng, sampling_deviation = 0.1):
     # x = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
     # y = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
     # Cartesian product of x and y, the second coordinate moves faster.
@@ -163,16 +163,27 @@ def sample_plane(mesh_dim, a, d, cluster, np_rng):
 
     x_cords = (cluster - mean) @ x[:, np.newaxis]
     y_cords = (cluster - mean) @ y[:, np.newaxis]
-    x_grid = np.linspace(x_cords.min(), x_cords.max(), mesh_dim)
-    y_grid = np.linspace(y_cords.min(), y_cords.max(), mesh_dim)
+
+    x_min = x_cords.min()
+    x_min += x_min * sampling_deviation
+    x_max = x_cords.max()
+    x_max += x_max * sampling_deviation
+    y_min = y_cords.min()
+    y_min += y_min * sampling_deviation
+    y_max = y_cords.max()
+    y_max += y_max * sampling_deviation
+
+    x_grid = np.linspace(x_min, x_max, mesh_dim)
+    y_grid = np.linspace(y_min, y_max, mesh_dim)
     grid = np.array(list(itertools.product(x_grid, y_grid)))
     # Return a linear span over the given basis, centered at the mean of the cluster 
     # projected to the plane.
     return (x * grid[:, 0:1] + y * grid[:, 1:2] + mean_projected).astype(np.float32)
 
 def generate_plane_mesh(mesh_dim, a, d, cluster, np_rng, device,
+                        plane_sampling_deviation = 0.1,
                         threshold_multiplier = 3.0):
-    vertices = sample_plane(mesh_dim, a, d, cluster, np_rng)
+    vertices = sample_plane(mesh_dim, a, d, cluster, np_rng, sampling_deviation = plane_sampling_deviation)
     mask = grid_trimming(cluster, vertices, mesh_dim, mesh_dim, device,
                          threshold_multiplier = threshold_multiplier)
     mesh = triangulate_and_mesh(vertices, mesh_dim, mesh_dim, "plane", mask = mask)
@@ -218,8 +229,10 @@ def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_
     arg_min_proj = np.argmin(projection)
     arg_max_proj = np.argmax(projection)
 
-    min_proj = np.squeeze(projection[arg_min_proj]) - height_margin
-    max_proj = np.squeeze(projection[arg_max_proj]) + height_margin
+    min_proj = np.squeeze(projection[arg_min_proj])
+    max_proj = np.squeeze(projection[arg_max_proj])
+    min_proj += min_proj * height_margin
+    max_proj += max_proj * height_margin
 
     theta = np.arange(dim_theta - 1, dtype = np.float32) * np.pi * 2 / dim_theta
     theta = np.concatenate([theta, np.array([2 * np.pi])])
@@ -254,8 +267,10 @@ def sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, heig
     axis = axis / np.linalg.norm(axis)
 
     proj = (cluster_points - vertex) @ axis
-    proj_min = np.min(proj) - height_margin
-    proj_max = np.max(proj) + height_margin
+    proj_min = np.min(proj)
+    proj_max = np.max(proj)
+    proj_min -= proj_min * height_margin
+    proj_max += proj_max * height_margin
 
     if single_sided:
         n_positive = np.sum(proj > 0)
