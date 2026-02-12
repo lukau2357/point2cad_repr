@@ -8,13 +8,14 @@ import point2cad.primitive_fitting_utils as primitive_fitting_utils
 
 from point2cad.primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder, fit_cylinder_optimized, fit_cone
 from point2cad.surface_fitter import fit_surface, SURFACE_NAMES
+from collections import Counter
 
 try:
     import point2cad.mesh_postprocessing as mesh_postprocessing
     HAS_PYMESH = True
 except ImportError:
     HAS_PYMESH = False
-    print("PyMesh not available. Post-processing (clipping/topology) will be skipped.")
+    print("PyMesh not available. Point2CAD pipeline will be skipped.")
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEVICE = "cpu"
@@ -52,17 +53,26 @@ def cylinder_benchmark(cluster):
     print(f"Speedup factor: {speedup}")
     print(f"Cylinder convergence status: {res_optimized['metadata']['optimizer_converged']}\n")
 
+def extract_pc_id(input_name):
+    base_name = os.path.basename(input_name)
+    name = base_name.split("_")[-1].split(".")[0]
+    return name
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description = "Point2CAD reproduction pipeline")
     parser.add_argument("--input", type = str, required = False, help = "Path to .xyzc input file")
     parser.add_argument("--output_dir", type = str, default = "output", help = "Output directory")
+    parser.add_argument("--visualize", action = "store_true", help = "Visualize the results of the algorithm in the output directory")
+    parser.add_argument("--visualize_id", type = str, help = "ID of the point cloud to visualize results for.")
     args = parser.parse_args()
 
     out_dir = args.output_dir
 
     # Docker mode: run full pipeline and save all output files
     if HAS_PYMESH:
+        pc_id = extract_pc_id(args.input)
+        out_dir = os.path.join(out_dir, pc_id)
         path = args.input
         data = np.loadtxt(path)
         points = data[:, :3]
@@ -70,6 +80,14 @@ if __name__ == "__main__":
             points = normalize_points(points)
             data[:, :3] = points
         clusters = data[:, -1].astype(int)
+        cluster_freqs = Counter(clusters).most_common()
+        cluster_freqs = np.array(cluster_freqs)
+
+        print(f"Number of input clusters: {len(cluster_freqs)}")
+        print(f"Maximum number of points per cluster: {np.max(cluster_freqs[:, 1])}")
+        print(f"Minimum number of points per cluster: {np.min(cluster_freqs[:, 1])}")
+        print(f"Average number of points per cluster: {np.mean(cluster_freqs[:, 1])}\n")
+
         unique_clusters = np.unique(clusters)
         num_clusters = len(unique_clusters)
 
@@ -109,7 +127,7 @@ if __name__ == "__main__":
                 plane_cone_ratio_threshold = 4,
                 cone_theta_tolerance_degrees = 10,
                 inr_fit_kwargs = {"max_steps": 1500, "noise_magnitude_3d": 0.05, "noise_magnitude_uv": 0.05, "initial_lr": 1e-1},
-                plane_mesh_kwargs = {"mesh_dim": 200, "threshold_multiplier": 2, "plane_sampling_deviation": 0.4},
+                plane_mesh_kwargs = {"mesh_dim": 200, "threshold_multiplier": 2.2, "plane_sampling_deviation": 0.4},
                 sphere_mesh_kwargs = {"dim_theta": 200, "dim_lambda": 200, "threshold_multiplier": 2},
                 cylinder_mesh_kwargs = {"dim_theta": 200, "dim_height": 100, "threshold_multiplier": 2, "cylinder_height_margin": 0.4},
                 cone_mesh_kwargs = {"dim_theta": 200, "dim_height": 200, "threshold_multiplier": 2, "cone_height_margin": 0.4},
@@ -148,7 +166,12 @@ if __name__ == "__main__":
         print(f"Unclipped meshes saved to {unclipped_path}")
 
         clipped_meshes = mesh_postprocessing.save_clipped_meshes(
-            pm_meshes, cluster_points_list, surface_types, clipped_path, area_multiplier = 1.5
+            pm_meshes, cluster_points_list, surface_types, clipped_path,
+            clip_method = "component_based",
+            # component_filter = "area_per_point",
+            # area_multiplier = 1.5
+            component_filter = "min_support",
+            support_fraction = 0.01
         )
         print(f"Clipped meshes saved to {clipped_path}")
 
@@ -156,11 +179,16 @@ if __name__ == "__main__":
         print(f"Topology saved to {topology_path}")
         print(f"All outputs saved to {out_dir}/")
 
-    else:
-        # Host mode: load saved output files and visualize
+    if args.visualize:
         import json
         import trimesh as tm
 
+        try:
+            out_dir = os.path.join(args.output_dir, pc_id)
+
+        except:
+            out_dir = os.path.join(args.output_dir, args.visualize_id)
+        
         pcd_path = os.path.join(out_dir, "point_cloud.ply")
         unclipped_path = os.path.join(out_dir, "unclipped.ply")
         clipped_path = os.path.join(out_dir, "clipped.ply")

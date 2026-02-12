@@ -1,0 +1,6 @@
+- Different runtimes across different numpy versions.
+- Showcase full pipeline results for different point clouds
+- Discuss that the final result of Point2CAD is not a true CAD - requires true BRep parametric representation
+- What about master thesis, it's likely that the actual work will deviate from the proposed one in master thesis application
+- A lot of notes regarding mathematical machinery, mesh operations and discrepancies between paper and implementation, 10-ish pages,
+  maybe more?

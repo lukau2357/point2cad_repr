@@ -334,3 +334,120 @@ For reference, the individual mesh generation functions that feed into the clipp
 5. The `pymesh.separate_mesh` call on [`io_utils.py:44`](point2cad/io_utils.py#L44) appears to be dead code — its result is never used. The actual component decomposition happens later via trimesh's face adjacency graph ([`io_utils.py:55-62`](point2cad/io_utils.py#L55)).
 
 6. The original INR meshing does not apply grid trimming ([`utils.py:236-252`](point2cad/utils.py#L236)) — there is no mask. It relies entirely on the downstream clipping pipeline to remove artifacts.
+
+## 7. The T-Junction Problem
+
+### Observed Symptom
+
+After the three mesh processing steps (merge → resolve self-intersections → deduplicate
+vertices), the number of connected components **increases** beyond the number of input
+meshes. Empirically observed: 16 input meshes (00000077 ABC sample) (each with 1 component) → 75 components
+after resolve → 172 components after dedup.
+
+This contradicts the expectation that merging and intersection resolution can only **merge**
+components (by creating shared edges between previously separate meshes), never split them.
+
+### What `resolve_self_intersection` Actually Does
+
+When two triangles from different surfaces intersect, the algorithm:
+
+1. Computes the intersection line segment
+2. Inserts new vertices at the intersection endpoints
+3. Subdivides **only the intersecting triangles** into smaller triangles
+
+Critically, it does **not** subdivide neighboring triangles that share an edge with the
+split triangle but are not themselves involved in any intersection.
+
+### How T-Junctions Form
+
+Consider triangles T1, T2, T3 in Mesh A, where T1 shares edge `V1-V4` with T2 and edge
+`V1-V2` with T3. Mesh B intersects T1 (but not T2 or T3), entering through edge `V1-V2`
+at point P and exiting through edge `V1-V4` at point Q:
+
+```
+Before resolution:                  After resolution:
+
+    V1 ------- V2                       V1 --P---- V2
+    | \   T1  /                         | \`./   /
+    |  \     /                          |  `Q   /
+    |   \   /                           | ./ \ /
+    | T2 \ / T3                         |/    /\ T3 (unchanged)
+    V3 --- V4                       V3 --- V4
+                                         ^
+                                    T2 (unchanged)
+
+T1 is subdivided into:
+  T1a = (V1, P, Q)
+  T1b = (P, V2, Q)
+  T1c = (Q, V2, V4)
+```
+
+**Edge analysis after resolution:**
+
+```
+                    Before                          After
+                    ──────                          ─────
+  T1 ↔ T2:         share edge V1─V4  ✓             T1a has V1─Q, T1c has Q─V4
+                                                    T2 still has V1─V4
+                                                    Neither half-edge matches  ✗
+
+  T1 ↔ T3:         share edge V1─V2  ✓             T1a has V1─P, T1b has P─V2
+                                                    T3 still has V1─V2
+                                                    Neither half-edge matches  ✗
+```
+
+The new vertices P and Q create **T-junctions**: points that lie on the interior of an
+edge belonging to a neighboring face, but are not vertices of that face.
+
+```
+Detail of T-junction at edge V1─V4:
+
+    V1 ─────────────────── V4       ← T2's edge (full)
+    V1 ──────── Q                   ← T1a's half-edge
+                Q ──────── V4       ← T1c's half-edge
+
+    T2 sees edge (V1, V4).
+    T1a sees edge (V1, Q).
+    T1c sees edge (Q, V4).
+
+    No shared edge between T2 and any T1 fragment.
+    Vertex Q is on T2's edge but is NOT a vertex of T2.
+    → T-junction: T1 fragments lose adjacency with T2.
+```
+
+### Why `remove_duplicated_vertices` Makes It Worse (75 → 172)
+
+After intersection resolution, vertices from Mesh A and Mesh B at intersection points may
+exist as duplicates (same spatial position, different vertex indices). Merging them via
+`remove_duplicated_vertices(tol=1e-6)` remaps face vertex indices. If two vertices of the
+same tiny sliver triangle merge to the same index, the face gets a degenerate edge
+`(Vi, Vi)`. This degenerate edge matches no neighbor's edge, further fragmenting the
+adjacency graph.
+
+### Impact on Component-Based Clipping
+
+The component-based clipping algorithm assumes connected components correspond to coherent
+surface patches. With T-junction fragmentation:
+
+- A single surface mesh gets split into many small components at every intersection
+- The `[0]` heuristic for source attribution becomes unreliable with many small components
+- Area-per-point filtering operates on fragments rather than whole surfaces
+- Result: jagged clipped meshes, especially for models with many surfaces (e.g., ABC
+  dataset models with 16+ surfaces)
+
+### Possible Mitigations
+
+1. **T-junction stitching**: After resolution, detect vertices lying on edges of
+   neighboring faces and split those faces to incorporate the vertex. Restores proper
+   edge-sharing across T-junctions.
+
+2. **Vertex-based connectivity**: Use vertex adjacency instead of edge adjacency for
+   connected component computation. Two faces sharing even a single vertex are considered
+   connected, bridging T-junctions at the cost of a coarser connectivity graph.
+
+3. **Per-face clipping**: Bypass connected components entirely. Use face provenance
+   (`face_sources_from_fit`) to attribute faces to surfaces, then filter individually.
+
+4. **Tolerance-based edge matching**: When building the face adjacency graph, consider
+   two edges as shared if their vertex positions are within a spatial tolerance, rather
+   than requiring exact vertex index matches.

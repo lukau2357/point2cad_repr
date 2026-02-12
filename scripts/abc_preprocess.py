@@ -1,10 +1,14 @@
 import argparse
 import glob
 import os
+import sys
 import yaml
 import numpy as np
 import json
 from collections import Counter
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from point2cad.color_config import get_surface_color
 
 def find_model_files(abc_dir, model_id):
     obj_dir = os.path.join(abc_dir, "obj", model_id)
@@ -47,9 +51,28 @@ def build_face_to_surface(surfaces, num_faces):
                 face_labels[fi] = sid
     return face_labels
 
-def sample_points_from_mesh(vertices, faces, face_labels, num_points, rng):
-    """Sample points uniformly from mesh faces via barycentric coordinates."""
-    # Compute face areas for weighted sampling
+def _sample_surface(vertices, faces, face_areas, face_labels, sid, n_pts, rng):
+    """Sample n_pts points from a single surface via area-weighted barycentric sampling."""
+    mask = face_labels == sid
+    areas = face_areas * mask
+    probs = areas / areas.sum()
+    sampled_face_ids = rng.choice(len(faces), size = n_pts, p = probs)
+
+    r1 = rng.random(n_pts)
+    r2 = rng.random(n_pts)
+    sqrt_r1 = np.sqrt(r1)
+    w0 = 1 - sqrt_r1
+    w1 = sqrt_r1 * (1 - r2)
+    w2 = sqrt_r1 * r2
+
+    pts = np.zeros((n_pts, 3))
+    for i, fi in enumerate(sampled_face_ids):
+        face = faces[fi]
+        pts[i] = w0[i] * vertices[face[0]] + w1[i] * vertices[face[1]] + w2[i] * vertices[face[2]]
+    return pts
+
+def sample_points_from_mesh(vertices, faces, face_labels, num_points, min_points_per_surface, rng):
+    """Sample num_points globally (area-weighted), then upsample surfaces below min_points_per_surface."""
     face_areas = np.zeros(len(faces))
     for i, face in enumerate(faces):
         if len(face) < 3:
@@ -57,17 +80,16 @@ def sample_points_from_mesh(vertices, faces, face_labels, num_points, rng):
         v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
         face_areas[i] = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
 
-    # Only sample from labeled faces
     valid = face_labels >= 0
     face_areas_valid = face_areas * valid
     total_area = face_areas_valid.sum()
     if total_area == 0:
         return np.zeros((0, 3)), np.zeros(0, dtype = np.int32)
 
+    # Global area-weighted sampling
     probs = face_areas_valid / total_area
     sampled_face_ids = rng.choice(len(faces), size = num_points, p = probs)
 
-    # Barycentric sampling
     r1 = rng.random(num_points)
     r2 = rng.random(num_points)
     sqrt_r1 = np.sqrt(r1)
@@ -77,11 +99,31 @@ def sample_points_from_mesh(vertices, faces, face_labels, num_points, rng):
 
     points = np.zeros((num_points, 3))
     labels = np.zeros(num_points, dtype = np.int32)
-
     for i, fi in enumerate(sampled_face_ids):
         face = faces[fi]
         points[i] = w0[i] * vertices[face[0]] + w1[i] * vertices[face[1]] + w2[i] * vertices[face[2]]
         labels[i] = face_labels[fi]
+
+    # Upsample surfaces below minimum
+    unique_labels, counts = np.unique(labels, return_counts = True)
+    extra_points = []
+    extra_labels = []
+    for sid, count in zip(unique_labels, counts):
+        if count < min_points_per_surface:
+            deficit = min_points_per_surface - count + rng.integers(0, min_points_per_surface // 5 + 1)
+            pts = _sample_surface(vertices, faces, face_areas, face_labels, sid, deficit, rng)
+            extra_points.append(pts)
+            extra_labels.append(np.full(deficit, sid, dtype = np.int32))
+
+    if len(extra_points) > 0:
+        points = np.concatenate([points] + extra_points)
+        labels = np.concatenate([labels] + extra_labels)
+
+    # Print cluster statistics
+    unique_labels, counts = np.unique(labels, return_counts = True)
+    print(f"  Cluster stats: {len(unique_labels)} surfaces, "
+          f"min={counts.min()}, max={counts.max()}, mean={counts.mean():.0f}, "
+          f"total={len(labels)} points")
 
     return points, labels
 
@@ -114,20 +156,71 @@ def analyze_model(abc_dir, model_id):
 
     return vertices, faces, surfaces, curves, face_labels
 
-def visualize_model(vertices, faces, face_labels, num_surfaces, num_points = 10000):
+ABC_TYPE_TO_COLOR_KEY = {
+    "Plane": "plane",
+    "Sphere": "sphere",
+    "Cylinder": "cylinder",
+    "Cone": "cone",
+}
+
+def surface_color_for_label(surfaces, label):
+    abc_type = surfaces[label]["type"]
+    color_key = ABC_TYPE_TO_COLOR_KEY.get(abc_type, "inr")
+    return get_surface_color(color_key)
+
+def visualize_model(vertices, faces, face_labels, surfaces, points, labels):
     import open3d as o3d
-    import matplotlib.pyplot as plt
+    import time
 
-    rng = np.random.default_rng(42)
-    points, labels = sample_points_from_mesh(vertices, faces, face_labels, num_points, rng)
-
-    cmap = plt.cm.tab20
-    colors = np.array([cmap(label / max(num_surfaces - 1, 1))[:3] for label in labels])
-
+    # Point cloud colored by surface type
+    colors = np.array([surface_color_for_label(surfaces, label) for label in labels])
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.colors = o3d.utility.Vector3dVector(colors)
-    o3d.visualization.draw_geometries([pcd], window_name = f"Segmented point cloud ({num_surfaces} surfaces)")
+
+    # Triangle mesh colored by surface type (per-vertex)
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(np.array(faces))
+    vertex_colors = np.ones((len(vertices), 3)) * 0.7
+    for vi in range(len(vertices)):
+        # Find any face containing this vertex to determine its surface label
+        pass
+    # Color faces via vertex colors: assign each vertex the color of its surface
+    vertex_labels = np.full(len(vertices), -1, dtype = np.int32)
+    for fi, face in enumerate(faces):
+        label = face_labels[fi]
+        if label < 0:
+            continue
+        for vi in face:
+            if vertex_labels[vi] < 0:
+                vertex_labels[vi] = label
+    for vi in range(len(vertices)):
+        if vertex_labels[vi] >= 0:
+            vertex_colors[vi] = surface_color_for_label(surfaces, vertex_labels[vi])
+    mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors)
+    mesh.compute_vertex_normals()
+
+    vis1 = o3d.visualization.Visualizer()
+    vis1.create_window(window_name = "Sampled point cloud", width = 640, height = 720, left = 0, top = 50)
+    vis1.add_geometry(pcd)
+    vis1.get_render_option().point_size = 2.0
+
+    vis2 = o3d.visualization.Visualizer()
+    vis2.create_window(window_name = "Original mesh", width = 640, height = 720, left = 640, top = 50)
+    vis2.add_geometry(mesh)
+    vis2.get_render_option().mesh_show_back_face = True
+
+    running1, running2 = True, True
+    while running1 and running2:
+        running1 = vis1.poll_events()
+        vis1.update_renderer()
+        running2 = vis2.poll_events()
+        vis2.update_renderer()
+        time.sleep(0.01)
+
+    vis1.destroy_window()
+    vis2.destroy_window()
 
 def list_available_models(abc_dir, max_display = 20):
     obj_dir = os.path.join(abc_dir, "obj")
@@ -167,7 +260,8 @@ if __name__ == "__main__":
     parser.add_argument("--abc_dir", type = str, required = True, help = "Path to ABC dataset root")
     parser.add_argument("--model_id", type = str, default = None, help = "Analyze/export a single model")
     parser.add_argument("--output_dir", type = str, default = None, help = "Output directory for .xyzc files")
-    parser.add_argument("--num_points", type = int, default = 10000, help = "Number of points to sample per model")
+    parser.add_argument("--num_points", type = int, default = 10000, help = "Total number of points to sample (area-weighted)")
+    parser.add_argument("--min_points_per_surface", type = int, default = 500, help = "Minimum points per surface, undersized clusters are upsampled")
     parser.add_argument("--visualize", action = "store_true", help = "Visualize the sampled point cloud")
     parser.add_argument("--list", action = "store_true", help = "List available models")
     parser.add_argument("--batch", action = "store_true", help = "Batch convert all available models")
@@ -185,10 +279,10 @@ if __name__ == "__main__":
 
         if args.visualize or args.output_dir:
             rng = np.random.default_rng(args.seed)
-            points, labels = sample_points_from_mesh(vertices, faces, face_labels, args.num_points, rng)
+            points, labels = sample_points_from_mesh(vertices, faces, face_labels, args.num_points, args.min_points_per_surface, rng)
 
             if args.visualize:
-                visualize_model(vertices, faces, face_labels, len(surfaces), args.num_points)
+                visualize_model(vertices, faces, face_labels, surfaces, points, labels)
 
             if args.output_dir:
                 os.makedirs(args.output_dir, exist_ok = True)
@@ -208,7 +302,7 @@ if __name__ == "__main__":
             vertices, faces = load_obj(obj_path)
             surfaces, _ = load_features(feat_path)
             face_labels = build_face_to_surface(surfaces, len(faces))
-            points, labels = sample_points_from_mesh(vertices, faces, face_labels, args.num_points, rng)
+            points, labels = sample_points_from_mesh(vertices, faces, face_labels, args.num_points, args.min_points_per_surface, rng)
 
             if len(points) == 0:
                 print(f"  [{i+1}/{len(model_ids)}] {mid}: skipped (no valid faces)")

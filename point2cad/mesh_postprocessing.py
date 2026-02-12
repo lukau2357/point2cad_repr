@@ -32,20 +32,23 @@ def save_unclipped_meshes(trimesh_meshes, surface_types, out_path):
         tri_mesh.visual.face_colors = _surface_color_rgba(surface_types[s])
         colored_meshes.append(tri_mesh)
         if faces.size == 0:
-            # print(f"[DEBUG] Skipping surface {s}: no faces", flush=True)
+            print(f"Warning: surface {s} ({surface_types[s]}) has no faces, inserting degenerate mesh to preserve index alignment.")
+            pm_meshes.append(pymesh.form_mesh(np.zeros((3, 3)), np.array([[0, 1, 2]])))
             continue
-        # print(f"[DEBUG] Calling pymesh.form_mesh for surface {s}...", flush=True)
         sys.stdout.flush()
         pm_meshes.append(
             pymesh.form_mesh(verts, faces)
         )
-        # print(f"[DEBUG] pymesh.form_mesh OK for surface {s}", flush=True)
 
     combined = trimesh.util.concatenate(colored_meshes)
     combined.export(out_path)
     return pm_meshes
 
-def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multiplier = 2.0):
+def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path,
+                        area_multiplier = 2.0,
+                        clip_method = "component",
+                        spacing_percentile = 90, threshold_multiplier = 3.0,
+                        component_filter = "area_per_point", support_fraction = 0.05):
     # Reference: io_utils.py:36-121
 
     # Step 1: Merge all surface meshes, tracking face provenance.
@@ -72,13 +75,130 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
     # two-level provenance!
     face_sources_from_fit = face_sources_merged[face_sources_resolved_ori]
 
+    # Diagnostic: count connected components at each stage to identify where fragmentation occurs.
+    # tri_merged = trimesh.Trimesh(vertices = pm_merged.vertices, faces = pm_merged.faces, process = False)
+    # labels1 = trimesh.graph.connected_component_labels(tri_merged.face_adjacency, len(tri_merged.faces))
+    # n1 = len(np.unique(labels1))
+
+    # tri_resolved_ori = trimesh.Trimesh(vertices = pm_resolved_ori.vertices, faces = pm_resolved_ori.faces, process = False)
+    # labels2 = trimesh.graph.connected_component_labels(tri_resolved_ori.face_adjacency, len(tri_resolved_ori.faces))
+    # n2 = len(np.unique(labels2))
+
+    tri_resolved = trimesh.Trimesh(vertices = pm_resolved.vertices, faces = pm_resolved.faces, process = False)
+    # labels3 = trimesh.graph.connected_component_labels(tri_resolved.face_adjacency, len(tri_resolved.faces))
+    # n3 = len(np.unique(labels3))
+
+    # print(f"Components after merge: {n1}, after resolve: {n2}, after dedup: {n3}")
+
+    if clip_method == "distance":
+        clipped_meshes = _clip_per_face(tri_resolved, face_sources_from_fit, clusters, surface_types, spacing_percentile, threshold_multiplier)
+    elif clip_method == "cluster_mismatch":
+        clipped_meshes = _clip_nearest(tri_resolved, face_sources_from_fit, clusters, surface_types)
+    elif clip_method == "component_based":
+        clipped_meshes = _clip_per_component(tri_resolved, face_sources_from_fit, clusters, surface_types, area_multiplier, component_filter, support_fraction)
+    else:
+        raise ValueError(f"Unknown clip_method '{clip_method}'. Must be one of: 'distance', 'cluster_mismatch', 'component_based'.")
+
+    clipped = trimesh.util.concatenate(clipped_meshes)
+    if len(clipped.vertices) > 0:
+        clipped.export(out_path)
+    else:
+        print(f"Warning: clipped mesh has 0 vertices, skipping export to {out_path}")
+    return clipped_meshes
+
+def _clip_per_face(tri_resolved, face_sources_from_fit, clusters, surface_types,
+                    spacing_percentile, threshold_multiplier):
+    # Triangle center - Barycentric coordinates (1/3, 1/3, 1/3)
+    centroids = tri_resolved.triangles_center
+    clipped_meshes = []
+
+    for p in range(len(clusters)):
+        face_mask = face_sources_from_fit == p
+        face_indices = np.where(face_mask)[0]
+
+        if len(face_indices) == 0:
+            print(f"Warning: surface {p} has no faces after resolution.")
+            clipped_meshes.append(trimesh.Trimesh())
+            continue
+
+        # Compute nearest-neighbor distances within the cluster to infer point spacing
+        cluster_dists = scipy.spatial.distance.cdist(clusters[p], clusters[p])
+        np.fill_diagonal(cluster_dists, np.inf)
+        nn_dists = cluster_dists.min(axis = 1)
+        spacing = np.percentile(nn_dists, spacing_percentile)
+        threshold = spacing * threshold_multiplier
+
+        # For each face, compute the distance from its centroid to the closest cluster point
+        surface_centroids = centroids[face_indices]
+        dists = scipy.spatial.distance.cdist(surface_centroids, clusters[p])
+        min_dists = dists.min(axis = 1)
+
+        # Diagnostics: understand the distance distribution
+        print(f"Surface {p} ({surface_types[p]}):")
+        print(f"  Cluster: {len(clusters[p])} points, NN spacing p{spacing_percentile}={spacing:.6f}")
+        print(f"  Faces: {len(face_indices)}, min_dist range: [{min_dists.min():.6f}, {min_dists.max():.6f}], "
+              f"mean={min_dists.mean():.6f}, median={np.median(min_dists):.6f}")
+        print(f"  Threshold: {threshold:.6f}")
+
+        # Discard faces whose centroid is farther than the threshold
+        keep = min_dists <= threshold
+
+        kept_faces = tri_resolved.faces[face_indices[keep]]
+        print(f"  Result: {keep.sum()}/{len(face_indices)} faces kept")
+
+        mesh = trimesh.Trimesh(vertices = tri_resolved.vertices, faces = kept_faces)
+        mesh.visual.face_colors = _surface_color_rgba(surface_types[p])
+        clipped_meshes.append(mesh)
+
+    return clipped_meshes
+
+def _clip_nearest(tri_resolved, face_sources_from_fit, clusters, surface_types):
+    # Triangle center - Barycentric coordinates (1/3, 1/3, 1/3)
+    centroids = tri_resolved.triangles_center
+
+    # Build a single KD-tree from all cluster points with their surface labels.
+    # For each face centroid, the tree answers "which cluster point is closest?"
+    # If the closest point's surface label does not match the face's provenance
+    # (face_sources_from_fit), the face extends into another surface's territory
+    # after intersection resolution and is discarded from the clipped mesh.
+    all_points = np.concatenate(clusters)
+    all_labels = np.concatenate([np.full(len(c), i, dtype = np.int32) for i, c in enumerate(clusters)])
+    tree = scipy.spatial.cKDTree(all_points)
+    _, nn_indices = tree.query(centroids)
+    nearest_surface = all_labels[nn_indices]
+
+    clipped_meshes = []
+
+    for p in range(len(clusters)):
+        face_mask = face_sources_from_fit == p
+        face_indices = np.where(face_mask)[0]
+
+        if len(face_indices) == 0:
+            print(f"Warning: surface {p} has no faces after resolution.")
+            clipped_meshes.append(trimesh.Trimesh())
+            continue
+
+        # Keep only faces whose nearest cluster point belongs to surface p
+        keep = nearest_surface[face_indices] == p
+        kept_faces = tri_resolved.faces[face_indices[keep]]
+
+        print(f"Surface {p} ({surface_types[p]}): {keep.sum()}/{len(face_indices)} faces kept")
+
+        mesh = trimesh.Trimesh(vertices = tri_resolved.vertices, faces = kept_faces)
+        mesh.visual.face_colors = _surface_color_rgba(surface_types[p])
+        clipped_meshes.append(mesh)
+
+    return clipped_meshes
+
+def _clip_per_component(tri_resolved, face_sources_from_fit, clusters, surface_types,
+                        area_multiplier, component_filter, support_fraction):
     # Step 4: Connected component decomposition.
-    tri_resolved = trimesh.Trimesh(vertices = pm_resolved.vertices, faces = pm_resolved.faces)
-    # Face adjacency matrix of the deduplicated merged mesh. Using Trimesh API for reamining operations.
+    # Face adjacency matrix of the deduplicated merged mesh. Using Trimesh API for remaining operations.
     face_adjacency = tri_resolved.face_adjacency
+
     # https://trimesh.org/trimesh.graph.html#trimesh.graph.connected_component_labels
-    # Mesh graph node are faces, and two faces are adjacent if they share the same edge/line. This computes 
-    # the connected components of this graph - which can be interpreted as a dual graph of the input. 
+    # Mesh graph nodes are faces, and two faces are adjacent if they share the same edge/line. This computes
+    # the connected components of this graph - which can be interpreted as a dual graph of the input.
     # So the number of vertices is the number of faces - each face gets adjoined a connected component label!
     connected_node_labels = trimesh.graph.connected_component_labels(
         edges = face_adjacency, node_count = len(tri_resolved.faces)
@@ -86,11 +206,10 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
 
     # Order connected components by number of faces in descending order.
     most_common_groupids = [item[0] for item in Counter(connected_node_labels).most_common()]
-    
+
     # Step 5: Extract submeshes and assign each to its source surface.
     submeshes = [
         trimesh.Trimesh(
-            # Some vertices might not end up in the current submesh?
             vertices = np.array(tri_resolved.vertices),
             # Extract all faces belonging to the current connected component
             faces = np.array(tri_resolved.faces)[np.where(connected_node_labels == item)]
@@ -98,21 +217,23 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
         for item in most_common_groupids
     ]
 
+    print(len(submeshes))
+
     indices_sources = [
         # face_sources_from_fit[connected_node_labels == item] - all input meshes that correspond to the current component
         # selects the first one as representative. Reasoning behind this, is this correct?
         # Naturally, a single connected component should be covered by exactly one input mesh?
-        # TODO: Actually a rough first-pass grouping, analyze this more!!!
-        face_sources_from_fit[connected_node_labels == item][0] 
+        face_sources_from_fit[connected_node_labels == item][0]
         for item in np.array(most_common_groupids)
     ]
 
-    # Steps 6-7: For each surface, select components by proximity and filter by area.
+    # Steps 6-7: For each surface, select components by proximity and filter.
     clipped_meshes = []
 
     for p in range(len(clusters)):
         # (cluster_size, 3)
         one_cluster_points = clusters[p]
+
         # All submeshes associated with the current cluster/fitted surface/original mesh
         # Which are not degenerate, have at most 2 faces.
         submeshes_cur = [
@@ -124,7 +245,7 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
             print(f"Warning: surface {p} has no valid components after clipping.")
             clipped_meshes.append(trimesh.Trimesh())
             continue
-        
+
         # https://trimesh.org/trimesh.proximity.html#trimesh.proximity.closest_point
         # Then for each point of the cluster extract the id of the closest mesh in submesh_cur
         # The resulting array is of shape (cluster_size)
@@ -138,44 +259,69 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path, area_multi
         )
 
         counter_nearest = Counter(nearest_submesh).most_common()
-        # Compute the ratio submesh_area / number of points it contains - area per point
-        # This is of shape [K], where K <= len(submesh_cur)
-        # Well fitting submesh should have low area per point.
-        area_per_point = np.array([
-            submeshes_cur[item[0]].area / item[1] for item in counter_nearest
-        ])
 
-        # np.array(counter_nearest) is of shape (K, 2). First entry is the cluster_id, the second entry
-        # is the number of supporting points
-        nonzero_indices = np.nonzero(area_per_point)[0]
-        if len(nonzero_indices) == 0:
-            print(f"Warning: surface {p} has only zero-area components.")
-            clipped_meshes.append(trimesh.Trimesh())
-            continue
-        result_indices = np.array(counter_nearest)[:, 0][
-            np.logical_and(
-                # Compare each area_per_point with the first non-zero element of area_per_point multiplier by area_multiplier
-                # First element of area_per_point will contain the best fitting fragment/submesh, with respect to the number
-                # of points closest to it. Allowance is best_area_per_point * 2 (default value of area_multiplier)
-                # but this is parametrizable. Remember, smaller area_per_point is better
-                # Of course, we disallow fragments with zero area - covered by the second condition.
-                area_per_point < area_per_point[nonzero_indices[0]] * area_multiplier,
-                area_per_point != 0,
-            )
-        ]
+        if component_filter == "area_per_point":
+            result_indices = _filter_area_per_point(counter_nearest, submeshes_cur, area_multiplier, p)
+        elif component_filter == "min_support":
+            result_indices = _filter_min_support(counter_nearest, support_fraction, p)
+        else:
+            raise ValueError(f"Unknown component_filter '{component_filter}'. Must be one of: 'area_per_point', 'min_support'.")
 
         result_submesh_list = [submeshes_cur[item] for item in result_indices]
         if len(result_submesh_list) == 0:
-            print(f"Warning: surface {p} has no surviving components after area filtering.")
+            print(f"Warning: surface {p} has no surviving components after filtering.")
             clipped_meshes.append(trimesh.Trimesh())
             continue
         clipped_mesh = trimesh.util.concatenate(result_submesh_list)
         clipped_mesh.visual.face_colors = _surface_color_rgba(surface_types[p])
         clipped_meshes.append(clipped_mesh)
 
-    clipped = trimesh.util.concatenate(clipped_meshes)
-    clipped.export(out_path)
     return clipped_meshes
+
+def _filter_area_per_point(counter_nearest, submeshes_cur, area_multiplier, surface_idx):
+    """Original filtering criterion: keep components whose area-per-point ratio
+    is within area_multiplier of the best (lowest) ratio."""
+    # Compute the ratio submesh_area / number of points it contains - area per point
+    # This is of shape [K], where K <= len(submesh_cur)
+    # Well fitting submesh should have low area per point.
+    area_per_point = np.array([
+        submeshes_cur[item[0]].area / item[1] for item in counter_nearest
+    ])
+
+    # np.array(counter_nearest) is of shape (K, 2). First entry is the cluster_id, the second entry
+    # is the number of supporting points
+    nonzero_indices = np.nonzero(area_per_point)
+    best_app = area_per_point[nonzero_indices].min()
+
+    if len(nonzero_indices[0]) == 0:
+        print(f"Warning: surface {surface_idx} has only zero-area components.")
+        return []
+
+    return np.array(counter_nearest)[:, 0][
+        np.logical_and(
+            # Compare each area_per_point with the first non-zero element of area_per_point multiplied by area_multiplier
+            # First element of area_per_point will contain the best fitting fragment/submesh, with respect to the number
+            # of points closest to it. Allowance is best_area_per_point * 2 (default value of area_multiplier)
+            # but this is parametrizable. Remember, smaller area_per_point is better
+            # Of course, we disallow fragments with zero area - covered by the second condition.
+            area_per_point < best_app * area_multiplier,
+            area_per_point != 0,
+        )
+    ]
+
+def _filter_min_support(counter_nearest, support_fraction, surface_idx):
+    """Support-based filtering: keep components whose number of supporting points
+    is at least support_fraction of the best (most supported) component's count.
+    This penalizes small components with few supporting points regardless of their area."""
+    # counter_nearest is sorted by count descending (from Counter.most_common())
+    # counter_nearest[i] = (submesh_index, num_supporting_points)
+    support_counts = np.array([item[1] for item in counter_nearest])
+    print(support_counts)
+    best_support = support_counts[0]
+    threshold = best_support * support_fraction
+
+    keep_mask = support_counts >= threshold
+    return np.array(counter_nearest)[:, 0][keep_mask]
 
 def save_topology(clipped_meshes, out_path):
     # Reference: io_utils.py:124-171
@@ -213,11 +359,11 @@ def save_topology(clipped_meshes, out_path):
         row_indices, col_indices = np.where(dists == 0)
 
         if len(row_indices) > 0 and len(col_indices) > 0:
-            corners = [
-               (sample0[item[0]] + sample1[item[1]]) / 2
-               for item in zip(row_indices, col_indices)
-            ]
-            # corners = [sample0[idx] for idx in row_indices]
+            # corners = [
+            #    (sample0[item[0]] + sample1[item[1]]) / 2
+            #   for item in zip(row_indices, col_indices)
+            # ]
+            corners = [sample0[idx] for idx in row_indices]
             intersection_corners.extend(corners)
 
     intersections["corners"] = [arr.tolist() for arr in intersection_corners]

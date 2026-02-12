@@ -217,3 +217,21 @@ docker run --rm -it --gpus all -e DISPLAY=${DISPLAY} -v $(pwd):/work <image_name
 docker run --rm -it --gpus all -v $(pwd):/work <image_name> <command>
 docker run --rm -it --gpus all -v $(pwd):/work point2cad_repr bash
 ```
+
+### Point2CAD repr shortcuts
+```
+# Run the algortihm for a sample point cloud
+
+# 2 planes + INR point cloud
+python main.py --input ./sample_clouds/abc_00470.xyzc
+python main.py --visualize --visualize_id 00470
+
+# Planes surrounded by cylinder point cloud
+python main.py --input ./sample_clouds/abc_00949.xyzc
+python main.py --visualize --visualize_id 00949
+
+# Cannon-like point cloud
+
+# ABC dataset inspection and generating point clouds from it
+python abc_preprocess.py --abc_dir ../../abc_dataset --model_id 00000077 --output_dir ../sample_clouds --num_points 30000 --min_points_per_surface 1500 --visualize
+```
