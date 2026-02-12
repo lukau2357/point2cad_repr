@@ -167,11 +167,12 @@ if __name__ == "__main__":
 
         clipped_meshes = mesh_postprocessing.save_clipped_meshes(
             pm_meshes, cluster_points_list, surface_types, clipped_path,
-            clip_method = "component_based",
+            clip_method = "provenance_walk",
+            walk_radius = 4,
+            foreign_threshold = 0.3,
+            # area_multiplier = 1.5,
             # component_filter = "area_per_point",
-            # area_multiplier = 1.5
-            component_filter = "min_support",
-            support_fraction = 0.01
+            # connectivity = "edge",
         )
         print(f"Clipped meshes saved to {clipped_path}")
 

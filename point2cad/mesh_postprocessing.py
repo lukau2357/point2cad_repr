@@ -7,6 +7,8 @@ import itertools
 import json
 
 from collections import Counter
+from scipy.sparse import lil_matrix, csr_matrix, eye as speye
+from scipy.sparse.csgraph import connected_components as sparse_connected_components
 from .color_config import get_surface_color
 
 def _surface_color_rgba(surface_type):
@@ -48,7 +50,9 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path,
                         area_multiplier = 2.0,
                         clip_method = "component",
                         spacing_percentile = 90, threshold_multiplier = 3.0,
-                        component_filter = "area_per_point", support_fraction = 0.05):
+                        component_filter = "area_per_point", support_fraction = 0.05,
+                        connectivity = "edge",
+                        walk_radius = 2, foreign_threshold = 0.5):
     # Reference: io_utils.py:36-121
 
     # Step 1: Merge all surface meshes, tracking face provenance.
@@ -95,9 +99,11 @@ def save_clipped_meshes(pm_meshes, clusters, surface_types, out_path,
     elif clip_method == "cluster_mismatch":
         clipped_meshes = _clip_nearest(tri_resolved, face_sources_from_fit, clusters, surface_types)
     elif clip_method == "component_based":
-        clipped_meshes = _clip_per_component(tri_resolved, face_sources_from_fit, clusters, surface_types, area_multiplier, component_filter, support_fraction)
+        clipped_meshes = _clip_per_component(tri_resolved, face_sources_from_fit, clusters, surface_types, area_multiplier, component_filter, support_fraction, connectivity)
+    elif clip_method == "provenance_walk":
+        clipped_meshes = _clip_provenance_walk(tri_resolved, face_sources_from_fit, clusters, surface_types, walk_radius, foreign_threshold)
     else:
-        raise ValueError(f"Unknown clip_method '{clip_method}'. Must be one of: 'distance', 'cluster_mismatch', 'component_based'.")
+        raise ValueError(f"Unknown clip_method '{clip_method}'. Must be one of: 'distance', 'cluster_mismatch', 'component_based', 'provenance_walk'.")
 
     clipped = trimesh.util.concatenate(clipped_meshes)
     if len(clipped.vertices) > 0:
@@ -190,22 +196,125 @@ def _clip_nearest(tri_resolved, face_sources_from_fit, clusters, surface_types):
 
     return clipped_meshes
 
-def _clip_per_component(tri_resolved, face_sources_from_fit, clusters, surface_types,
-                        area_multiplier, component_filter, support_fraction):
-    # Step 4: Connected component decomposition.
-    # Face adjacency matrix of the deduplicated merged mesh. Using Trimesh API for remaining operations.
-    face_adjacency = tri_resolved.face_adjacency
+def _clip_provenance_walk(tri_resolved, face_sources_from_fit, clusters, surface_types,
+                           walk_radius, foreign_threshold):
+    """Per-face filtering using BFS neighborhood provenance voting.
 
-    # https://trimesh.org/trimesh.graph.html#trimesh.graph.connected_component_labels
-    # Mesh graph nodes are faces, and two faces are adjacent if they share the same edge/line. This computes
-    # the connected components of this graph - which can be interpreted as a dual graph of the input.
-    # So the number of vertices is the number of faces - each face gets adjoined a connected component label!
-    connected_node_labels = trimesh.graph.connected_component_labels(
-        edges = face_adjacency, node_count = len(tri_resolved.faces)
-    )
+    For each face F attributed to surface p, consider all faces reachable within
+    `walk_radius` edge-hops of F. Among these, compute the fraction belonging to a
+    different surface (the "foreign ratio"). If this ratio exceeds `foreign_threshold`,
+    F is likely an excess face extending past an intersection boundary into foreign
+    territory and is discarded.
+
+    Interior faces are surrounded by same-surface faces (low foreign ratio).
+    Excess faces at intersection boundaries are surrounded by the other surface's
+    faces (high foreign ratio).
+    """
+    num_faces = len(tri_resolved.faces)
+
+    # Build sparse edge-based adjacency matrix from trimesh face_adjacency.
+    # face_adjacency is an (E, 2) array of face pairs sharing an edge.
+    adj = tri_resolved.face_adjacency
+    data = np.ones(len(adj) * 2)
+    rows = np.concatenate([adj[:, 0], adj[:, 1]])
+    cols = np.concatenate([adj[:, 1], adj[:, 0]])
+    A = csr_matrix((data, (rows, cols)), shape = (num_faces, num_faces))
+
+    # Compute r-hop reachability matrix: M[i, j] > 0 iff face j is within
+    # walk_radius edge-hops of face i. M is symmetric (if i reaches j, j reaches i),
+    # so the foreign ratio computation exploits this automatically.
+    I = speye(num_faces, format = "csr")
+    M = I.copy()
+    power = I.copy()
+    for _ in range(walk_radius):
+        power = power @ A
+        M = M + power
+    # Binarize: we only care about reachability, not path counts
+    M = (M > 0).astype(np.float64)
+
+    # Total neighborhood size for each face (including itself)
+    total_counts = np.array(M.sum(axis = 1)).flatten()
+
+    # For each surface, count how many neighbors share the same provenance
+    clipped_meshes = []
+
+    for p in range(len(clusters)):
+        face_mask = face_sources_from_fit == p
+        face_indices = np.where(face_mask)[0]
+
+        if len(face_indices) == 0:
+            print(f"Warning: surface {p} has no faces after resolution.")
+            clipped_meshes.append(trimesh.Trimesh())
+            continue
+
+        # Indicator vector: 1 for faces belonging to surface p, 0 otherwise
+        indicator = face_mask.astype(np.float64)
+        # For each face, count how many of its r-hop neighbors belong to surface p
+        same_surface_counts = np.array(M @ indicator).flatten()
+
+        # Foreign ratio: fraction of neighbors NOT from surface p
+        surface_foreign = 1.0 - same_surface_counts[face_indices] / total_counts[face_indices]
+        keep = surface_foreign <= foreign_threshold
+        kept_faces = tri_resolved.faces[face_indices[keep]]
+
+        print(f"Surface {p} ({surface_types[p]}): {keep.sum()}/{len(face_indices)} faces kept "
+              f"(foreign ratio: mean={surface_foreign.mean():.3f}, max={surface_foreign.max():.3f})")
+
+        mesh = trimesh.Trimesh(vertices = tri_resolved.vertices, faces = kept_faces)
+        mesh.visual.face_colors = _surface_color_rgba(surface_types[p])
+        clipped_meshes.append(mesh)
+
+    return clipped_meshes
+
+def _vertex_based_component_labels(faces, num_vertices):
+    """Compute connected component labels using vertex-based adjacency.
+    Two faces are connected if they share at least one vertex. This bridges
+    T-junctions where faces share a vertex but not a full edge (see Section 7
+    of mesh_clipping_and_topology.md)."""
+    num_faces = len(faces)
+    # For each vertex, collect all faces containing it
+    vert_to_faces = [[] for _ in range(num_vertices)]
+    for fi in range(num_faces):
+        for vi in faces[fi]:
+            vert_to_faces[vi].append(fi)
+
+    # Build sparse adjacency: faces sharing any vertex are connected
+    adj = lil_matrix((num_faces, num_faces), dtype = bool)
+    for face_list in vert_to_faces:
+        for i in range(len(face_list)):
+            for j in range(i + 1, len(face_list)):
+                adj[face_list[i], face_list[j]] = True
+
+    _, labels = sparse_connected_components(adj, directed = False)
+    return labels
+
+def _clip_per_component(tri_resolved, face_sources_from_fit, clusters, surface_types,
+                        area_multiplier, component_filter, support_fraction, connectivity):
+    # Step 4: Connected component decomposition.
+    if connectivity == "edge":
+        # Face adjacency matrix of the deduplicated merged mesh. Using Trimesh API for remaining operations.
+        face_adjacency = tri_resolved.face_adjacency
+
+        # https://trimesh.org/trimesh.graph.html#trimesh.graph.connected_component_labels
+        # Mesh graph nodes are faces, and two faces are adjacent if they share the same edge/line. This computes
+        # the connected components of this graph - which can be interpreted as a dual graph of the input.
+        # So the number of vertices is the number of faces - each face gets adjoined a connected component label!
+        connected_node_labels = trimesh.graph.connected_component_labels(
+            edges = face_adjacency, node_count = len(tri_resolved.faces)
+        )
+    elif connectivity == "vertex":
+        # Vertex-based adjacency: two faces are connected if they share at least one vertex.
+        # This bridges T-junctions introduced by resolve_self_intersection, where split faces
+        # and their non-split neighbors share corner vertices but not full edges.
+        connected_node_labels = _vertex_based_component_labels(
+            tri_resolved.faces, len(tri_resolved.vertices)
+        )
+    else:
+        raise ValueError(f"Unknown connectivity '{connectivity}'. Must be one of: 'edge', 'vertex'.")
 
     # Order connected components by number of faces in descending order.
     most_common_groupids = [item[0] for item in Counter(connected_node_labels).most_common()]
+    print(f"Connected components ({connectivity}-based): {len(most_common_groupids)}")
 
     # Step 5: Extract submeshes and assign each to its source surface.
     submeshes = [
@@ -216,8 +325,6 @@ def _clip_per_component(tri_resolved, face_sources_from_fit, clusters, surface_t
         )
         for item in most_common_groupids
     ]
-
-    print(len(submeshes))
 
     indices_sources = [
         # face_sources_from_fit[connected_node_labels == item] - all input meshes that correspond to the current component
