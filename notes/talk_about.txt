@@ -4,3 +4,13 @@
 - What about master thesis, it's likely that the actual work will deviate from the proposed one in master thesis application
 - A lot of notes regarding mathematical machinery, mesh operations and discrepancies between paper and implementation, 10-ish pages,
   maybe more?
+
+Beyond Point2CAD:
+- CadRECODE only supports up to 256 points, probably not ideal. Failed for both ABC sample point clouds, perhaps the normalization
+  was not conducted correctly?
+
+- Scan2BRep - Point-level classification, classifies points as boundary/interior and then boundary point classification as
+junction/not junction. Combine somehow with current surface fitting approach/
+
+- Mesh2BRep - Inherently does segmentation + primitive surface fitting. We already have primitive surface fitting implemented,
+  bypass these 2 steps and continue onwards to get a BRep?

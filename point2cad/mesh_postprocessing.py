@@ -211,14 +211,38 @@ def _clip_provenance_walk(tri_resolved, face_sources_from_fit, clusters, surface
     faces (high foreign ratio).
     """
     num_faces = len(tri_resolved.faces)
+    num_vertices = len(tri_resolved.vertices)
 
-    # Build sparse edge-based adjacency matrix from trimesh face_adjacency.
-    # face_adjacency is an (E, 2) array of face pairs sharing an edge.
-    adj = tri_resolved.face_adjacency
-    data = np.ones(len(adj) * 2)
-    rows = np.concatenate([adj[:, 0], adj[:, 1]])
-    cols = np.concatenate([adj[:, 1], adj[:, 0]])
-    A = csr_matrix((data, (rows, cols)), shape = (num_faces, num_faces))
+    # Vertex-based adjacency: two faces are adjacent if they share at least one vertex.
+    # Edge-based adjacency (face_adjacency) has 0 cross-surface pairs after
+    # resolve_self_intersection + dedup, because PyMesh keeps each surface's faces
+    # topologically isolated even when they share vertex positions at intersection
+    # boundaries. Vertex-based adjacency bridges across surfaces through shared
+    # intersection vertices, enabling the BFS walk to detect foreign faces.
+    #
+    # Computed via sparse incidence matrix: F[i, v] = 1 if face i contains vertex v.
+    # A = F @ F^T gives A[i, j] = number of shared vertices between faces i and j.
+    face_indices = np.repeat(np.arange(num_faces), 3)
+    vertex_indices = tri_resolved.faces.flatten()
+    F = csr_matrix(
+        (np.ones(len(face_indices), dtype = np.float64), (face_indices, vertex_indices)),
+        shape = (num_faces, num_vertices)
+    )
+    A = F @ F.T
+    A.setdiag(0)
+    A.eliminate_zeros()
+    # Binarize: we only care about adjacency, not the count of shared vertices
+    A = (A > 0).astype(np.float64)
+
+    # Diagnostic: cross-surface adjacency check
+    adj_coo = A.tocoo()
+    src_a = face_sources_from_fit[adj_coo.row]
+    src_b = face_sources_from_fit[adj_coo.col]
+    cross_count = (src_a != src_b).sum() // 2  # each pair counted twice (symmetric)
+    total_pairs = adj_coo.nnz // 2
+    print(f"[provenance_walk] Vertex-based adjacency pairs: {total_pairs}")
+    print(f"[provenance_walk] Cross-surface pairs: {cross_count} / {total_pairs}")
+    print(f"[provenance_walk] Num faces: {num_faces}")
 
     # Compute r-hop reachability matrix: M[i, j] > 0 iff face j is within
     # walk_radius edge-hops of face i. M is symmetric (if i reaches j, j reaches i),
@@ -234,6 +258,10 @@ def _clip_provenance_walk(tri_resolved, face_sources_from_fit, clusters, surface
 
     # Total neighborhood size for each face (including itself)
     total_counts = np.array(M.sum(axis = 1)).flatten()
+    print(f"[provenance_walk] Neighborhood sizes (walk_radius={walk_radius}): "
+          f"min={total_counts.min():.0f}, max={total_counts.max():.0f}, "
+          f"mean={total_counts.mean():.1f}, median={np.median(total_counts):.0f}")
+    print(f"[provenance_walk] Faces with neighborhood size 1 (only self): {(total_counts == 1).sum()}")
 
     # For each surface, count how many neighbors share the same provenance
     clipped_meshes = []
