@@ -381,3 +381,5 @@ _, indices <- z.topk(5, largest = False) Pairs of points closest to each other.
 * o3d.utlity.Vector2iVector - Collection of 3D vectors (int32), representing linked points. Useful for representing lines.
 
 * Downloading ABC dataset chunks handle: https://archive.nyu.edu/handle/2451/43778. Supposedly, we require META/FEAT and OBJ files to generate segmented point clouds from here.
+
+* Point2Primitive dataset construction notes: https://github.com/AnonymousRepo1234/Point2Primitive
