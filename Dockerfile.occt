@@ -1,0 +1,40 @@
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y \
+        gosu \
+        wget \
+        libgl1-mesa-glx \
+        libxrender1 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install Miniconda (used only for pythonocc-core)
+ENV CONDA_DIR=/opt/conda
+
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p ${CONDA_DIR} && \
+    rm /tmp/miniconda.sh
+ENV PATH="${CONDA_DIR}/bin:${PATH}"
+RUN conda tos accept
+# Pin Python 3.10 (Open3D requires <=3.12) and install pythonocc-core
+RUN conda install -c conda-forge python=3.10 pythonocc-core -y && \
+    conda clean -afy
+
+RUN pip install --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cu126
+
+RUN pip install --no-cache-dir \
+    numpy \
+    scipy \
+    open3d \
+    matplotlib \
+    tqdm \
+    trimesh
+
+COPY entrypoint_occt.sh /entrypoint_occt.sh
+RUN chmod +x /entrypoint_occt.sh
+ENTRYPOINT ["/entrypoint_occt.sh"]
+
+WORKDIR /work

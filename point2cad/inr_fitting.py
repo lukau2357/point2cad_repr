@@ -208,17 +208,18 @@ class INRNetwork(torch.nn.Module):
     def sample_points(self, mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = 0.1):
         # Resulting samples will be of shape [mesh_dim^2, 3]
         uv_length = uv_bb_max - uv_bb_min
-        uv_bb_min -= uv_length * uv_margin
-        uv_bb_max += uv_length * uv_margin
+        uv_bb_min_extended = uv_bb_min - uv_length * uv_margin
+        uv_bb_max_extended = uv_bb_max + uv_length * uv_margin
+
 
         # Should always do clipping regardless of closeness?
         if self.is_u_closed:
-            uv_bb_min[0] = max(uv_bb_min[0], -1)
-            uv_bb_max[0] = min(uv_bb_max[0], 1)
+            uv_bb_min_extended[0] = max(uv_bb_min_extended[0], -1)
+            uv_bb_max_extended[0] = min(uv_bb_max_extended[0], 1)
 
         if self.is_v_closed:
-            uv_bb_min[1] = max(uv_bb_min[1], -1)
-            uv_bb_max[1] = min(uv_bb_max[1], 1)
+            uv_bb_min_extended[1] = max(uv_bb_min_extended[1], -1)
+            uv_bb_max_extended[1] = min(uv_bb_max_extended[1], 1)
         
         device = next(self.parameters()).device
 
@@ -400,7 +401,7 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
             uv = model.forward_encoder(X).cpu().numpy()
             uvs.append(uv)
 
-    uvs = np.array(uvs).reshape(-1, 2)
+    uvs = np.concatenate(uvs, axis = 0)
     uv_bb_min = uvs.min(axis = 0)
     uv_bb_max = uvs.max(axis = 0)
 

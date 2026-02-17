@@ -94,7 +94,7 @@ def cone_special_handling(results, errors, simple_error_threshold, plane_cone_ra
     cone_diff_pi2 = abs(cone_angle - np.pi / 2)
     cone_diff_0 = cone_angle
     
-    if abs(cone_angle - np.pi / 2) < cone_theta_tolerance_rad or cone_angle < cone_theta_tolerance_rad:
+    if cone_diff_pi2 < cone_theta_tolerance_rad or cone_diff_0 < cone_theta_tolerance_rad:
         simple_min = np.argmin(errors[:-1])
 
         return simple_min if errors[simple_min] < simple_error_threshold else -1
@@ -143,6 +143,8 @@ def fit_surface(cluster,
 
     if errors[simple_min] < simple_error_threshold:
         # Spetial treatment for cone
+        print(f"Plane error: {plane_result['error']:.4f} Sphere error: {sphere_result['error']:.4f} Cylinder error: {cylinder_result['error']:.4f} Cone error: {cone_result['error']:.4f}")
+
         if simple_min == SURFACE_CONE:
             cone_results = cone_special_handling(results, errors, simple_error_threshold, plane_cone_ratio_threshold, cone_theta_tolerance_degrees)
         
@@ -158,6 +160,8 @@ def fit_surface(cluster,
             return {"surface_id": simple_min, "result": results[simple_min], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
         
     inr_result = fit_inr(cluster, inr_network_parameters, device = device, **inr_fit_kwargs)
+    print(f"Plane error: {plane_result['error']:.4f} Sphere error: {sphere_result['error']:.4f} Cylinder error: {cylinder_result['error']:.4f} Cone error: {cone_result['error']:.4f} INR error: {inr_result['error']:.4f}")
+
     results.append(inr_result)
     errors = np.append(errors, inr_result["error"])
 

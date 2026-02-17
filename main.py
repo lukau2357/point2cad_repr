@@ -125,7 +125,7 @@ if __name__ == "__main__":
                 "fraction_siren": 0.5
             }, np_rng, device,
                 plane_cone_ratio_threshold = 4,
-                cone_theta_tolerance_degrees = 10,
+                cone_theta_tolerance_degrees = 5,
                 inr_fit_kwargs = {"max_steps": 1500, "noise_magnitude_3d": 0.05, "noise_magnitude_uv": 0.05, "initial_lr": 1e-1},
                 plane_mesh_kwargs = {"mesh_dim": 200, "threshold_multiplier": 2.2, "plane_sampling_deviation": 0.4},
                 sphere_mesh_kwargs = {"dim_theta": 200, "dim_lambda": 200, "threshold_multiplier": 2},
