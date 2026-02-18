@@ -169,7 +169,7 @@ def _clip_nearest(tri_resolved, face_sources_from_fit, clusters, surface_types):
     # after intersection resolution and is discarded from the clipped mesh.
     all_points = np.concatenate(clusters)
     all_labels = np.concatenate([np.full(len(c), i, dtype = np.int32) for i, c in enumerate(clusters)])
-    tree = scipy.spatial.cKDTree(all_points)
+    tree = scipy.spatial.KDTree(all_points)
     _, nn_indices = tree.query(centroids)
     nearest_surface = all_labels[nn_indices]
 

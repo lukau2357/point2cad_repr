@@ -141,7 +141,7 @@ def cone_error(points : np.ndarray, vertex: np.ndarray, axis: np.ndarray, theta:
     errors = np.abs(h * np.sin(theta) - r * np.cos(theta))
     return np.mean(errors)
 
-def sample_plane(mesh_dim, a, d, cluster, np_rng, sampling_deviation = 0.1):
+def sample_plane(mesh_dim, a, d, cluster, np_rng, sampling_deviation = 0):
     # x = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
     # y = np.linspace(-scale, scale, mesh_dim, dtype = np.float32)
     # Cartesian product of x and y, the second coordinate moves faster.
@@ -221,7 +221,7 @@ def generate_sphere_mesh(dim_theta, dim_lambda, radius, center, cluster, device,
     mesh = triangulate_and_mesh(vertices, dim_theta, dim_lambda, "sphere", mask = mask)
     return mesh
 
-def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_margin = 0.1):
+def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_margin = 0):
     # Input cluster is needed as points parameter, in order to determine minimum and maximum height for cylinder sampling
     center = center.reshape((1, 3))
     axis = axis.reshape((3, 1))
@@ -268,7 +268,7 @@ def generate_cylinder_mesh(dim_theta, dim_height, radius, center, axis, cluster,
     mesh = triangulate_and_mesh(vertices, dim_theta, 2 * dim_height, "cylinder", mask = mask)
     return mesh
 
-def sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, height_margin = 0.1, single_sided = True):
+def sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, height_margin = 0, single_sided = True):
     vertex = vertex.reshape(3).astype(np.float32)
     axis = axis.reshape(3).astype(np.float32)
     axis = axis / np.linalg.norm(axis)
