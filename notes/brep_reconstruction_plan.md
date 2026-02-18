@@ -110,11 +110,30 @@ No analytic shortcut. Use OCCT's `BRepAlgoAPI_Section` or `GeomInt_IntSS`.
 
 **Trimming intersection curves:**
 
-Raw surface-surface intersection gives infinite/full-domain curves. Trim them to the portion
-lying within both surfaces' actual boundaries. Approach: project each cluster's points onto
-its surface's UV domain, compute the convex hull (or alpha shape) in UV, and use this as the
-trim boundary. The intersection curve, mapped to each surface's UV space, is trimmed against
-this boundary.
+Raw surface-surface intersection gives infinite or full-domain curves.  Trim them to the
+portion lying on the actual shared boundary between the two clusters.
+
+The UV convex hull approach (project cluster points to UV, compute the hull, convert hull
+vertices to 3-D, project onto the curve) was considered but rejected: it assumes the face
+boundary is convex in UV space, which fails for non-convex faces and INR surfaces whose
+UV domain is an irregular subset of $[-1,1]^2$.
+
+**Adopted approach — boundary strip projection** (see `notes/curve_trimming.md` for full
+mathematical detail):
+
+1. **Extract boundary strip**: for each cluster in the adjacent pair, keep only the points
+   whose nearest-neighbour distance to the *other* cluster is at most the adjacency
+   threshold.  The union of both strips contains the points that lie on the shared edge.
+2. **Project onto the curve**: use `GeomAPI_ProjectPointOnCurve` to find the parameter
+   $t_k$ of each strip point on the intersection curve; discard projections whose distance
+   exceeds $c \cdot \text{spacing}$ (the point is not on this particular edge).
+3. **Compute trim interval**:
+   - Non-periodic curves (lines, B-splines): $[t_\min, t_\max]$.
+   - Periodic curves (circles, ellipses): find the largest gap between consecutive sorted
+     parameters; the trim arc is the complement of that gap (handles the $0/2\pi$ seam).
+4. **Create `Geom_TrimmedCurve`**: wrap the original `Geom_Curve` with the computed
+   bounds.  `FirstParameter()` / `LastParameter()` are overridden; `sample_curve` needs
+   no changes.
 
 ### Phase 5: B-Rep Topology Assembly
 
@@ -366,7 +385,12 @@ $$
 \dim \mathbb{S}_{p, \mathbf{t}, \mathbf{r}} = N - p - 1
 $$
 
-A B-spline knot vector with $N$ entries defines $N - p - 1$ basis functions of degree $p$.
+A B-spline knot vector with $N$ entries defines $N - p - 1$ basis functions of degree $p$. If we give the degree $p$ and the number of basis functions $n + 1$ in advance, then the required number of knots becomes:
+$$
+N - p - 1 = n + 1 \Rightarrow N = n + p + 2
+$$ 
+
+This parametrization is more common in practice - we give in advance the desired degree and number of basis functions, from which the solvers typically infer the required number of konts.
 
 **Example.** Cubic ($p = 3$), $\mathbf{t} = (0, 1, 2, 3, 4)$,
 $\mathbf{r} = (2, 1, 2)$:
@@ -451,7 +475,7 @@ Equivalently: $\text{(number of basis functions)} = \text{(number of knots)} - p
 
 1. **Non-negativity**: $N_{i,p}(u) \geq 0$ for all $u$. (easy to verify by induction)
 
-2. **Compact support**: $N_{i,p}(u) \neq 0$ only on $[u_i, u_{i+p+1})$. Each basis function is "local" --- it influences only $p + 1$ knot spans. (easy to verify with dinctuon, using the previous property also)
+2. **Compact support**: $N_{i,p}(u) \neq 0$ only on $[u_i, u_{i+p+1})$. Each basis function is "local" --- it influences only $p + 1$ knot spans. (easy to verify with induction, using the previous property also)
 
 3. **Partition of unity**: $\sum_{i=0}^{n} N_{i,p}(u) = 1$ for all $u$ in the domain $[a, b)$.
 
@@ -844,3 +868,7 @@ Sources:
 - [Least-Squares Fitting of Data with B-Spline Curves (Geometric Tools)](https://www.geometrictools.com/Documentation/BSplineCurveLeastSquaresFit.pdf)
 - [A Direct Method to Solve Optimal Knots of B-Spline Curves (PLOS One)](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0173857)
 - [Introduction to Spline Theory (Floater, UiO lecture notes)](https://www.uio.no/studier/emner/matnat/math/MAT4170/v23/undervisningsmateriale/spline_notes.pdf)
+
+
+## More useful links
+* BSpline basis nice illustrations: https://pages.mtu.edu/~shene/COURSES/cs3621/NOTES/spline/B-spline/bspline-basis.html

@@ -5,8 +5,12 @@
 - A lot of notes regarding mathematical machinery, mesh operations and discrepancies between paper and implementation, 10-ish pages,
   maybe more?
 
+---- Post Point2CAD ----
 - CADRecode simply did not work for 2 sample point clouds. It has a context length of 256, single ABC clusters contain up to 1000 points.
 - Point2Primitive seems to be the closest to a full BRep model out of all papers (along with CADRecode of course), it describes a CAD model
   in terms of sketch/extrude operations and it does not (at least for now) seem to have a limit on the number of input points.
-- Another interesting path is using OCCT and Mesh2BRep-style CAD construction in the existing Poin2CAD primitive fitting flow. Big room for 
-  novelty, but hight risk!
+- Current occupation: Use Point2CAD fitted surfaces and construct a real BRep model from them. Convert INR to BSpline, perform intersections
+  using OpenCascade Python bindings, clip the objects to the input point cloud. If successful, a real contribution, no one has done this
+  so far up to my knowledge.
+- Another interesting direction: Instead of 2 steps: fit INR + fit a BSpline, somehow jointly train INR to adapt a BSpline, this
+  would be another research novelty.

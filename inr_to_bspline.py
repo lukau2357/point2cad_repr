@@ -24,6 +24,7 @@ from collections import Counter
 import point2cad.primitive_fitting_utils as primitive_fitting_utils
 from point2cad.surface_fitter import fit_surface, SURFACE_NAMES, SURFACE_INR
 from point2cad.color_config import get_surface_color
+from point2cad.occ_surfaces import fit_bspline_surface
 
 # ---------------------------------------------------------------------------
 # Normalization (same as main.py)
@@ -43,84 +44,6 @@ def extract_pc_id(input_name):
     base_name = os.path.basename(input_name)
     return base_name.split("_")[-1].split(".")[0]
 
-# ---------------------------------------------------------------------------
-# INR sampling on a regular UV grid
-# ---------------------------------------------------------------------------
-
-def sample_inr_grid(model, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, resolution, uv_margin = 0.1):
-    """
-    Sample the trained INR decoder on a regular (resolution x resolution) UV grid.
-    Returns:
-        xyz_grid: np.ndarray of shape (resolution, resolution, 3)
-        u_lin:    np.ndarray of shape (resolution,) - the u parameter values
-        v_lin:    np.ndarray of shape (resolution,) - the v parameter values
-    """
-    uv_length = uv_bb_max - uv_bb_min
-    uv_min = uv_bb_min - uv_length * uv_margin
-    uv_max = uv_bb_max + uv_length * uv_margin
-
-    if model.is_u_closed:
-        uv_min[0] = max(uv_min[0], -1)
-        uv_max[0] = min(uv_max[0], 1)
-    if model.is_v_closed:
-        uv_min[1] = max(uv_min[1], -1)
-        uv_max[1] = min(uv_max[1], 1)
-
-    device = next(model.parameters()).device
-
-    u_lin = torch.linspace(uv_min[0], uv_max[0], resolution, device = device)
-    v_lin = torch.linspace(uv_min[1], uv_max[1], resolution, device = device)
-    u, v = torch.meshgrid(u_lin, v_lin, indexing = "ij")
-    uv = torch.stack((u, v), dim = 2).reshape(-1, 2)
-
-    with torch.no_grad():
-        X = model.forward_decoder(uv)
-        X = X * torch.tensor(cluster_scale, device = device) + torch.tensor(cluster_mean, device = device)
-
-    xyz_grid = X.cpu().numpy().reshape(resolution, resolution, 3)
-    return xyz_grid, u_lin.cpu().numpy(), v_lin.cpu().numpy()
-
-# ---------------------------------------------------------------------------
-# B-spline fitting via OpenCASCADE
-# ---------------------------------------------------------------------------
-
-def fit_bspline_surface(xyz_grid, degree_min, degree_max, continuity, tol3d):
-    """
-    Fit a B-spline surface to a regular grid of 3D points using OCCT.
-    Args:
-        xyz_grid:    np.ndarray (M, N, 3)
-        degree_min:  minimum B-spline degree
-        degree_max:  maximum B-spline degree
-        continuity:  integer 0-3 mapping to GeomAbs_C0..C3
-        tol3d:       maximum approximation tolerance
-    Returns:
-        bspline_surface: OCC Geom_BSplineSurface handle
-        fitting_time:    seconds
-    """
-    from OCC.Core.GeomAPI import GeomAPI_PointsToBSplineSurface
-    from OCC.Core.TColgp import TColgp_Array2OfPnt
-    from OCC.Core.gp import gp_Pnt
-    from OCC.Core.GeomAbs import GeomAbs_C0, GeomAbs_C1, GeomAbs_C2, GeomAbs_C3
-    from OCC.Core.Approx import Approx_IsoParametric
-
-    continuity_map = {0: GeomAbs_C0, 1: GeomAbs_C1, 2: GeomAbs_C2, 3: GeomAbs_C3}
-    geom_continuity = continuity_map[continuity]
-
-    M, N, _ = xyz_grid.shape
-    points = TColgp_Array2OfPnt(1, M, 1, N)
-    for i in range(M):
-        for j in range(N):
-            x, y, z = xyz_grid[i, j]
-            points.SetValue(i + 1, j + 1, gp_Pnt(float(x), float(y), float(z)))
-
-    t0 = time.time()
-    approx = GeomAPI_PointsToBSplineSurface(
-        points, degree_min, degree_max, geom_continuity, tol3d
-    )
-    fitting_time = time.time() - t0
-
-    bspline_surface = approx.Surface()
-    return bspline_surface, fitting_time
 
 def evaluate_bspline_on_grid(bspline_surface, M, N):
     """
@@ -437,11 +360,10 @@ if __name__ == "__main__":
 
         # Sample INR on regular grid
         print(f"  Sampling INR on {args.sampling_resolution}x{args.sampling_resolution} grid...")
-        inr_grid, u_lin, v_lin = sample_inr_grid(
-            model, uv_bb_min.copy(), uv_bb_max.copy(),
-            cluster_mean, cluster_scale,
-            args.sampling_resolution
-        )
+        inr_grid = model.sample_points(
+            args.sampling_resolution, uv_bb_min.copy(), uv_bb_max.copy(),
+            cluster_mean, cluster_scale
+        ).cpu().numpy().reshape(args.sampling_resolution, args.sampling_resolution, 3)
 
         # Fit B-spline to the INR-sampled grid
         print(f"  Fitting B-spline surface via OCCT...")
@@ -466,11 +388,10 @@ if __name__ == "__main__":
         bspline_grid = evaluate_bspline_on_grid(bspline_surface, eval_res, eval_res)
 
         # Also evaluate INR at eval resolution for visualization
-        inr_grid_eval, _, _ = sample_inr_grid(
-            model, uv_bb_min.copy(), uv_bb_max.copy(),
-            cluster_mean, cluster_scale,
-            eval_res
-        )
+        inr_grid_eval = model.sample_points(
+            eval_res, uv_bb_min.copy(), uv_bb_max.copy(),
+            cluster_mean, cluster_scale
+        ).cpu().numpy().reshape(eval_res, eval_res, 3)
 
         # Error metrics
         # INR: pointwise autoencoder reconstruction (Euclidean)
