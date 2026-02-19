@@ -2,11 +2,18 @@
 
 ## Overview
 
-The intersection between two fitted surfaces yields an unbounded or fully
-periodic `Geom_Curve`.  For B-Rep construction only the portion that lies on
-the actual shared boundary between the two point-cloud clusters is needed.
-This section describes how to determine that portion and create a
-`Geom_TrimmedCurve`.
+OCC returns intersection curves as `Geom_Curve` objects whose parameter
+domain may be bounded or unbounded.  Curves returned by `GeomAPI_IntSS`
+(e.g. a plane intersecting a cylinder) are always wrapped in a
+`Geom_TrimmedCurve` with finite bounds.  The only case requiring explicit
+trimming in this pipeline is the analytical plane–plane intersection, which
+produces a `Geom_Line` whose parameter domain is $(-\infty, +\infty)$.
+
+The decision of whether to trim is therefore made entirely by checking the
+curve's parameter bounds: if $|t_0| \ge \texttt{Precision::Infinite()}$ or
+$|t_1| \ge \texttt{Precision::Infinite()}$, trimming is applied; otherwise
+the curve is returned unchanged.  Compact parameter domains are continuous
+functions on a compact set and are already well-behaved for B-Rep purposes.
 
 ---
 
@@ -158,29 +165,18 @@ applies the closed-form formulas above rather than the B-spline algorithm.
 
 ## Computing the trim interval
 
-### Non-periodic curves (lines, B-splines)
-
 Collect the projected parameters $\{t_k\}$ from all boundary-strip points
-whose `LowerDistance()` is below a projection tolerance $\varepsilon_\text{proj}$:
+whose `LowerDistance()` is below the projection tolerance $\varepsilon_\text{proj}$:
 
 $$t_\text{min} = \min_k t_k, \quad t_\text{max} = \max_k t_k$$
 
-### Periodic curves (circles, ellipses — domain $[0, 2\pi]$)
+The interval is then extended symmetrically by a relative margin to avoid
+endpoint gaps:
 
-A simple min/max is incorrect when the trimmed arc crosses the $0 / 2\pi$
-seam.  Correct procedure:
+$$t_\text{min} \leftarrow t_\text{min} - \alpha\,(t_\text{max} - t_\text{min}), \qquad
+  t_\text{max} \leftarrow t_\text{max} + \alpha\,(t_\text{max} - t_\text{min})$$
 
-1. Sort the valid parameters: $t_{(1)} \le t_{(2)} \le \cdots \le t_{(n)}$.
-2. Compute the $n$ gaps between consecutive parameters (cyclically):
-   $\Delta_k = t_{(k+1)} - t_{(k)}$, with $\Delta_n = 2\pi - t_{(n)} + t_{(1)}$.
-3. The largest gap $\Delta_{k^*}$ is the portion of the circle **not** covered
-   by the arc.
-4. Set $t_\text{min} = t_{(k^*+1)}$ and $t_\text{max} = t_{(k^*)} + 2\pi$
-   (i.e. shift $t_\text{max}$ by $2\pi$ if the arc wraps around the seam).
-
-If $\Delta_{k^*}$ is close to $2\pi$ (nearly the whole circle is a gap),
-fewer than two valid projections were found and the trim should be skipped or
-flagged.
+where $\alpha$ is a small constant (implementation uses $\alpha = 0.05$).
 
 ### Creating `Geom_TrimmedCurve`
 

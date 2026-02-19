@@ -3,3 +3,4 @@ __pycache__/
 output/
 secrets.yaml
 output_bspline/
+**/output_surfaceinter

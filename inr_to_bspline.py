@@ -24,7 +24,11 @@ from collections import Counter
 import point2cad.primitive_fitting_utils as primitive_fitting_utils
 from point2cad.surface_fitter import fit_surface, SURFACE_NAMES, SURFACE_INR
 from point2cad.color_config import get_surface_color
-from point2cad.occ_surfaces import fit_bspline_surface
+try:
+    from point2cad.occ_surfaces import fit_bspline_surface
+    OCC_AVAILABLE = True
+except ImportError:
+    OCC_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Normalization (same as main.py)
@@ -56,7 +60,6 @@ def evaluate_bspline_on_grid(bspline_surface, M, N):
     u_lin = np.linspace(u1, u2, M)
     v_lin = np.linspace(v1, v2, N)
 
-    from OCC.Core.gp import gp_Pnt
     xyz_bspline = np.zeros((M, N, 3))
     for i, u in enumerate(u_lin):
         for j, v in enumerate(v_lin):
@@ -292,6 +295,10 @@ if __name__ == "__main__":
     # Pipeline mode (inside Docker with OCCT available)
     # -----------------------------------------------------------------------
 
+    if not OCC_AVAILABLE:
+        print("OCC bindings not available — run inside Docker for the fitting pipeline.")
+        exit(1)
+
     assert args.input is not None, "Provide --input path to .xyzc file"
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -337,7 +344,7 @@ if __name__ == "__main__":
                 "noise_magnitude_uv": args.inr_noise_uv,
                 "initial_lr": args.inr_lr,
             },
-            inr_mesh_kwargs = {"mesh_dim": args.sampling_resolution, "uv_margin": 0.2, "threshold_multiplier": 0.2}
+            inr_mesh_kwargs = {"mesh_dim": args.sampling_resolution}
         )
 
         surface_name = SURFACE_NAMES[fitting_result["surface_id"]]

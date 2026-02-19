@@ -211,7 +211,7 @@ class INRNetwork(torch.nn.Module):
         uv_bb_min_extended = uv_bb_min - uv_length * uv_margin
         uv_bb_max_extended = uv_bb_max + uv_length * uv_margin
 
-        # Should always do clipping regardless of closeness?
+        # Should always do clipping regardless of closedness?
         if self.is_u_closed:
             uv_bb_min_extended[0] = max(uv_bb_min_extended[0], -1)
             uv_bb_max_extended[0] = min(uv_bb_max_extended[0], 1)
@@ -385,9 +385,17 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
                                            initial_lr = initial_lr,
                                            noise_magnitude_3d = noise_magnitude_3d,
                                            noise_magnitude_uv = noise_magnitude_uv)
+            print(f"{u} {v} {current_model['error']}")
             if best_model is None or best_model["error"] > current_model["error"]:
-                best_model = current_model
-    
+                best_model = current_model  
+    # best_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,
+    #                             is_u_closed = False, 
+    #                             is_v_closed = False,
+    #                             max_steps = max_steps,
+    #                             warmup_steps_ratio = warmup_steps_ratio,
+    #                             initial_lr = initial_lr,
+    #                             noise_magnitude_3d = noise_magnitude_3d,
+    #                             noise_magnitude_uv = noise_magnitude_uv)
     best_model["params"]["cluster_mean"] = cluster_mean
     best_model["params"]["cluster_scale"] = cluster_scale
     model = best_model["params"]["model"]

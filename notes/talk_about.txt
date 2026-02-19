@@ -14,3 +14,15 @@
   so far up to my knowledge.
 - Another interesting direction: Instead of 2 steps: fit INR + fit a BSpline, somehow jointly train INR to adapt a BSpline, this
   would be another research novelty.
+- What has been done so far: 
+    - Cluster adjacency matrix: Compute median distance over nearest neighbor distances for all clusters, m. Declare clusters adjacent
+      if 2-percentile nearest neighbor distance (configurable) falls within m * threshold (1.5, configurable)
+    
+    - Compute analytical intersections between adjacents clusters via OCC. In the case of simlper intersections (plane/plane, plane/sphere,
+    use handwritten solutions). Result: parametric curves.
+
+    - Trim curves to boundary points. First, if the resulting curve has a compact parameter space, we will not perform any trimming (for now
+      at least). If the curve has an infinite parameter space, project boundary points (points from clusters that matched the distance threshold
+      in adjacency matrix computation), and compute the minimum and maximum parameter values for projected points (using lowest distance points
+      for reference if there are multiple projections for a single point). Extend this minimum and maximum thresholds by relative extension
+      parameter, and generate a trimmed curve with this new parameter space.

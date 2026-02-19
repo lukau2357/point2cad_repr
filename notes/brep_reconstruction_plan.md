@@ -128,7 +128,7 @@ mathematical detail):
    $t_k$ of each strip point on the intersection curve; discard projections whose distance
    exceeds $c \cdot \text{spacing}$ (the point is not on this particular edge).
 3. **Compute trim interval**:
-   - Non-periodic curves (lines, B-splines): $[t_\min, t_\max]$.
+   - Non-periodic curves (lines, B-splines): $[t_{min}, t_{max}]$.
    - Periodic curves (circles, ellipses): find the largest gap between consecutive sorted
      parameters; the trim arc is the complement of that gap (handles the $0/2\pi$ seam).
 4. **Create `Geom_TrimmedCurve`**: wrap the original `Geom_Curve` with the computed
@@ -433,7 +433,7 @@ $\mathbb{S}_{p, \mathbf{t}}$ but with fundamentally better properties:
 
 | Property | Truncated powers | B-splines |
 |---|---|---|
-| Support | Global: $[t_k, t_K]$ | Local: $[u_i, u_{i+p+1})$ |
+| Support | Global: $[t_0, t_K]$ | Local: $[u_i, u_{i+p+1})$ |
 | Sign | Alternating | Non-negative |
 | Conditioning | Exponentially ill-conditioned | Well-conditioned (banded) |
 | Geometric meaning | None | Control points define a control polygon |
@@ -872,3 +872,5 @@ Sources:
 
 ## More useful links
 * BSpline basis nice illustrations: https://pages.mtu.edu/~shene/COURSES/cs3621/NOTES/spline/B-spline/bspline-basis.html
+
+* Open Cascade BREP documentation: https://dev.opencascade.org/doc/overview/html/specification__brep_format.html
