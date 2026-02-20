@@ -166,7 +166,7 @@ def run_compute(args):
         build_edge_arcs, print_edge_arcs_summary,
         face_arc_incidence, print_face_arcs_summary,
         assemble_wires, print_face_wires_summary,
-        build_brep_shape, export_step,
+        build_brep_shape, build_brep_shape_bop, export_step,
     )
     import point2cad.primitive_fitting_utils as pfu
 
@@ -190,11 +190,11 @@ def run_compute(args):
     data[:, :3]     = normalize_points(data[:, :3])
     unique_clusters = np.unique(data[:, -1].astype(int))
 
-    np_rng = np.random.default_rng(41)
-    torch.manual_seed(41)
-    torch.cuda.manual_seed(41)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
+    np_rng = np.random.default_rng(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark     = False
 
     # ------------------------------------------------------------------
     # Surface fitting
@@ -228,7 +228,7 @@ def run_compute(args):
         )
         print(f"Cluster {cid}: {SURFACE_NAMES[sid]}")
 
-    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters, threshold_factor = 1.5)
+    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters, threshold_factor = 3)
     print(f"\nSpacing={spacing:.5f}  threshold={threshold:.5f}")
     print(f"Adjacent pairs: {adjacency_pairs(adj)}\n")
 
@@ -327,18 +327,27 @@ def run_compute(args):
     print_face_arcs_summary(face_arcs)
 
     # ------------------------------------------------------------------
-    # Step 3: wire assembly (diagnostic only)
+    # Step 3: wire assembly with angular ordering at high-degree vertices
     # ------------------------------------------------------------------
-    face_wires = assemble_wires(face_arcs)
+    face_wires = assemble_wires(face_arcs, occ_surfs, vertices)
     print_face_wires_summary(face_wires)
 
     # ------------------------------------------------------------------
-    # Step 5: BRep assembly and STEP export
+    # Step 5a: BRep assembly — manual arc/wire approach
     # ------------------------------------------------------------------
     step_path = os.path.join(out_dir, f"{pc_id}.step")
-    shape = build_brep_shape(face_arcs, occ_surfs, vertices, tolerance=1e-3)
+    shape = build_brep_shape(face_arcs, occ_surfs, vertices,
+                             surface_ids=surface_ids,
+                             face_wires=face_wires, tolerance=1e-3)
     export_step(shape, step_path)
 
+    # ------------------------------------------------------------------
+    # Step 5b: BRep assembly — BOPAlgo_MakerVolume approach
+    # ------------------------------------------------------------------
+    # step_path_bop = os.path.join(out_dir, f"{pc_id}_bop.step")
+    # shape_bop = build_brep_shape_bop(occ_surfs, clusters, adj, tolerance=1e-3, margin=0.1)
+    # if shape_bop is not None:
+    #     export_step(shape_bop, step_path_bop)
     print(f"\nAll results saved to {out_dir}/")
 
 
@@ -359,6 +368,7 @@ if __name__ == "__main__":
                         help="Path to .xyzc file (compute mode)")
     parser.add_argument("--output_dir", type=str, default="output_brep",
                         help="Directory for saved results")
+    parser.add_argument("-seed", type=int, default = 41, help = "Reproducibility seed")
     args = parser.parse_args()
 
     if args.visualize:

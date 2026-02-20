@@ -1,3 +1,4 @@
+import sys
 import numpy as np
 import pymesh
 import pyvista as pv
@@ -5,6 +6,7 @@ import scipy.spatial
 import trimesh
 import itertools
 import json
+import vtk
 
 from collections import Counter
 from scipy.sparse import lil_matrix, csr_matrix, eye as speye
@@ -21,7 +23,6 @@ def save_unclipped_meshes(trimesh_meshes, surface_types, out_path):
     colored_meshes = []
     pm_meshes = []
 
-    import sys
     for s in range(len(trimesh_meshes)):
         tri_mesh = trimesh_meshes[s]
         verts = np.array(tri_mesh.vertices, dtype = np.float64)
@@ -460,7 +461,6 @@ def _filter_min_support(counter_nearest, support_fraction, surface_idx):
 
 def save_topology(clipped_meshes, out_path):
     # Reference: io_utils.py:124-171
-    import vtk
     vtk.vtkObject.GlobalWarningDisplayOff()
     pv_meshes = [pv.wrap(item) for item in clipped_meshes]
     pv_combinations = list(itertools.combinations(pv_meshes, 2))
