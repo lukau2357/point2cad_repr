@@ -87,37 +87,3 @@ def adjacency_triangles(adj):
                 if adj[i, k] and adj[j, k]:
                     triangles.append((i, j, k))
     return triangles
-
-if __name__ == "__main__":
-    import os
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    import torch
-    import point2cad.primitive_fitting_utils as pfu
-    from point2cad.surface_fitter import fit_surface, SURFACE_NAMES
-
-    SAMPLE = os.path.join(os.path.dirname(__file__), "..", "sample_clouds", "abc_00470.xyzc")
-    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-    def normalize_points(points):
-        points = points - np.mean(points, axis = 0, keepdims = True)
-        S, U = np.linalg.eig(points.T @ points)
-        smallest_ev = U[:, np.argmin(S)]
-        R = pfu.rotation_matrix_a_to_b(smallest_ev, np.array([1, 0, 0]))
-        points = (R @ points.T).T
-        extents = np.max(points, axis = 0) - np.min(points, axis = 0)
-        return (points / (np.max(extents) + 1e-7)).astype(np.float32)
-
-    data = np.loadtxt(SAMPLE)
-    data[:, :3] = normalize_points(data[:, :3])
-    unique_clusters = np.unique(data[:, -1].astype(int))
-    clusters = [data[data[:, -1].astype(int) == cid, :3].astype(np.float32) for cid in unique_clusters]
-    cluster_sizes = [int((data[:, -1] == cid).sum()) for cid in unique_clusters]
-    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters)
-
-    print(f"Reference spacing: {spacing:.6f}")
-    print(f"Adjacency threshold: {threshold:.6f}")
-    print(f"Adjacency matrix:\n{adj.astype(int)}")
-    for i, j in adjacency_pairs(adj):
-        print(f"  Clusters {unique_clusters[i]} and {unique_clusters[j]} are adjacent")
-        print(f"  Cluster sizes: {cluster_sizes[i]} {cluster_sizes[j]}")

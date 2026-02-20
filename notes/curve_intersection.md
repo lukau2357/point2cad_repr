@@ -8,19 +8,71 @@ B-Rep: the points where two or more edges simultaneously meet.
 
 ---
 
-## Topological constraint: which curve pairs can share a vertex
+## Which curve pairs can share a vertex: a geometric argument
 
 A vertex $v$ in a B-Rep lies on at least two edges.  Each edge $C_{ij}$
 lies simultaneously on surface $F_i$ and on surface $F_j$.  If two edges
 $C_{ij}$ and $C_{kl}$ share a vertex $v$, then $v$ lies on all surfaces
-in $\{i,j\} \cup \{k,l\}$.  A necessary condition is:
+in $\{i,j\} \cup \{k,l\}$.  We claim the correct search space is pairs
+with
 
-$$|\{i,j\} \cap \{k,l\}| = 1$$
+$$|\{i,j\} \cap \{k,l\}| = 1,$$
 
-i.e. the two edge index pairs share **exactly one** surface index.  Two
-curves from entirely disjoint pairs ($\{i,j\} \cap \{k,l\} = \emptyset$)
-have no common surface, so any geometric proximity between them is
-accidental and not a valid topological vertex.
+i.e. exactly one shared surface index.  This is **not** merely a
+topological convention — it is forced by a dimension-counting argument.
+
+### Dimension counting / transversality
+
+Each smooth surface $F_i \subset \mathbb{R}^3$ is a codimension-1
+submanifold.  The intersection of $k$ surfaces in general position has
+codimension $k$, so dimension $3 - k$.  Concretely:
+
+| Number of surfaces | Expected dimension of intersection |
+|---|---|
+| 1 | 2 (a surface) |
+| 2 | 1 (a curve) — this is an edge $C_{ij}$ |
+| 3 | 0 (a point) — this is a vertex |
+| 4 | $-1$ (generically **empty**) |
+
+So in $\mathbb{R}^3$, **three** surfaces in general position meet in a
+point, and **four** surfaces in general position do not meet at all.
+
+Now consider the two cases for a pair of curves:
+
+**Case $|\{i,j\} \cap \{k,l\}| = 1$**, say $i = k$.  Then
+
+$$C_{ij} \cap C_{kl} = F_i \cap F_j \cap F_i \cap F_l = F_i \cap F_j \cap F_l,$$
+
+the intersection of **three** surfaces — generically a point.  This is
+the correct codimension and explains why vertices of this type generically
+exist and are isolated.
+
+**Case $|\{i,j\} \cap \{k,l\}| = 0$ (disjoint indices).**  Then
+
+$$C_{ij} \cap C_{kl} = F_i \cap F_j \cap F_k \cap F_l,$$
+
+the intersection of **four** distinct surfaces — generically empty in
+$\mathbb{R}^3$.  Any geometric proximity between $C_{ij}$ and $C_{kl}$
+when all four surface indices are distinct is a non-generic coincidence,
+not a structural vertex.
+
+An equivalent way to see this: two curves in $\mathbb{R}^3$ each have
+dimension 1, so their expected intersection dimension is $1 + 1 - 3 = -1$
+(empty).  For them to meet, one needs a constraint that reduces the
+effective ambient dimension.  Sharing a common surface $F_m$ does exactly
+this: both curves lie on the 2-dimensional $F_m$, so their intersection is
+expected to have dimension $1 + 1 - 2 = 0$ — a point.  Without a shared
+surface there is no such reduction and the intersection is generically empty.
+
+### The B-Rep constraint encodes generic geometry
+
+The B-Rep rule "a vertex lies on exactly 3 faces" is the topological
+*encoding* of this generic geometric reality, not an independent assumption.
+Four-surface vertices can exist (they are valid B-Rep configurations) but
+they require a special, non-generic geometric coincidence — for instance,
+four planes arranged to pass through a common line, then perturbed to meet
+at a point.  In a model reconstructed from point cloud data they are
+extremely unlikely to arise from the fitting process.
 
 **Consequence:** the correct search space is all pairs of edges whose
 index sets share exactly one index, regardless of whether the remaining

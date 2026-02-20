@@ -35,7 +35,6 @@ try:
     _OCC_INF     = precision.Infinite()
     OCC_AVAILABLE = True
 except ImportError as err:
-    print(err)
     _OCC_INF      = float("inf")
     OCC_AVAILABLE = False
 
@@ -148,7 +147,7 @@ def _intersect_occ(occ_surf_i, occ_surf_j, tol):
         return _result([], [], "failed", "occ")
 
     curves = [inter.Line(k) for k in range(1, inter.NbLines() + 1)]
-
+    
     if not curves:
         # GeomAPI_IntSS exposes no point query; NbLines()==0 after IsDone()
         # means either no intersection or point tangency (indistinguishable
@@ -338,7 +337,7 @@ def trim_intersections(intersections, boundary_strips, threshold, extension_fact
     return trimmed
 
 
-def compute_vertices(adj, intersections, threshold):
+def compute_vertices(adj, intersections, threshold = 1e-4):
     """
     Find B-Rep vertices: points where three or more surfaces simultaneously meet.
 
@@ -361,12 +360,15 @@ def compute_vertices(adj, intersections, threshold):
 
     Returns
     -------
-    vertices : (M, 3) float64 array of vertex positions, or (0, 3) if none
+    vertices     : (M, 3) float64 array of vertex positions, or (0, 3) if none
+    vertex_edges : list[set] of length M; vertex_edges[v] is the set of edge
+                   tuples (i, j) that vertex v is incident to
     """
-    candidates = []
+    candidates      = []   # list of (M, 3) positions
+    candidate_edges = []   # list of {ea, eb} edge sets, parallel to candidates
+
     edges = list(intersections.keys())   # each is (i, j) with i < j
-    threshold = 1e-3
-    
+
     for idx_a in range(len(edges)):
         ea = edges[idx_a]
         curves_a = intersections[ea].get("curves", [])
@@ -401,314 +403,27 @@ def compute_vertices(adj, intersections, threshold):
                                 (p1.Z() + p2.Z()) / 2.0,
                             ])
                             candidates.append(midpoint)
+                            candidate_edges.append({ea, eb})
 
     if not candidates:
-        return np.empty((0, 3), dtype=np.float64)
+        return np.empty((0, 3), dtype=np.float64), []
 
     # Greedy deduplication: merge candidates within threshold of each other
-    candidates = np.array(candidates, dtype = np.float64)
+    candidates = np.array(candidates, dtype=np.float64)
     used = np.zeros(len(candidates), dtype=bool)
-    merged = []
+    merged_positions  = []
+    merged_edge_sets  = []
     for idx in range(len(candidates)):
         if used[idx]:
             continue
         dists = np.linalg.norm(candidates - candidates[idx], axis=1)
         close = dists < threshold
-        merged.append(candidates[close].mean(axis=0))
+        merged_positions.append(candidates[close].mean(axis=0))
+        # Union of edge sets from all merged candidates
+        merged_set = set()
+        for ci in np.where(close)[0]:
+            merged_set |= candidate_edges[ci]
+        merged_edge_sets.append(merged_set)
         used[close] = True
 
-    return np.array(merged, dtype=np.float64)
-
-
-# ---------------------------------------------------------------------------
-# Open3D helpers
-# ---------------------------------------------------------------------------
-
-CURVE_TYPE_COLORS = {
-    "line":    [1.0, 0.2, 0.2],
-    "circle":  [0.2, 0.85, 0.2],
-    "ellipse": [0.2, 0.4,  1.0],
-    "conic":   [0.8, 0.2,  0.8],
-    "bspline": [1.0, 0.6,  0.0],
-    "curve":   [0.8, 0.8,  0.0],
-    "tangent": [1.0, 1.0,  1.0],
-}
-
-
-def make_curve_lineset(curve, color, n_points = 200, line_extent = 1.0):
-    """
-    Build an Open3D LineSet by sampling a Geom_Curve.
-
-    Parameters
-    ----------
-    curve      : Geom_Curve
-    color      : RGB list/array, e.g. [1.0, 0.2, 0.2]
-    n_points   : number of sample points
-    line_extent: clipping half-length for infinite lines (Geom_Line)
-    """
-    import open3d as o3d
-    pts   = sample_curve(curve, n_points = n_points, line_extent = line_extent)
-    lines = [[i, i + 1] for i in range(len(pts) - 1)]
-    ls = o3d.geometry.LineSet()
-    ls.points = o3d.utility.Vector3dVector(pts)
-    ls.lines  = o3d.utility.Vector2iVector(lines)
-    ls.colors = o3d.utility.Vector3dVector([color] * len(lines))
-    return ls
-
-
-# ---------------------------------------------------------------------------
-# __main__ smoke-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import argparse, os, sys, time, glob as _glob, torch
-    parser = argparse.ArgumentParser(
-        description = "Surface intersection smoke-test",
-        formatter_class = argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--visualize", action = "store_true",
-                        help = "Load saved results and visualize (host mode, no OCC needed)")
-    parser.add_argument("--input", type = str, default = None,
-                        help = "Path to .xyzc file (compute mode only)")
-    parser.add_argument("--visualize_id", type = str, help = "ID of the point cloud to visualize the results for")
-    parser.add_argument("--output_dir", type = str, default = "output_surfaceinter",
-                        help = "Directory for saved results")
-    args = parser.parse_args()
-
-    # ------------------------------------------------------------------
-    # Host mode: load saved results and open Open3D windows
-    # ------------------------------------------------------------------
-    if args.visualize:
-        import open3d as o3d
-
-        # Accept either output_dir/pc_id/ or output_dir/ directly.
-        # If metadata.npz is not at the top level, look for a single subdirectory.
-        out_dir = args.output_dir
-        pc_id = args.visualize_id
-        out_dir = os.path.join(out_dir, pc_id)
-        
-        meta = np.load(os.path.join(out_dir, "metadata.npz"), allow_pickle = True)
-        n_clusters   = int(meta["n_clusters"])
-        surface_ids  = meta["surface_ids"]
-        surf_names   = meta["surface_names"]
-        clust_colors = meta["cluster_colors"]
-
-        cluster_pcds = []
-        for i in range(n_clusters):
-            pts = np.load(os.path.join(out_dir, f"cluster_{i}.npy"))
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts)
-            pcd.paint_uniform_color(clust_colors[i].tolist())
-            cluster_pcds.append(pcd)
-
-        def _pts_to_lineset(pts, color):
-            lines = [[m, m + 1] for m in range(len(pts) - 1)]
-            ls = o3d.geometry.LineSet()
-            ls.points = o3d.utility.Vector3dVector(pts)
-            ls.lines  = o3d.utility.Vector2iVector(lines)
-            ls.colors = o3d.utility.Vector3dVector([color] * len(lines))
-            return ls
-
-        trimmed_linesets   = []
-        untrimmed_linesets = []
-        for inter_path in sorted(_glob.glob(os.path.join(out_dir, "inter_*.npz"))):
-            d          = np.load(inter_path, allow_pickle = True)
-            curve_type = str(d["curve_type"])
-            n_curves   = int(d["n_curves"])
-            n_raw      = int(d["n_untrimmed_curves"])
-            ci, cj     = int(d["cluster_i"]), int(d["cluster_j"])
-            si_name    = str(d["surface_i_name"])
-            sj_name    = str(d["surface_j_name"])
-            print(f"({ci},{cj})  {si_name} ∩ {sj_name}  ->  type={curve_type}"
-                  f"  trimmed={n_curves}  raw={n_raw}")
-            color = CURVE_TYPE_COLORS.get(curve_type, [0.8, 0.8, 0.8])
-            for k in range(n_curves):
-                trimmed_linesets.append(_pts_to_lineset(d[f"curve_points_{k}"], color))
-            for k in range(n_raw):
-                untrimmed_linesets.append(_pts_to_lineset(d[f"untrimmed_curve_points_{k}"], color))
-
-        inr_meshes = []
-        for mesh_path in sorted(_glob.glob(os.path.join(out_dir, "inr_mesh_*.npz"))):
-            ci    = int(os.path.basename(mesh_path).replace("inr_mesh_", "").replace(".npz", ""))
-            d     = np.load(mesh_path)
-            mesh  = o3d.geometry.TriangleMesh()
-            mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
-            mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
-            mesh.compute_vertex_normals()
-            mesh.paint_uniform_color(clust_colors[ci].tolist())
-            inr_meshes.append(mesh)
-
-        # 2×2 window layout (fits 1920×1080)
-        W, H = 960, 490
-
-        vis1 = o3d.visualization.Visualizer()
-        vis1.create_window(window_name = "Untrimmed curves", width = W, height = H, left = 0, top = 50)
-        for ls in untrimmed_linesets:
-            vis1.add_geometry(ls)
-
-        vertex_pcd = None
-        vertex_path = os.path.join(out_dir, "vertices.npz")
-        if os.path.exists(vertex_path):
-            vdata = np.load(vertex_path)
-            verts = vdata["vertices"]
-            if len(verts) > 0:
-                vertex_pcd = o3d.geometry.PointCloud()
-                vertex_pcd.points = o3d.utility.Vector3dVector(verts)
-                vertex_pcd.paint_uniform_color([1.0, 1.0, 0.0])
-                print(f"Loaded {len(verts)} vertices")
-
-        vis2 = o3d.visualization.Visualizer()
-        vis2.create_window(window_name = "Trimmed curves + vertices", width = W, height = H, left = W, top = 50)
-        for ls in trimmed_linesets:
-            vis2.add_geometry(ls)
-        if vertex_pcd is not None:
-            vis2.add_geometry(vertex_pcd)
-        vis2.get_render_option().point_size = 8.0
-
-        vis3 = o3d.visualization.Visualizer()
-        vis3.create_window(window_name = "Point clouds + trimmed curves", width = W, height = H, left = 0, top = 50 + H + 40)
-        for pcd in cluster_pcds:
-            vis3.add_geometry(pcd)
-        for ls in trimmed_linesets:
-            vis3.add_geometry(ls)
-        vis3.get_render_option().point_size = 2.0
-
-        vis4 = o3d.visualization.Visualizer()
-        vis4.create_window(window_name = "INR surfaces", width = W, height = H, left = W, top = 50 + H + 40)
-        for mesh in inr_meshes:
-            vis4.add_geometry(mesh)
-
-        running1 = running2 = running3 = running4 = True
-        while running1 and running2 and running3 and running4:
-            if running1:
-                running1 = vis1.poll_events()
-                vis1.update_renderer()
-            if running2:
-                running2 = vis2.poll_events()
-                vis2.update_renderer()
-            if running3:
-                running3 = vis3.poll_events()
-                vis3.update_renderer()
-            if running4:
-                running4 = vis4.poll_events()
-                vis4.update_renderer()
-            time.sleep(0.01)
-
-        vis1.destroy_window()
-        vis2.destroy_window()
-        vis3.destroy_window()
-        vis4.destroy_window()
-        sys.exit(0)
-
-    # ------------------------------------------------------------------
-    # Compute mode (Docker): fit surfaces, intersect, save results
-    # ------------------------------------------------------------------
-    if not OCC_AVAILABLE:
-        print("OCC bindings not available — cannot run intersection computation.")
-        sys.exit(1)
-
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    import point2cad.primitive_fitting_utils as pfu
-    from point2cad.surface_fitter    import fit_surface, SURFACE_NAMES
-    from point2cad.occ_surfaces      import to_occ_surface
-    from point2cad.cluster_adjacency import compute_adjacency_matrix, adjacency_pairs, adjacency_triangles
-    from point2cad.color_config      import get_surface_color
-
-    SAMPLE = args.input or os.path.join(os.path.dirname(__file__), "..", "sample_clouds", "abc_00949.xyzc")
-    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-    pc_id   = os.path.basename(SAMPLE).split("_")[-1].split(".")[0]
-    out_dir = os.path.join(args.output_dir, pc_id)
-    os.makedirs(out_dir, exist_ok = True)
-
-    def normalize_points(pts):
-        pts = pts - np.mean(pts, axis = 0, keepdims = True)
-        S, U = np.linalg.eig(pts.T @ pts)
-        R = pfu.rotation_matrix_a_to_b(U[:, np.argmin(S)], np.array([1, 0, 0]))
-        pts = (R @ pts.T).T
-        extents = np.max(pts, axis = 0) - np.min(pts, axis = 0)
-        return (pts / (np.max(extents) + 1e-7)).astype(np.float32)
-
-    data = np.loadtxt(SAMPLE)
-    data[:, :3] = normalize_points(data[:, :3])
-    unique_clusters = np.unique(data[:, -1].astype(int))
-    np_rng = np.random.default_rng(41)
-    torch.manual_seed(41)
-    torch.cuda.manual_seed(41)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False 
-    
-    clusters, surface_ids, fit_results, fit_meshes, occ_surfs = [], [], [], [], []
-    for cid in unique_clusters:
-        cluster = data[data[:, -1].astype(int) == cid, :3].astype(np.float32)
-        clusters.append(cluster)
-        res = fit_surface(cluster, {"hidden_dim": 64, "use_shortcut": True, "fraction_siren": 0.5},
-                          np_rng, DEVICE, 
-                          inr_fit_kwargs = {"max_steps": 1500, "noise_magnitude_3d": 0.05, "noise_magnitude_uv": 0.05, "initial_lr": 1e-1},
-                          inr_mesh_kwargs = {"mesh_dim": 200, "uv_margin": 0.2, "threshold_multiplier": 1.5})
-        
-        sid = res["surface_id"]
-        surface_ids.append(sid)
-        fit_results.append(res["result"])
-        fit_meshes.append(res["mesh"])
-        occ_surfs.append(to_occ_surface(sid, res["result"], cluster = cluster, uv_margin = 0.05))
-        print(f"Cluster {cid}: {SURFACE_NAMES[sid]}")
-
-    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters)
-    print(f"\nSpacing={spacing:.5f}  threshold={threshold:.5f}")
-    print(f"Adjacent pairs: {adjacency_pairs(adj)}\n")
-
-    # Save metadata and cluster point clouds BEFORE intersection so the
-    # visualizer always has something to display even if OCC fails later.
-    np.savez(
-        os.path.join(out_dir, "metadata.npz"),
-        n_clusters     = len(clusters),
-        surface_ids    = np.array(surface_ids),
-        surface_names  = np.array([SURFACE_NAMES[s] for s in surface_ids]),
-        cluster_colors = np.array([get_surface_color(SURFACE_NAMES[s]).tolist() for s in surface_ids]),
-    )
-    for i, cluster in enumerate(clusters):
-        np.save(os.path.join(out_dir, f"cluster_{i}.npy"), cluster)
-
-    for i, (sid, mesh) in enumerate(zip(surface_ids, fit_meshes)):
-        if sid == SURFACE_INR:
-            np.savez(
-                os.path.join(out_dir, f"inr_mesh_{i}.npz"),
-                vertices  = np.asarray(mesh.vertices),
-                triangles = np.asarray(mesh.triangles),
-            )
-    print(f"Cluster files saved to {out_dir}/")
-
-    raw_intersections   = compute_all_intersections(adj, surface_ids, fit_results, occ_surfs)
-    trim_intersections_ = trim_intersections(raw_intersections, boundary_strips, threshold, extension_factor = 0.15)
-
-    vertices = compute_vertices(adj, trim_intersections_, threshold)
-    print(f"Found {len(vertices)} vertices")
-    np.savez(os.path.join(out_dir, "vertices.npz"), vertices=vertices)
-
-    # Save intersections: sample curves to numpy so the host needs no OCC.
-    # Both untrimmed (raw) and trimmed samples are stored in the same npz.
-    for (i, j) in raw_intersections:
-        inter_raw  = raw_intersections[(i, j)]
-        inter_trim = trim_intersections_[(i, j)]
-        si, sj = SURFACE_NAMES[surface_ids[i]], SURFACE_NAMES[surface_ids[j]]
-        print(f"({i},{j})  {si} ∩ {sj}  ->  type={inter_raw['type']}  method={inter_raw['method']}"
-              f"  raw_curves={len(inter_raw['curves'])}  trimmed_curves={len(inter_trim['curves'])}")
-        kw = dict(
-            cluster_i           = i,
-            cluster_j           = j,
-            surface_i_name      = si,
-            surface_j_name      = sj,
-            curve_type          = inter_raw["type"],
-            method              = inter_raw["method"],
-            n_curves            = len(inter_trim["curves"]),
-            n_untrimmed_curves  = len(inter_raw["curves"]),
-        )
-        for k, curve in enumerate(inter_trim["curves"]):
-            print(f"  trimmed  curve[{k}] params: [{curve.FirstParameter():.6f}, {curve.LastParameter():.6f}]")
-            kw[f"curve_points_{k}"] = sample_curve(curve, n_points = 200, line_extent = 1.0)
-        for k, curve in enumerate(inter_raw["curves"]):
-            print(f"  raw      curve[{k}] params: [{curve.FirstParameter():.6f}, {curve.LastParameter():.6f}]")
-            kw[f"untrimmed_curve_points_{k}"] = sample_curve(curve, n_points = 200, line_extent = 1.0)
-        np.savez(os.path.join(out_dir, f"inter_{i}_{j}.npz"), **kw)
-
-    print(f"\nAll results saved to {out_dir}/")
+    return np.array(merged_positions, dtype=np.float64), merged_edge_sets

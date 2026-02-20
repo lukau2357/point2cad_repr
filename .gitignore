@@ -4,3 +4,4 @@ output/
 secrets.yaml
 output_bspline/
 **/output_surfaceinter
+output_brep/
