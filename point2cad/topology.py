@@ -26,17 +26,21 @@ import numpy as np
 
 try:
     from OCC.Core.Geom           import Geom_TrimmedCurve
+    from OCC.Core.Geom2dAPI      import Geom2dAPI_PointsToBSpline
     from OCC.Core.GeomAPI        import GeomAPI_ProjectPointOnCurve, GeomAPI_ProjectPointOnSurf
     from OCC.Core.GeomLProp      import GeomLProp_SLProps
-    from OCC.Core.gp             import gp_Pnt
+    from OCC.Core.gp             import gp_Pnt, gp_Pnt2d
+    from OCC.Core.TColgp         import TColgp_Array1OfPnt2d
+    from OCC.Core.BRep           import BRep_Builder, BRep_Tool
     from OCC.Core.TopExp         import TopExp_Explorer
-    from OCC.Core.TopAbs         import TopAbs_EDGE
+    from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_SHELL, TopAbs_SOLID
     from OCC.Core.TopoDS         import topods
     from OCC.Core.BRepBuilderAPI import (
         BRepBuilderAPI_MakeVertex,
         BRepBuilderAPI_MakeEdge,
         BRepBuilderAPI_MakeWire,
         BRepBuilderAPI_MakeFace,
+        BRepBuilderAPI_MakeSolid,
         BRepBuilderAPI_Sewing,
     )
     from OCC.Core.ShapeFix       import ShapeFix_Wire, ShapeFix_Shape
@@ -471,9 +475,9 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
     Step 3 of B-Rep topology: for each face, partition its arcs into closed
     wires (boundary loops).
 
-    INR (BSpline) faces are skipped: their face in build_brep_shape is
-    constructed from UV parameter bounds rather than from wires, so Euler
-    decomposition of their arc graph is unnecessary.
+    All faces — including BSpline (INR) faces — are processed identically.
+    Whether the resulting wires are used for face construction depends on the
+    `bspline_method` passed to `build_brep_shape`.
 
     Closed arcs (closed=True) each form a trivial one-arc wire immediately.
 
@@ -494,26 +498,18 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
     vertices     : np.ndarray (M, 3) or None
         Vertex positions; required together with occ_surfaces.
     surface_ids  : list[int] or None
-        Surface type ids from surface_fitter.  INR faces are skipped.
+        Surface type ids from surface_fitter (reserved for future use).
 
     Returns
     -------
     face_wires : dict i -> list[list[(arc_dict, bool)]]
         Outer list: one entry per wire on face i.
         Inner list: ordered (arc, forward) pairs forming a closed loop.
-        INR faces map to an empty list.
     """
     use_angular = (occ_surfaces is not None) and (vertices is not None)
     face_wires = {}
 
     for face_idx, arcs in face_arcs.items():
-        is_inr = (surface_ids is not None and
-                  face_idx < len(surface_ids) and
-                  surface_ids[face_idx] == SURFACE_INR)
-        if is_inr:
-            face_wires[face_idx] = []
-            continue
-
         wires = []
 
         # Trivial wires: each closed arc is its own single-arc wire.
@@ -617,10 +613,54 @@ def print_face_wires_summary(face_wires):
 # Step 5 — BRep assembly and STEP export
 # ---------------------------------------------------------------------------
 
+def _build_pcurve_on_bspline(curve_3d, t0, t1, surface, n_samples=50, tolerance=1e-3):
+    """
+    Compute a Geom2d pcurve for the 3D curve segment [t0, t1] on a BSpline surface.
+
+    Steps:
+      1. Sample n_samples points evenly on curve_3d between t0 and t1.
+      2. Project each 3D point onto the surface via GeomAPI_ProjectPointOnSurf
+         (Newton iteration) to obtain (u_k, v_k).
+      3. Fit a Geom2d_BSplineCurve through the (u_k, v_k) sequence via
+         Geom2dAPI_PointsToBSpline (degree 3–8, C2 continuity).
+
+    Returns the Geom2d_BSplineCurve on success, or None if fewer than 2
+    points project successfully or if the 2D BSpline fit fails.
+    """
+    uv_pts = []
+    for k in range(n_samples):
+        t = t0 + (t1 - t0) * k / max(n_samples - 1, 1)
+        try:
+            p3d = curve_3d.Value(t)
+            proj = GeomAPI_ProjectPointOnSurf(p3d, surface)
+            if proj.NbPoints() > 0:
+                u, v = proj.LowerDistanceParameters()
+                uv_pts.append((float(u), float(v)))
+        except Exception:
+            pass
+
+    if len(uv_pts) < 2:
+        return None
+
+    try:
+        pts_arr = TColgp_Array1OfPnt2d(1, len(uv_pts))
+        for i, (u, v) in enumerate(uv_pts):
+            pts_arr.SetValue(i + 1, gp_Pnt2d(u, v))
+        approx = Geom2dAPI_PointsToBSpline(pts_arr)
+        if not approx.IsDone():
+            return None
+        return approx.Curve()
+    except Exception:
+        return None
+
+
 def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
                      face_wires=None, tolerance=1e-3,
                      inr_geom_close_tol=0.05, inr_arc_samples=30,
-                     inr_uv_margin=0.02):
+                     inr_uv_margin=0.02,
+                     bspline_method="uv_bounds",
+                     same_parameter=True,
+                     orient_solid=True):
     """
     Build a TopoDS_Shape from face_arcs.
 
@@ -630,19 +670,28 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
     wire is built directly from the ordered (arc, forward) sequence — arc
     orientation is encoded by edge.Reversed() when forward=False.
 
-    BSpline (INR) surfaces
-    ----------------------
-    A tube-like BSpline face has two boundary circles forming an annular UV
-    topology (neither wire contains the other) that OCC cannot trim using the
-    standard MakeFace(surface, wire) API without seam-edge handling.  When
-    `surface_ids` is provided and `surface_ids[face_idx] == SURFACE_INR`,
-    the face is instead built with explicit UV parameter bounds:
-    `BRepBuilderAPI_MakeFace(surface, u_min, u_max, v_min, v_max, tolerance)`.
-    The bounds are obtained by projecting sampled points from all incident arcs
-    onto the BSpline surface via `GeomAPI_ProjectPointOnSurf` and taking
-    min/max with a small relative margin.  OCC computes pcurves for the
-    iso-parameter boundary edges automatically.  Falls back to the full natural
-    UV domain if projection fails.
+    BSpline (INR) surfaces — two methods
+    -------------------------------------
+    bspline_method="uv_bounds"  (default)
+        The face is built with explicit UV parameter bounds:
+        `BRepBuilderAPI_MakeFace(surface, u_min, u_max, v_min, v_max, tolerance)`.
+        The bounds are estimated by projecting sampled points from incident arcs
+        onto the BSpline surface.  Geometric closure in each direction is
+        detected and SetUPeriodic / SetVPeriodic called accordingly.
+        OCC computes trivial iso-parameter pcurves automatically.
+        Sewing bridges the gap between these iso-parameter edges and the exact
+        intersection curve edges of adjacent analytical faces.
+        Restriction: the face must have rectangular UV topology (at most two
+        open boundary loops); fails for non-tubular or multi-boundary shapes.
+
+    bspline_method="explicit_pcurve"
+        The face is built from the intersection curve wires assembled by
+        assemble_wires, exactly as for analytical faces.  After MakeFace,
+        `breplib.BuildCurve2d` is called for every edge of the BSpline face to
+        project the 3D intersection curves onto the UV domain and compute
+        explicit pcurves via Newton iteration.  Topologically general — handles
+        any number of boundary loops — but more expensive and can fail if Newton
+        diverges near surface seams or low-curvature regions.
 
     All faces are sewn with BRepBuilderAPI_Sewing and healed with
     ShapeFix_Shape.
@@ -659,15 +708,18 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
         (for primitive faces), and ShapeFix_Wire / ShapeFix_Shape.  In principle
         these could differ; a single value is a pragmatic simplification.
     inr_geom_close_tol : float
-        Maximum 3D distance (in model units) between opposite BSpline boundary
+        (uv_bounds only) Maximum 3D distance between opposite BSpline boundary
         curves for a parametric direction to be declared geometrically closed.
-        Default 0.05 (5% of unit-normalised scale); may need tuning per dataset.
+        Default 0.05 (5% of unit-normalised scale).
     inr_arc_samples   : int
-        Number of points sampled from each incident arc when projecting onto
-        the BSpline surface to estimate UV bounds.  Default 30.
+        (uv_bounds only) Number of points sampled per arc for UV bound estimation.
+        Default 30.
     inr_uv_margin     : float
-        Relative margin added to the projected UV bounds on each side
-        (fraction of the projected span).  Default 0.02 (2%).
+        (uv_bounds only) Relative margin added to projected UV bounds on each side.
+        Default 0.02 (2%).
+    bspline_method    : str
+        How BSpline (INR) faces are constructed.  "uv_bounds" (default) or
+        "explicit_pcurve".
 
     Returns
     -------
@@ -731,23 +783,17 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
             fix.FixConnected()
             occ_wires.append(fix.Wire())
 
-        # BSpline (INR) faces: determine UV bounds by projecting incident arc
-        # sample points onto the surface, then build a parameter-bounded face.
-        # This avoids annular-topology issues (two disjoint boundary wires that
-        # neither contains the other in UV space) and produces clean iso-parameter
-        # boundary edges whose pcurves are trivial straight lines in UV space.
         is_inr = (surface_ids is not None and
                   face_idx < len(surface_ids) and
                   surface_ids[face_idx] == SURFACE_INR)
+
+        # Shared INR setup: geometric closure detection and periodisation.
+        # Runs before both bspline_method branches so that the surface is
+        # already periodic (if applicable) when either branch builds its face.
+        closed_u = closed_v = False
+        nu1 = nu2 = nv1 = nv2 = None
         if is_inr:
             nu1, nu2, nv1, nv2 = surface.Bounds()
-
-            # Detect geometric closure: measure the 3D distance between the
-            # two opposite boundaries in each parametric direction.
-            # A closed surface (e.g. a tube) has coincident u=nu1 and u=nu2
-            # edges in 3D.  GeomAPI_PointsToBSplineSurface never produces a
-            # periodic surface, so OCC is unaware of this closure — we must
-            # detect it and call SetUPeriodic / SetVPeriodic explicitly.
             v_mid = (nv1 + nv2) / 2.0
             u_mid = (nu1 + nu2) / 2.0
             try:
@@ -763,27 +809,89 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
                                 (pv1.Z()-pv2.Z())**2)
             except Exception:
                 d_u, d_v = 1.0, 1.0
-
             closed_u = d_u < inr_geom_close_tol
             closed_v = d_v < inr_geom_close_tol
             print(f"[brep] face {face_idx}: BSpline seam check "
                   f"d_u={d_u:.4f} d_v={d_v:.4f} "
                   f"closed_u={closed_u} closed_v={closed_v}")
-
-            # Make the surface periodic in whichever directions are closed so
-            # OCC creates a proper internal seam edge instead of two separate
-            # degenerate boundary edges that sewing would incorrectly merge.
             try:
                 if closed_u:
                     surface.SetUPeriodic()
                 if closed_v:
                     surface.SetVPeriodic()
-                # Refresh bounds after periodisation (knot vector may shift).
                 nu1, nu2, nv1, nv2 = surface.Bounds()
             except Exception as exc:
                 print(f"[brep] face {face_idx}: SetPeriodic failed: {exc}")
                 closed_u = closed_v = False
 
+        # BSpline (INR) face — explicit pcurve method:
+        # Build the face from assembled intersection-curve wires (same as
+        # analytical faces) on the already-periodic surface.  Then for every
+        # edge in the resulting face, extract its 3D curve via BRep_Tool.Curve,
+        # compute a pcurve by sampling + Newton projection onto the BSpline UV
+        # domain + Geom2d BSpline fit (_build_pcurve_on_bspline), and attach
+        # it via BRep_Builder.UpdateEdge.
+        if is_inr and bspline_method == "explicit_pcurve":
+            if not occ_wires:
+                print(f"[brep] face {face_idx}: BSpline explicit-pcurve "
+                      f"— no wires assembled, skipping")
+                continue
+            try:
+                face_maker = BRepBuilderAPI_MakeFace(surface, occ_wires[0])
+                for inner in occ_wires[1:]:
+                    face_maker.Add(inner)
+                if not face_maker.IsDone():
+                    print(f"[brep] face {face_idx}: BSpline explicit-pcurve "
+                          f"MakeFace failed (error {face_maker.Error()})")
+                    continue
+                face = face_maker.Face()
+                brep_builder = BRep_Builder()
+                n_ok, n_fail = 0, 0
+                seen_edges = set()
+                explorer = TopExp_Explorer(face, TopAbs_EDGE)
+                while explorer.More():
+                    edge = topods.Edge(explorer.Current())
+                    eid = edge.__hash__()
+                    if eid not in seen_edges:
+                        seen_edges.add(eid)
+                        try:
+                            crv, t0, t1 = BRep_Tool.Curve(edge)
+                            if crv is None:
+                                n_fail += 1
+                            else:
+                                pcurve = _build_pcurve_on_bspline(
+                                    crv, t0, t1, surface,
+                                    n_samples=50, tolerance=tolerance,
+                                )
+                                if pcurve is not None:
+                                    brep_builder.UpdateEdge(
+                                        edge, pcurve, face, tolerance
+                                    )
+                                    n_ok += 1
+                                else:
+                                    print(
+                                        f"[brep] face {face_idx}: "
+                                        f"_build_pcurve_on_bspline returned "
+                                        f"None for an edge"
+                                    )
+                                    n_fail += 1
+                        except Exception as exc:
+                            print(f"[brep] face {face_idx}: pcurve "
+                                  f"computation failed: {exc}")
+                            n_fail += 1
+                    explorer.Next()
+                print(f"[brep] face {face_idx}: BSpline explicit-pcurve "
+                      f"pcurves ok={n_ok} fail={n_fail}")
+                sewing.Add(face)
+            except Exception as exc:
+                print(f"[brep] face {face_idx}: BSpline explicit-pcurve "
+                      f"exception: {exc}")
+            continue
+
+        # BSpline (INR) face — UV-bounds method:
+        # Build a parameter-bounded face from the BSpline's (now possibly
+        # periodic) UV domain, clipped to the extent of incident arcs.
+        if is_inr:
             # Start from full natural domain; constrain OPEN direction(s) by
             # projecting arc sample points onto the surface.  Sampling and
             # projection are skipped entirely when both directions are closed.
@@ -875,8 +983,46 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
     fixer = ShapeFix_Shape(shape)
     fixer.SetPrecision(tolerance)
     fixer.Perform()
-
     shape = fixer.Shape()
+
+    # 6. Re-parameterise edges so stored tolerances reflect the actual
+    #    3D-curve / pcurve deviation.  Fixes "Invalid curve on surface"
+    #    errors in boolean operation pre-checks.
+    #    Disable with same_parameter=False if this causes regressions.
+    if same_parameter:
+        try:
+            breplib.SameParameter(shape, True)
+            print("[brep] SameParameter done")
+        except Exception as exc:
+            print(f"[brep] SameParameter failed: {exc}")
+
+    # 7. Ensure consistent face-normal orientation for a closed shell/solid.
+    #    Fixes "Self-intersection found" errors caused by inward-pointing
+    #    face normals.  Requires a TopoDS_Solid; shells are wrapped first.
+    #    Disable with orient_solid=False if this causes regressions.
+    if orient_solid:
+        try:
+            stype = shape.ShapeType()
+            if stype == TopAbs_SOLID:
+                solid = topods.Solid(shape)
+                breplib.OrientClosedSolid(solid)
+                shape = solid
+                print("[brep] OrientClosedSolid done (solid)")
+            elif stype == TopAbs_SHELL:
+                solid_maker = BRepBuilderAPI_MakeSolid(topods.Shell(shape))
+                if solid_maker.IsDone():
+                    solid = solid_maker.Solid()
+                    breplib.OrientClosedSolid(solid)
+                    shape = solid
+                    print("[brep] OrientClosedSolid done (shell → solid)")
+                else:
+                    print("[brep] OrientClosedSolid: MakeSolid from shell failed")
+            else:
+                print(f"[brep] OrientClosedSolid: skipped "
+                      f"(shape type {stype}, expected shell or solid)")
+        except Exception as exc:
+            print(f"[brep] OrientClosedSolid failed: {exc}")
+
     analyzer = BRepCheck_Analyzer(shape)
     eval_results = analyzer.IsValid()
     print(f"[brep] Results of BRep correctness analyzer: {eval_results}")

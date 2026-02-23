@@ -338,7 +338,8 @@ def run_compute(args):
     step_path = os.path.join(out_dir, f"{pc_id}.step")
     shape = build_brep_shape(face_arcs, occ_surfs, vertices,
                              surface_ids=surface_ids,
-                             face_wires=face_wires, tolerance=1e-3)
+                             face_wires=face_wires, tolerance=1e-3,
+                             bspline_method=args.bspline_method)
     export_step(shape, step_path)
 
     # ------------------------------------------------------------------
@@ -368,7 +369,14 @@ if __name__ == "__main__":
                         help="Path to .xyzc file (compute mode)")
     parser.add_argument("--output_dir", type=str, default="output_brep",
                         help="Directory for saved results")
-    parser.add_argument("-seed", type=int, default = 41, help = "Reproducibility seed")
+    parser.add_argument("-seed", type=int, default=41, help="Reproducibility seed")
+    parser.add_argument("--bspline_method", type=str, default="uv_bounds",
+                        choices=["uv_bounds", "explicit_pcurve"],
+                        help="How BSpline (INR) faces are constructed. "
+                             "'uv_bounds': rectangular UV-bounds face, sewing "
+                             "bridges the gap to adjacent analytical faces (default). "
+                             "'explicit_pcurve': wire-based face with pcurves "
+                             "computed by breplib.BuildCurve2d for each edge.")
     args = parser.parse_args()
 
     if args.visualize:

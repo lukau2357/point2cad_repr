@@ -687,6 +687,25 @@ or sewing to reject the face.  The UV-bounds approach avoids all of these
 failure modes at the cost of delegating the boundary approximation to the
 sewing tolerance.
 
+**The four iso-parameter edges.**  The rectangular UV-bounds face always has
+exactly four boundary edges:
+
+| Edge | 3D curve | UV pcurve |
+|---|---|---|
+| $S(u,\, v_\text{min})$, $u \in [u_1, u_2]$ | bottom cap boundary | horizontal line $v = v_\text{min}$ |
+| $S(u,\, v_\text{max})$, $u \in [u_1, u_2]$ | top cap boundary | horizontal line $v = v_\text{max}$ |
+| $S(u_min,\, v)$, $v \in [v_\text{min}, v_\text{max}]$ | left seam | vertical line $u = u_1$ |
+| $S(u_max,\, v)$, $v \in [v_\text{min}, v_\text{max}]$ | right seam | vertical line $u = u_2$ |
+
+For a surface periodic in $u$ (closed revolution), `SetUPeriodic` collapses
+the left and right seam edges into a single internal seam edge with two
+pcurves (one for each side), reducing the boundary to three curves.  Sewing
+then attempts to merge each boundary edge with an edge from a neighboring face:
+the $v_\text{min}$ and $v_\text{max}$ edges are candidates for merging with
+the intersection curve edges of adjacent cap faces; the seam edge(s) have no
+neighbor and remain internal.  In a typical closed tube with two planar caps
+all mergeable edges are within sewing tolerance and the shell closes cleanly.
+
 ---
 
 ## 7 — OCC topology assembly (Step 5)
