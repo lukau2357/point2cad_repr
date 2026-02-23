@@ -1,187 +1,6 @@
-# B-Rep Reconstruction Plan: From Point2CAD to CAD-Ready Output
+# B-Spline and NURBS Theory
 
-## 1. Current Pipeline vs. Mesh2Brep
-
-| Mesh2Brep step | Point2CAD pipeline | Status |
-|---|---|---|
-| Segmentation | Point2CAD clustering | Done |
-| Primitive fitting | Plane/sphere/cylinder/cone + INR freeform | Done |
-| Geometric constraints + optimization (Sec. V) | — | Skipping (for now) |
-| B-Rep creation via OCCT (Sec. VI-A) | — | **Target** |
-
-### On skipping constrained optimization
-
-Mesh2Brep's Sec. V constraints fix issues like:
-- A plane 0.5 degrees off from perpendicular to a cylinder axis: tangency constraint snaps it.
-- Two cylinders with radii 4.98 and 5.02: same-radius constraint unifies them.
-- Three planes meeting at slightly different points: same-intersection-point constraint merges corners.
-
-Without these, the B-Rep will have small gaps/overlaps at intersection curves. For a first
-version this is acceptable --- OCCT's sewing and tolerance-based operations can absorb small
-errors. If persistent topological defects appear later, selective constraints (tangency being the
-highest-value one) can be added without implementing the full Ipopt optimization.
-
----
-
-## 2. Execution Plan
-
-### Phase 1: Adjacency Matrix
-
-We need to know which surface pairs should intersect. Not all surfaces intersect --- only
-adjacent ones.
-
-**Approach**: For each pair of clusters (i, j), compute the minimum (or k-th percentile)
-distance between their point sets. Use a single KDTree over the full point cloud, query each
-cluster's points against all others. Two surfaces are adjacent if their mutual closest-point
-distance falls below a threshold, e.g. `t * median_spacing` where `median_spacing` is the
-typical nearest-neighbor distance within a cluster. This gives a sparse symmetric adjacency
-matrix `A[i,j] = 1` if surfaces i and j should be intersected.
-
-Advantage over mesh-based adjacency: operates on the raw input, independent of all the
-mesh clipping / T-junction issues.
-
-### Phase 2: Analytic Surfaces to OCCT Geometry Objects
-
-For each fitted surface, create the corresponding OpenCASCADE geometry via PythonOCC
-(`from OCC.Core.Geom import *`) or CadQuery:
-
-| Surface type | Fitted parameters | OCCT class |
-|---|---|---|
-| Plane | normal `n`, point `p` | `Geom_Plane(gp_Pln(gp_Pnt, gp_Dir))` |
-| Sphere | center `c`, radius `r` | `Geom_SphericalSurface(gp_Ax3, r)` |
-| Cylinder | axis `a`, center `c`, radius `r` | `Geom_CylindricalSurface(gp_Ax3, r)` |
-| Cone | apex, axis, half-angle | `Geom_ConicalSurface(gp_Ax3, angle, r)` |
-| INR freeform | Trained network (u,v) to (x,y,z) | `Geom_BSplineSurface` (after NURBS conversion) |
-
-Straightforward parameter marshalling for the quadrics.
-
-### Phase 3: INR to NURBS Conversion
-
-Two approaches:
-
-**Approach A --- Post-hoc fitting (simpler, implement first):**
-1. Sample the trained INR on a dense regular grid in UV space, e.g. 50x50.
-2. Fit a B-spline surface to the sampled points using
-   `OCC.Core.GeomAPI.GeomAPI_PointsToBSplineSurface`.
-3. The UV parameterization is already established by the INR encoder.
-
-The approximation error depends on the B-spline degree and number of control points.
-Measure it by comparing the spline evaluation against the INR at off-grid UV points.
-
-**Approach B --- Differentiable spline training (more elegant, future work):**
-Replace the INR decoder MLP with a differentiable B-spline layer:
-- Fix the knot vector (uniform, with chosen density).
-- Make the control points the learnable parameters.
-- B-spline evaluation is polynomial, therefore fully differentiable.
-- Train with the same reconstruction loss as the INR.
-
-This gives a NURBS surface directly without post-hoc fitting. The UV encoder maps points
-to parameter space, the B-spline maps parameters back to 3D. The challenge is choosing the
-right number of control points (too few = underfitting, too many = overfitting/wiggles).
-
-### Phase 4: Surface-Surface Intersection
-
-For each adjacent pair (i, j) from the adjacency matrix:
-
-**Quadric-quadric (plane, sphere, cylinder, cone):**
-
-Many cases have analytic solutions:
-- **Plane-Plane**: line. Direction = `n1 x n2`. A point on the line is solvable from the two
-  plane equations. Trivial.
-- **Plane-Sphere**: circle. Center = projection of sphere center onto plane.
-  Radius = `sqrt(R^2 - d^2)` where d = signed distance from sphere center to plane.
-- **Plane-Cylinder**: ellipse (general), pair of lines (axis parallel to plane), or single line
-  (tangent). Substitute the plane equation into the cylinder equation.
-- **Plane-Cone**: conic section (ellipse/parabola/hyperbola depending on angle vs half-angle).
-
-For the general case (cylinder-cylinder, sphere-cylinder, etc.), the intersection is a degree-4
-space curve, not a simple conic. Use OCCT:
-
-```python
-from OCC.Core.GeomInt import GeomInt_IntSS
-intersector = GeomInt_IntSS(surface_i, surface_j, tolerance)
-for k in range(intersector.NbLines()):
-    curve_3d = intersector.Line(k + 1)  # Geom_Curve
-```
-
-**Quadric-NURBS or NURBS-NURBS:**
-
-No analytic shortcut. Use OCCT's `BRepAlgoAPI_Section` or `GeomInt_IntSS`.
-
-**Trimming intersection curves:**
-
-Raw surface-surface intersection gives infinite or full-domain curves.  Trim them to the
-portion lying on the actual shared boundary between the two clusters.
-
-The UV convex hull approach (project cluster points to UV, compute the hull, convert hull
-vertices to 3-D, project onto the curve) was considered but rejected: it assumes the face
-boundary is convex in UV space, which fails for non-convex faces and INR surfaces whose
-UV domain is an irregular subset of $[-1,1]^2$.
-
-**Adopted approach — boundary strip projection** (see `notes/curve_trimming.md` for full
-mathematical detail):
-
-1. **Extract boundary strip**: for each cluster in the adjacent pair, keep only the points
-   whose nearest-neighbour distance to the *other* cluster is at most the adjacency
-   threshold.  The union of both strips contains the points that lie on the shared edge.
-2. **Project onto the curve**: use `GeomAPI_ProjectPointOnCurve` to find the parameter
-   $t_k$ of each strip point on the intersection curve; discard projections whose distance
-   exceeds $c \cdot \text{spacing}$ (the point is not on this particular edge).
-3. **Compute trim interval**:
-   - Non-periodic curves (lines, B-splines): $[t_{min}, t_{max}]$.
-   - Periodic curves (circles, ellipses): find the largest gap between consecutive sorted
-     parameters; the trim arc is the complement of that gap (handles the $0/2\pi$ seam).
-4. **Create `Geom_TrimmedCurve`**: wrap the original `Geom_Curve` with the computed
-   bounds.  `FirstParameter()` / `LastParameter()` are overridden; `sample_curve` needs
-   no changes.
-
-### Phase 5: B-Rep Topology Assembly
-
-With surfaces, intersection curves, and vertices (curve-curve intersection points), build
-the B-Rep using OCCT:
-
-1. **Edges**: Each trimmed intersection curve becomes a `TopoDS_Edge`.
-2. **Wires**: For each face, collect its bounding edges into a `TopoDS_Wire` (ordered loop).
-3. **Faces**: Each surface + its wire boundary = `TopoDS_Face` via `BRep_Builder`.
-4. **Shell/Solid**: Assemble faces into a `TopoDS_Shell`, then `TopoDS_Solid`.
-
-OCCT's `BRepBuilderAPI_MakeFace`, `BRepBuilderAPI_MakeWire`, `BRepBuilderAPI_Sewing`
-handle much of the complexity. The `ShapeFix` package can repair small gaps and tolerance
-issues.
-
-### Phase 6: STEP Export
-
-```python
-from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
-writer = STEPControl_Writer()
-writer.Transfer(solid, STEPControl_AsIs)
-writer.Write("output.step")
-```
-
-This STEP file opens in any CAD software (FreeCAD, Fusion 360, SolidWorks, etc.) with
-full parametric editing capability.
-
----
-
-## 3. Suggested Implementation Order
-
-1. **Adjacency matrix** (KDTree on raw clusters) --- quick win, needed by everything downstream.
-2. **Quadric surfaces to OCCT objects** --- straightforward parameter marshalling.
-3. **Quadric-quadric intersections via OCCT** --- test on a simple 2-3 plane model first.
-4. **Trim curves + B-Rep assembly + STEP export** --- hardest part, do it for planes-only first.
-5. **INR to NURBS conversion** (approach A, post-hoc sampling + fitting).
-6. **NURBS intersection and mixed-type B-Rep** --- integrate freeform surfaces.
-7. **(Optional) Differentiable spline training** --- approach B, if approach A has accuracy issues.
-8. **(Optional) Selective geometric constraints** --- add tangency/coplanarity if needed.
-
-Start with a test case of 3-4 planes forming a box corner. Get a valid STEP file from that.
-Then add curved surfaces incrementally.
-
----
-
-## 4. Mathematical Overview of NURBS
-
-### 4.1 The Problem with Polynomial Interpolation
+## 1. The Problem with Polynomial Interpolation
 
 Given n distinct points on a plane (or in 3D), there exists a unique polynomial of degree
 n - 1 passing through all of them. This is the classical **Lagrange interpolation** result.
@@ -210,7 +29,7 @@ large changes in the polynomial coefficients.
 These problems are fundamental to *global* polynomial representations and motivated the
 development of *piecewise* polynomial methods.
 
-### 4.2 Piecewise Polynomials: The Naive Approach
+## 2. Piecewise Polynomials: The Naive Approach
 
 The natural fix for Runge's phenomenon: instead of one high-degree polynomial, use many
 low-degree polynomials joined at designated points called **knots**.
@@ -264,7 +83,7 @@ This motivates the search for a **basis** of the spline space: a set of $K + p$ 
 $\{B_i(u)\}$ such that every spline can be written as $s(u) = \sum_i c_i B_i(u)$, where the
 coefficients $c_i$ have geometric meaning and local influence.
 
-### 4.3 The Spline Space, Smoothness Vector, and Dimension
+## 3. The Spline Space, Smoothness Vector, and Dimension
 
 **Definition.** Let $p \geq 0$ be the polynomial degree. Let
 $\mathbf{t} = (t_0, t_1, \ldots, t_K)$ be a sequence of $K + 1$ **distinct** knot positions with
@@ -324,6 +143,14 @@ with $p = 3$ encodes:
 
 - $r_k = -1$ ($m = 4$, quadruple knot): the curve is **discontinuous** — it breaks into
   two separate pieces.
+
+> **Important.** The four cases above apply exclusively to **interior** knots,
+> where two polynomial pieces meet and continuity between them is well-defined.
+> At the **boundary** knots $t_0$ and $t_{n+p+1}$ there is only one adjacent
+> piece, so the concept of $C^r$ continuity between two pieces does not apply.
+> Multiplicity $p+1$ at a boundary knot does **not** produce a discontinuity;
+> instead it forces **endpoint interpolation** — see Section 5 (Clamped knot
+> vectors) for the proof.
 
 #### Dimension of the spline space
 
@@ -405,7 +232,7 @@ Replacing $r_2 = 1$ with $r_2 = 2$ (making all interior knots maximally smooth) 
 $\dim = 4 + (1 + 1 + 1) = 7$. The reduction in smoothness at $t_2$ added one degree
 of freedom.
 
-### 4.4 Why Basis Functions? Truncated Powers vs. B-Splines
+## 4. Why Basis Functions? Truncated Powers vs. B-Splines
 
 Any $(K + p)$-dimensional vector space can be spanned by many different bases. The choice
 of basis determines the numerical and practical properties of the representation.
@@ -443,7 +270,7 @@ The B-spline basis is *the* standard basis for splines in all practical applicat
 introduced by Isaac Schoenberg (1946) and made computationally practical by Carl de Boor
 and Maurice Cox (1972) through the recursive evaluation formula.
 
-### 4.5 B-Spline Basis Functions
+## 5. B-Spline Basis Functions
 
 **Definition** (Cox-de Boor recursion):
 
@@ -533,9 +360,12 @@ Equivalently: $\text{(number of basis functions)} = \text{(number of knots)} - p
 
    Hence $\sum_{i=0}^{n} N_{i,p}(u) = 1$. $\blacksquare$
 
-4. **Smoothness**: At a knot of multiplicity $m$, the basis function is $C^{p-m}$.
-   A simple knot gives $C^{p-1}$ continuity; a knot of multiplicity $p$ gives $C^0$
-   (just continuous, allowing a sharp corner); multiplicity $p + 1$ gives a discontinuity.
+4. **Smoothness**: At an **interior** knot of multiplicity $m$, the basis function is
+   $C^{p-m}$.  A simple knot gives $C^{p-1}$ continuity; multiplicity $p$ gives $C^0$
+   (positional continuity only, a sharp corner); multiplicity $p+1$ at an interior knot
+   gives $C^{-1}$ — a genuine discontinuity between two adjacent pieces.  This rule
+   applies **only to interior knots**; at boundary knots multiplicity $p+1$ has a
+   different meaning (see below).
 
 5. **Linear independence**: The $n + 1$ basis functions are linearly independent and form
    a basis for $\mathbb{S}_{p, \mathbf{t}}$.
@@ -546,10 +376,21 @@ $$
 U = [\underbrace{a, \ldots, a}_{p+1}, u_{p+1}, \ldots, u_{n}, \underbrace{b, \ldots, b}_{p+1}]
 $$
 
-This ensures that the curve starts at the first control point $P_0$ and ends at the last
-control point $P_n$ (endpoint interpolation), which is almost always desired.
+At the boundary $t = a$ there is only one adjacent polynomial piece $q_0$, so no
+continuity condition between two pieces exists there.  The formula $r = p - m = -1$
+is vacuously satisfied and does not imply a discontinuity.  What multiplicity $p+1$
+*does* enforce is **endpoint interpolation**: with $u_0 = \cdots = u_p = a$, the
+degree-0 basis satisfies $N_{p,0}(a) = 1$ and $N_{i,0}(a) = 0$ for $i \neq p$
+(the only non-empty interval $[u_i, u_{i+1})$ containing $a$ is $[u_p, u_{p+1})$).
+Propagating through $p$ levels of the Cox–de Boor recursion gives $N_{0,p}(a) = 1$
+and $N_{i,p}(a) = 0$ for $i > 0$, so:
 
-### 4.6 B-Spline Curves
+$$C(a) = \sum_{i=0}^{n} N_{i,p}(a)\,P_i = P_0$$
+
+The same argument at $t = b$ gives $C(b) = P_n$.  Endpoint interpolation is almost
+always desired in practice.
+
+## 6. B-Spline Curves
 
 A **B-spline curve** of degree $p$ with $n + 1$ control points $P_0, \ldots, P_n \in \mathbb{R}^d$
 and knot vector $U = [u_0, \ldots, u_{n+p+1}]$ is:
@@ -573,7 +414,7 @@ $U = [0, 0, 0, 0, 1, 2, 3, 4, 4, 4, 4]$ (11 knots = $n + p + 2 = 11$):
 - Moving $P_3$ only affects the curve on approximately $u \in [1, 3]$.
 - The curve has $C^2$ continuity at each interior knot (simple knots, $p - 1 = 2$).
 
-### 4.7 NURBS: Adding Weights
+## 7. NURBS: Adding Weights
 
 **Non-Uniform Rational B-Splines (NURBS)** extend B-splines by assigning a **weight**
 $w_i > 0$ to each control point. The curve becomes:
@@ -609,7 +450,7 @@ dividing by the last coordinate gives the NURBS curve $C(u)$.
 The weight $w_i$ controls how strongly $P_i$ "pulls" the curve. Higher weight = curve passes
 closer to that control point. Setting all weights equal recovers the plain B-spline.
 
-### 4.8 NURBS Surfaces (Tensor Product)
+## 8. NURBS Surfaces (Tensor Product)
 
 A **NURBS surface** is the tensor product of two NURBS curves. Given an
 $(n+1) \times (m+1)$ grid of control points $P_{i,j} \in \mathbb{R}^3$ with weights $w_{i,j} > 0$:
@@ -630,7 +471,7 @@ The surface has:
 - An $(n+1) \times (m+1)$ net of control points forming a **control mesh**.
 - Total parameters: $(n+1)(m+1)$ control points $\times$ (3 coordinates + 1 weight) each.
 
-### 4.9 Fitting B-Splines to Data
+## 9. Fitting B-Splines to Data
 
 This is the central practical question: given a set of data points, how does one compute
 the B-spline (or NURBS) that best represents them? The procedure has distinct stages,
@@ -760,20 +601,60 @@ and solve the reduced $(n-1) \times (n-1)$ system for the interior control point
 
 #### Surface fitting (tensor product)
 
-For surface data on a grid $Q_{k,l}$ with parameters $(\bar{u}_k, \bar{v}_l)$, the least-squares
-problem separates by the tensor product structure. The NURBS surface
-$S(u, v) = \sum_i \sum_j N_{i,p}(u) N_{j,q}(v) P_{i,j}$ can be fitted by solving two sequences
-of curve fitting problems:
+For surface data on a grid $Q_{k,l}$ with parameters $(\bar{u}_k, \bar{v}_l)$, evaluation
+at a grid point is:
 
-1. For each row $l$: fit a B-spline curve in $u$ through $\{Q_{k,l}\}_{k=0}^{M_u}$ to obtain
-   intermediate control points $R_{i,l}$.
-2. For each column $i$: fit a B-spline curve in $v$ through $\{R_{i,l}\}_{l=0}^{M_v}$ to obtain
-   the final control points $P_{i,j}$.
+$$S(\bar{u}_k, \bar{v}_l) = \bigl[\mathbf{N}_u\,\mathbf{P}\,\mathbf{N}_v^\top\bigr]_{kl}$$
 
-This reduces a 2D problem to two sequences of 1D problems, each solvable via the
-banded linear systems described above.
+where $(\mathbf{N}_u)_{ki} = N_{i,p}(\bar{u}_k)$ and $(\mathbf{N}_v)_{lj} = N_{j,q}(\bar{v}_l)$,
+and $\mathbf{P}$ is the $(n+1)\times(m+1)$ matrix of control points (one per spatial
+coordinate).  The least-squares objective is:
 
-### 4.10 NURBS Hyperparameters
+$$\min_{\mathbf{P}}\;\|\mathbf{N}_u\,\mathbf{P}\,\mathbf{N}_v^\top - \mathbf{Q}\|_F^2$$
+
+Setting the gradient to zero gives the **2D normal equations**:
+
+$$(\mathbf{N}_u^\top \mathbf{N}_u)\,\mathbf{P}\,(\mathbf{N}_v^\top \mathbf{N}_v)
+  = \mathbf{N}_u^\top\,\mathbf{Q}\,\mathbf{N}_v$$
+
+Because the two Gram matrices act on independent indices, the solution factors as:
+
+$$\mathbf{P} = (\mathbf{N}_u^\top \mathbf{N}_u)^{-1}\,\mathbf{N}_u^\top\,\mathbf{Q}
+              \,\mathbf{N}_v\,(\mathbf{N}_v^\top \mathbf{N}_v)^{-1}$$
+
+This is computed in **two sequential passes**, each consisting of independent 1D
+least-squares problems:
+
+**Pass 1 — fit in $u$, for each column $l = 0,\ldots,M_v$:**
+
+$$\min_{\mathbf{r}_l}\;\|\mathbf{N}_u\,\mathbf{r}_l - \mathbf{q}_l\|^2
+\;\Longrightarrow\;
+\mathbf{R} = (\mathbf{N}_u^\top \mathbf{N}_u)^{-1}\,\mathbf{N}_u^\top\,\mathbf{Q}
+\in \mathbb{R}^{(n+1)\times(M_v+1)}$$
+
+The $M_v+1$ systems share the same coefficient matrix $\mathbf{N}_u^\top\mathbf{N}_u$
+and differ only in their right-hand sides, so a single Cholesky factorisation suffices.
+
+**Pass 2 — fit in $v$, for each row $i = 0,\ldots,n$:**
+
+$$\min_{\mathbf{p}_i}\;\|\mathbf{N}_v\,\mathbf{p}_i - \mathbf{r}_i^\top\|^2
+\;\Longrightarrow\;
+\mathbf{P} = \mathbf{R}\,\mathbf{N}_v\,(\mathbf{N}_v^\top \mathbf{N}_v)^{-1}$$
+
+The $n+1$ systems again share one factorisation of $\mathbf{N}_v^\top\mathbf{N}_v$.
+
+The two-pass solution is **not an approximation** — it is algebraically identical to
+solving the full 2D system jointly.  The equivalence relies on one essential assumption:
+**the data must lie on a rectangular grid**, so that the same $\bar{u}$ values are used
+for every $l$ and the same $\bar{v}$ values for every $k$.  For scattered (non-grid) data
+the normal equations do not factor and the 2D system must be solved directly.
+
+The intermediate matrix $\mathbf{R}$ has a natural interpretation: its $i$-th row
+$R_{i,\cdot}$ gives the optimal $u$-direction control point $i$ as a function of the
+$v$ sample index.  Pass 2 then fits a B-spline through those $M_v+1$ values to obtain
+the final bivariate control net $P_{i,j}$.
+
+## 10. NURBS Hyperparameters
 
 Fitting a NURBS to data involves choosing several hyperparameters. This is fundamentally
 different from Lagrange interpolation where the degree is forced by the number of points.
@@ -794,7 +675,7 @@ expensive and typically unnecessary for smooth surfaces. See
 [Plos One: Optimal Knots for B-Spline Curves](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0173857)
 for an example of knot optimization.
 
-### 4.11 NURBS vs. Polynomial Interpolation: Summary
+## 11. NURBS vs. Polynomial Interpolation: Summary
 
 | Property | Polynomial (Lagrange) | NURBS |
 |---|---|---|
@@ -808,7 +689,7 @@ for an example of knot optimization.
 | Fitting linearity | Linear (Vandermonde system) | Linear (banded system, knot vector fixed) |
 | Hyperparameters | None (everything forced by data) | Degree, control point count, knot vector, weights |
 
-### 4.12 Why NURBS is the Right Choice Here
+## 12. Why NURBS is the Right Choice Here
 
 For the specific goal of producing CAD-compatible output:
 
@@ -833,7 +714,7 @@ For the specific goal of producing CAD-compatible output:
 Alternative representations (subdivision surfaces, T-splines) either lack CAD software
 support or add complexity without clear benefit for this use case.
 
-### 4.13 Concrete Example: Fitting a NURBS to INR Output
+## 13. Concrete Example: Fitting a NURBS to INR Output
 
 **Step 1**: Train the INR as usual. The encoder maps points to UV, the decoder maps UV to 3D.
 

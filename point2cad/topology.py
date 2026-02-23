@@ -23,7 +23,6 @@ Each arc_dict has:
 
 import math
 import numpy as np
-from collections import defaultdict
 
 try:
     from OCC.Core.Geom           import Geom_TrimmedCurve
@@ -344,6 +343,7 @@ def _arc_outgoing_tangent(arc, v_cur):
       - If v_cur == v_start: the arc leaves in the +t direction → +d/dt at t_start.
       - If v_cur == v_end:   the arc leaves in the -t direction → -d/dt at t_end.
     """
+    # https://dev.opencascade.org/doc/refman/html/class_geom___curve.html
     if arc["v_start"] == v_cur:
         d = arc["curve"].DN(arc["t_start"], 1)
         return np.array([d.X(), d.Y(), d.Z()])
@@ -364,6 +364,7 @@ def _surface_normal_at_point(surface, pt):
         if proj.NbPoints() == 0:
             return None
         u, v = proj.LowerDistanceParameters()
+        # https://dev.opencascade.org/doc/refman/html/class_geom_l_prop___s_l_props.html
         props = GeomLProp_SLProps(surface, u, v, 1, 1e-6)
         if not props.IsNormalDefined():
             return None
@@ -398,13 +399,26 @@ def _select_next_arc_angular(v_cur, prev_arc, candidates, face_idx, occ_surfaces
     pt = vertices[v_cur]
 
     if face_idx >= len(occ_surfaces) or occ_surfaces[face_idx] is None:
+        print(
+            f"[topology] face {face_idx}: vertex {v_cur}: angular ordering fallback "
+            f"— surface missing or None, using candidates[0]"
+        )
         return candidates[0]
 
     N = _surface_normal_at_point(occ_surfaces[face_idx], pt)
     if N is None:
+        print(
+            f"[topology] face {face_idx}: vertex {v_cur}: angular ordering fallback "
+            f"— surface normal projection failed (point may be off surface), "
+            f"using candidates[0]"
+        )
         return candidates[0]
     N_norm = np.linalg.norm(N)
     if N_norm < 1e-10:
+        print(
+            f"[topology] face {face_idx}: vertex {v_cur}: angular ordering fallback "
+            f"— surface normal degenerate (norm={N_norm:.2e}), using candidates[0]"
+        )
         return candidates[0]
     N = N / N_norm
 
@@ -413,9 +427,15 @@ def _select_next_arc_angular(v_cur, prev_arc, candidates, face_idx, occ_surfaces
     # prev_arc, which is exactly toward the previous vertex — the backward dir.
     t_back = _arc_outgoing_tangent(prev_arc, v_cur)
     t_back_proj = t_back - np.dot(t_back, N) * N
-    if np.linalg.norm(t_back_proj) < 1e-10:
+    t_back_norm = np.linalg.norm(t_back_proj)
+    if t_back_norm < 1e-10:
+        print(
+            f"[topology] face {face_idx}: vertex {v_cur}: angular ordering fallback "
+            f"— backward arc tangent is parallel to surface normal "
+            f"(proj norm={t_back_norm:.2e}), using candidates[0]"
+        )
         return candidates[0]
-    t_back_proj /= np.linalg.norm(t_back_proj)
+    t_back_proj /= t_back_norm
 
     # Tangent plane basis: e1 = backward direction, e2 = N × e1 (CCW from e1).
     e1 = t_back_proj
@@ -426,6 +446,11 @@ def _select_next_arc_angular(v_cur, prev_arc, candidates, face_idx, occ_surfaces
         t_proj = t_out - np.dot(t_out, N) * N
         norm_t = np.linalg.norm(t_proj)
         if norm_t < 1e-10:
+            print(
+                f"[topology] face {face_idx}: vertex {v_cur}: candidate arc "
+                f"{arc.get('edge_key')} tangent projects to zero in tangent plane "
+                f"(norm={norm_t:.2e}) — pushed to last"
+            )
             return 2 * math.pi   # degenerate: push to end
         t_proj /= norm_t
         a = math.atan2(np.dot(t_proj, e2), np.dot(t_proj, e1))
@@ -441,10 +466,14 @@ def _select_next_arc_angular(v_cur, prev_arc, candidates, face_idx, occ_surfaces
 # Step 3 — Wire assembly
 # ---------------------------------------------------------------------------
 
-def assemble_wires(face_arcs, occ_surfaces=None, vertices=None):
+def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None):
     """
     Step 3 of B-Rep topology: for each face, partition its arcs into closed
     wires (boundary loops).
+
+    INR (BSpline) faces are skipped: their face in build_brep_shape is
+    constructed from UV parameter bounds rather than from wires, so Euler
+    decomposition of their arc graph is unnecessary.
 
     Closed arcs (closed=True) each form a trivial one-arc wire immediately.
 
@@ -464,17 +493,27 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None):
         Required for angular ordering at high-degree vertices.
     vertices     : np.ndarray (M, 3) or None
         Vertex positions; required together with occ_surfaces.
+    surface_ids  : list[int] or None
+        Surface type ids from surface_fitter.  INR faces are skipped.
 
     Returns
     -------
     face_wires : dict i -> list[list[(arc_dict, bool)]]
         Outer list: one entry per wire on face i.
         Inner list: ordered (arc, forward) pairs forming a closed loop.
+        INR faces map to an empty list.
     """
     use_angular = (occ_surfaces is not None) and (vertices is not None)
     face_wires = {}
 
     for face_idx, arcs in face_arcs.items():
+        is_inr = (surface_ids is not None and
+                  face_idx < len(surface_ids) and
+                  surface_ids[face_idx] == SURFACE_INR)
+        if is_inr:
+            face_wires[face_idx] = []
+            continue
+
         wires = []
 
         # Trivial wires: each closed arc is its own single-arc wire.
@@ -493,13 +532,13 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None):
                 adj.setdefault(ve, []).append((arc, vs, False))
 
             for v, neighbours in adj.items():
-                if len(neighbours) != 2:
-                    if not use_angular:
-                        print(
-                            f"[topology] face {face_idx}: vertex {v} has degree "
-                            f"{len(neighbours)} (expected 2) — topology may be degenerate"
-                        )
-
+                deg = len(neighbours)
+                if deg % 2 != 0:
+                    print(
+                        f"[topology] face {face_idx}: vertex {v} has odd degree "
+                        f"{deg} — topology is degenerate (missing or spurious arc)"
+                    )
+                
             arc_index    = {id(a): idx for idx, a in enumerate(open_arcs)}
             visited_arcs = set()
 
@@ -538,6 +577,12 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None):
                             face_idx, occ_surfaces, vertices,
                         )
                     else:
+                        if len(candidates) > 1:
+                            print(
+                                f"[topology] face {face_idx}: vertex {v_cur}: "
+                                f"{len(candidates)} candidates but angular ordering "
+                                f"unavailable — using greedy first candidate"
+                            )
                         arc, v_cur, forward = candidates[0]
 
                     wire.append((arc, forward))
@@ -572,60 +617,18 @@ def print_face_wires_summary(face_wires):
 # Step 5 — BRep assembly and STEP export
 # ---------------------------------------------------------------------------
 
-def _connected_components(open_arcs):
-    """
-    Group open arcs into connected components by shared vertex indices.
-    Each component will become one boundary wire on the face.
-    Uses union-find on vertex indices.
-    """
-    n = len(open_arcs)
-    if n == 0:
-        return []
-
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x, y):
-        px, py = find(x), find(y)
-        if px != py:
-            parent[px] = py
-
-    vertex_to_first = {}
-    for idx, arc in enumerate(open_arcs):
-        for v in (arc["v_start"], arc["v_end"]):
-            if v not in vertex_to_first:
-                vertex_to_first[v] = idx
-            else:
-                union(vertex_to_first[v], idx)
-
-    components = defaultdict(list)
-    for idx, arc in enumerate(open_arcs):
-        components[find(idx)].append(arc)
-    return list(components.values())
-
-
 def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
-                     face_wires=None, tolerance=1e-3):
+                     face_wires=None, tolerance=1e-3,
+                     inr_geom_close_tol=0.05, inr_arc_samples=30,
+                     inr_uv_margin=0.02):
     """
     Build a TopoDS_Shape from face_arcs.
 
-    Wire assembly strategy
-    ----------------------
-    If `face_wires` is provided (output of assemble_wires with angular
-    ordering), each wire is built directly from the ordered (arc, forward)
-    sequence — arc orientation is encoded by edge.Reversed() when
-    forward=False.  This correctly separates outer boundaries from inner
-    holes at high-degree vertices.
-
-    If `face_wires` is None, falls back to the connected-component heuristic:
-    open arcs are grouped by shared vertices (union-find) and each group is
-    passed to ShapeFix_Wire for reordering.  This fails to separate wires
-    that share vertices (degree-4 problem).
+    Wire assembly
+    -------------
+    `face_wires` is the output of assemble_wires (angular ordering).  Each
+    wire is built directly from the ordered (arc, forward) sequence — arc
+    orientation is encoded by edge.Reversed() when forward=False.
 
     BSpline (INR) surfaces
     ----------------------
@@ -646,12 +649,25 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
 
     Parameters
     ----------
-    face_arcs    : dict i -> list[arc_dict]
-    occ_surfaces : list[Geom_Surface], indexed by face index
-    vertices     : np.ndarray (M, 3)
-    surface_ids  : list[int] or None  — SURFACE_INR flags which faces are BSpline
-    face_wires   : dict i -> list[list[(arc_dict, bool)]] or None
-    tolerance    : sewing / ShapeFix tolerance
+    face_arcs         : dict i -> list[arc_dict]
+    occ_surfaces      : list[Geom_Surface], indexed by face index
+    vertices          : np.ndarray (M, 3)
+    surface_ids       : list[int] or None  — SURFACE_INR flags BSpline faces
+    face_wires        : dict i -> list[list[(arc_dict, bool)]] or None
+    tolerance         : float
+        Single tolerance passed to BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeFace
+        (for primitive faces), and ShapeFix_Wire / ShapeFix_Shape.  In principle
+        these could differ; a single value is a pragmatic simplification.
+    inr_geom_close_tol : float
+        Maximum 3D distance (in model units) between opposite BSpline boundary
+        curves for a parametric direction to be declared geometrically closed.
+        Default 0.05 (5% of unit-normalised scale); may need tuning per dataset.
+    inr_arc_samples   : int
+        Number of points sampled from each incident arc when projecting onto
+        the BSpline surface to estimate UV bounds.  Default 30.
+    inr_uv_margin     : float
+        Relative margin added to the projected UV bounds on each side
+        (fraction of the projected span).  Default 0.02 (2%).
 
     Returns
     -------
@@ -699,51 +715,21 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
 
         occ_wires = []
 
-        if face_wires is not None and face_idx in face_wires:
-            # --- Angular-ordered path ---
-            for wire_arcs in face_wires[face_idx]:
-                wm = BRepBuilderAPI_MakeWire()
-                for arc, forward in wire_arcs:
-                    if id(arc) not in arc_to_edge:
-                        continue
-                    edge = arc_to_edge[id(arc)]
-                    wm.Add(edge if forward else edge.Reversed())
-                if not wm.IsDone():
-                    print(f"[brep] face {face_idx}: angular wire maker failed")
-                    continue
-                fix = ShapeFix_Wire()
-                fix.Load(wm.Wire())
-                fix.SetPrecision(tolerance)
-                fix.FixConnected()
-                occ_wires.append(fix.Wire())
-        else:
-            # --- Connected-component fallback ---
-            closed_arcs = [a for a in arcs if     a["closed"]]
-            open_arcs   = [a for a in arcs if not a["closed"]]
-
-            for arc in closed_arcs:
+        for wire_arcs in face_wires.get(face_idx, []):
+            wm = BRepBuilderAPI_MakeWire()
+            for arc, forward in wire_arcs:
                 if id(arc) not in arc_to_edge:
                     continue
-                wm = BRepBuilderAPI_MakeWire(arc_to_edge[id(arc)])
-                if wm.IsDone():
-                    occ_wires.append(wm.Wire())
-                else:
-                    print(f"[brep] face {face_idx}: closed-arc wire failed")
-
-            for component in _connected_components(open_arcs):
-                wm = BRepBuilderAPI_MakeWire()
-                for arc in component:
-                    if id(arc) in arc_to_edge:
-                        wm.Add(arc_to_edge[id(arc)])
-                if not wm.IsDone():
-                    print(f"[brep] face {face_idx}: component wire maker failed")
-                    continue
-                fix = ShapeFix_Wire()
-                fix.Load(wm.Wire())
-                fix.SetPrecision(tolerance)
-                fix.FixReorder()
-                fix.FixConnected()
-                occ_wires.append(fix.Wire())
+                edge = arc_to_edge[id(arc)]
+                wm.Add(edge if forward else edge.Reversed())
+            if not wm.IsDone():
+                print(f"[brep] face {face_idx}: wire maker failed")
+                continue
+            fix = ShapeFix_Wire()
+            fix.Load(wm.Wire())
+            fix.SetPrecision(tolerance)
+            fix.FixConnected()
+            occ_wires.append(fix.Wire())
 
         # BSpline (INR) faces: determine UV bounds by projecting incident arc
         # sample points onto the surface, then build a parameter-bounded face.
@@ -764,7 +750,6 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
             # detect it and call SetUPeriodic / SetVPeriodic explicitly.
             v_mid = (nv1 + nv2) / 2.0
             u_mid = (nu1 + nu2) / 2.0
-            GEOM_CLOSE_TOL = 0.05  # 5% of unit-normalised model size
             try:
                 pu1 = surface.Value(nu1, v_mid)
                 pu2 = surface.Value(nu2, v_mid)
@@ -779,8 +764,8 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
             except Exception:
                 d_u, d_v = 1.0, 1.0
 
-            closed_u = d_u < GEOM_CLOSE_TOL
-            closed_v = d_v < GEOM_CLOSE_TOL
+            closed_u = d_u < inr_geom_close_tol
+            closed_v = d_v < inr_geom_close_tol
             print(f"[brep] face {face_idx}: BSpline seam check "
                   f"d_u={d_u:.4f} d_v={d_v:.4f} "
                   f"closed_u={closed_u} closed_v={closed_v}")
@@ -799,34 +784,35 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
                 print(f"[brep] face {face_idx}: SetPeriodic failed: {exc}")
                 closed_u = closed_v = False
 
-            # Start from full natural domain; project arc sample points to
-            # constrain the OPEN direction(s) to the physical boundary.
+            # Start from full natural domain; constrain OPEN direction(s) by
+            # projecting arc sample points onto the surface.  Sampling and
+            # projection are skipped entirely when both directions are closed.
             u_min, u_max = nu1, nu2
             v_min, v_max = nv1, nv2
 
-            sample_pts = []
-            for arc in face_arcs.get(face_idx, []):
-                t0, t1 = arc["t_start"], arc["t_end"]
-                n_samp = 30
-                for k in range(n_samp):
-                    t = t0 + (t1 - t0) * k / max(n_samp - 1, 1)
-                    try:
-                        p = arc["curve"].Value(t)
-                        sample_pts.append([p.X(), p.Y(), p.Z()])
-                    except Exception:
-                        pass
+            if not closed_u or not closed_v:
+                sample_pts = []
+                for arc in face_arcs.get(face_idx, []):
+                    t0, t1 = arc["t_start"], arc["t_end"]
+                    for k in range(inr_arc_samples):
+                        t = t0 + (t1 - t0) * k / max(inr_arc_samples - 1, 1)
+                        try:
+                            p = arc["curve"].Value(t)
+                            sample_pts.append([p.X(), p.Y(), p.Z()])
+                        except Exception:
+                            pass
 
-            if sample_pts:
-                sample_arr = np.array(sample_pts, dtype=np.float32)
-                bounds = _cluster_uv_bounds(surface, sample_arr, rel_margin=0.02)
-                if bounds is not None:
-                    bu_min, bu_max, bv_min, bv_max = bounds
-                    if not closed_u:
-                        u_min = max(bu_min, nu1)
-                        u_max = min(bu_max, nu2)
-                    if not closed_v:
-                        v_min = max(bv_min, nv1)
-                        v_max = min(bv_max, nv2)
+                if sample_pts:
+                    sample_arr = np.array(sample_pts, dtype=np.float32)
+                    bounds = _cluster_uv_bounds(surface, sample_arr, rel_margin=inr_uv_margin)
+                    if bounds is not None:
+                        bu_min, bu_max, bv_min, bv_max = bounds
+                        if not closed_u:
+                            u_min = max(bu_min, nu1)
+                            u_max = min(bu_max, nu2)
+                        if not closed_v:
+                            v_min = max(bv_min, nv1)
+                            v_max = min(bv_max, nv2)
 
             face_added = False
             try:

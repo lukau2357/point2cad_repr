@@ -228,7 +228,7 @@ def run_compute(args):
         )
         print(f"Cluster {cid}: {SURFACE_NAMES[sid]}")
 
-    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters, threshold_factor = 3)
+    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters, threshold_factor = 1.5)
     print(f"\nSpacing={spacing:.5f}  threshold={threshold:.5f}")
     print(f"Adjacent pairs: {adjacency_pairs(adj)}\n")
 
@@ -329,7 +329,7 @@ def run_compute(args):
     # ------------------------------------------------------------------
     # Step 3: wire assembly with angular ordering at high-degree vertices
     # ------------------------------------------------------------------
-    face_wires = assemble_wires(face_arcs, occ_surfs, vertices)
+    face_wires = assemble_wires(face_arcs, occ_surfs, vertices, surface_ids=surface_ids)
     print_face_wires_summary(face_wires)
 
     # ------------------------------------------------------------------

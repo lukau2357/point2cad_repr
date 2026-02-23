@@ -1,20 +1,124 @@
 # B-Rep Construction Pipeline
 
-This document covers every stage of the pipeline that follows surface-surface
-intersection: trimming raw curves to the physical boundary, finding vertices,
-splitting curves into B-Rep arcs, assembling face wires, handling pcurves, and
-assembling the final `TopoDS_Shape` for STEP export.
+This document covers the complete pipeline from a pre-segmented point cloud to
+a valid STEP file: adjacency detection, surface fitting, surface-surface
+intersection, trimming, vertex finding, wire assembly, face construction, and
+STEP export.
 
-**Inputs (produced upstream)**
+**Pipeline input:** a segmented point cloud — $n$ labelled clusters
+$\{C_0, \ldots, C_{n-1}\}$, each an $(N_i \times 3)$ array of 3D points
+belonging to one surface patch.  Segmentation is assumed given (e.g.\ from
+Point2CAD).
+
+**Pipeline output:** `TopoDS_Shape` (shell or solid) exportable to STEP.
+
+---
+
+## 0a — Reference spacing
+
+All distance thresholds in the pipeline are expressed as multiples of a single
+**reference spacing** $\sigma$, defined as the median nearest-neighbour
+distance across all cluster points:
+
+$$
+\begin{align*}
+D_i &= \{\argmin_{y \in C_i, y \neq x}||x - y||_{2} \mid x \in C_i\} \\
+\sigma &= \operatorname{median} \cup_{i=1}^{N}D_i\\
+\end{align*}
+$$
+
+$N$ is the number of clusters, and $\sigma$ is the adapative threshold, used for the following step.
+
+---
+
+## 0b — Cluster adjacency matrix
+
+**Goal.** Determine which surface pairs share a physical boundary and therefore
+need to be intersected.  Intersecting all $\binom{n}{2}$ pairs is wasteful and
+produces spurious curves for non-adjacent surfaces.
+
+**Algorithm.**  For each unordered pair $(i, j)$ with $i < j$:
+
+1. Build a KDTree on the larger cluster (say $C_i$).
+2. Query every point of the smaller cluster $C_j$, obtaining nearest-neighbour
+   distances $\{d_k\}_{k=1}^{|C_j|}$.
+3. Compute the **robust minimum** — the $p$-th percentile of $\{d_k\}$ (default
+   $p = 2$, i.e.\ the 2nd-percentile distance):
+
+$$\hat{d}_{ij} = \operatorname{percentile}_p(\{d_k\})$$
+
+4. Declare clusters adjacent if $\hat{d}_{ij} \le \tau \cdot \sigma$, where
+   $\tau = 1.5$ is the threshold factor.
+
+Using the $p$-th percentile rather than the minimum makes the test robust to
+outliers and to slight cluster overlap near shared boundaries.  Two clusters
+that touch along a narrow strip will have a few points very close to each
+other; the 2nd percentile captures this even if the bulk of one cluster is far
+from the other.
+
+**Boundary strips.**  For each adjacent pair $(i, j)$, retain the subset of
+points whose nearest-neighbour distance to the opposite cluster is at most
+$\tau \cdot \sigma$:
+
+$$B_{ij} = \{x \in C_i : d(x, C_j) \le \tau\sigma\}
+  \cup \{x \in C_j : d(x, C_i) \le \tau\sigma\} $$
+
+$B_{ij}$ is reused downstream in two places: trimming intersection curves
+(Section 1) and computing UV bounds for BSpline faces (Section 7).
+
+**Output.**
+- $A \in \{0,1\}^{n \times n}$ — symmetric Boolean adjacency matrix.
+- `boundary_strips[(i,j)]` — $(|B_{ij}| \times 3)$ float32 array for each adjacent pair.
+---
+
+## 0c — Surface fitting and OCC geometry objects
+
+Each cluster $C_i$ is fitted with the surface type assigned by the upstream
+segmentation.  The five supported types and their OCC representations are:
+
+| Type | Fitted parameters | OCC class |
+|---|---|---|
+| Plane | unit normal $\mathbf{a}$, offset $d$ ($\mathbf{a}\cdot\mathbf{x}=d$) | `Geom_Plane` |
+| Sphere | centre $\mathbf{c}$, radius $r$ | `Geom_SphericalSurface` |
+| Cylinder | axis direction $\mathbf{a}$, axis point $\mathbf{c}$, radius $r$ | `Geom_CylindricalSurface` |
+| Cone | apex, axis direction, half-angle $\alpha$ | `Geom_ConicalSurface` |
+| INR (freeform) | trained MLP encoder–decoder | `Geom_BSplineSurface` (see below) |
+
+Analytical surfaces (plane–cone) are converted by direct parameter marshalling
+into the corresponding `gp_` geometry primitives.
+
+**INR → BSpline conversion.**  The INR represents a surface implicitly as a
+trained neural network $f_\theta : \mathbb{R}^2 \to \mathbb{R}^3$ mapping UV
+parameters to 3D positions.  Because OCC requires an explicit parametric
+representation, the INR is converted post-hoc:
+
+1. **Sample.** Evaluate $f_\theta$ on a regular $G \times G$ grid in UV space
+   (default $G = 100$), extended by a margin $\delta = 0.05$ beyond the
+   cluster's UV bounding box to ensure the boundary circles do not get clipped
+   by the BSpline knot span:
+   $$Q_{kl} = f_\theta\!\left(\frac{k}{G-1},\, \frac{l}{G-1}\right), \quad k, l = 0, \ldots, G-1$$
+
+2. **Fit.** Pass the $G \times G$ grid to
+   `GeomAPI_PointsToBSplineSurface(points, deg_min=3, deg_max=8, C^2, tol=10^{-3})`.
+   OCC selects the minimal degree in $[3, 8]$ needed to satisfy the $C^2$
+   continuity and $10^{-3}$ approximation tolerance, then solves the
+   tensor-product least-squares system (see `brep_reconstruction_plan.md`
+   Section 4.9 for the mathematics).
+
+3. **Result.** A `Geom_BSplineSurface` with knot vectors determined by OCC,
+   parameter domain $[u_1, u_2] \times [v_1, v_2] \approx [-1.05, 1.05]^2$.
+   The surface is **not periodic** even if the underlying shape is geometrically
+   closed — this requires explicit handling at the face-construction stage
+   (Section 7).
+
+**Upstream inputs (produced before this document's scope)**
 
 | Object | Type |
 |---|---|
 | Fitted OCC surfaces | `list[Geom_Surface]`, indexed by cluster $i$ |
-| Raw intersection curves | `dict (i,j) → list[Geom_Curve]` |
-| Adjacency matrix + boundary strips | `np.ndarray`, `list[list[np.ndarray]]` |
+| Adjacency matrix + boundary strips | `np.ndarray`, `dict` |
 | Cluster point clouds | `list[np.ndarray (N,3)]` |
-
-**Output:** `TopoDS_Shape` (shell or solid) exportable to STEP.
+| Surface type IDs | `list[int]` (`SURFACE_PLANE` … `SURFACE_INR`)
 
 ---
 
@@ -190,19 +294,35 @@ Define graph $G_i$ for face $i$:
 - **Nodes** — vertex indices appearing in `face_arcs[i]`
 - **Edges** — open arcs, connecting `v_start` to `v_end`
 
-In a valid manifold B-Rep, every node of $G_i$ has degree exactly 2, so $G_i$
-is a disjoint union of simple cycles.  Each cycle is one wire.  Closed-loop
-arcs form trivial one-arc cycles.
+In a valid manifold B-Rep, every node of $G_i$ has **even degree $\ge 2$**
+($\deg = 2k$ where $k$ is the number of wires passing through that vertex).
+Isolated vertices ($\deg = 0$) cannot occur by construction.  Odd-degree
+vertices imply an open boundary chain and are topologically invalid.
 
-### Degree-2 case
+Because every node has even degree, $G_i$ admits an **Eulerian decomposition**
+into edge-disjoint closed trails (classical theorem: a graph has such a
+decomposition iff every vertex has even degree).  Each closed trail is one wire.
+Closed-loop arcs form trivial one-arc trails.
+
+The Eulerian decomposition is **not unique** when any vertex has degree $\ge 4$:
+multiple pairings of arc-endpoints are possible, all valid as abstract graphs,
+but only geometrically correct pairings produce a 2-manifold face locally at $v$.
+This is why angular ordering is required — it selects the unique pairing that
+respects the alternating inside/outside sector structure around $v$.
+
+### Degree-2 case ($k = 1$)
 
 The next arc is uniquely determined.  No angular computation needed.
 
-### High-degree vertices (degree $\ge 4$)
+### High-degree vertices (degree $2k$, $k \ge 2$)
 
 At a vertex $v$ where $2k$ arc-endpoints meet on face $F$, the 2-manifold
-constraint requires alternating inside/outside sectors.  The arcs of each
-individual wire are angularly interleaved with arcs of every other wire.
+constraint requires sectors around $v$ to alternate strictly between inside
+and outside the face.  At degree 4 (the common case), the three possible
+arc pairings reduce to two geometrically valid ones (adjacent-angle pairing)
+and one invalid one (opposite-angle pairing), which produces crossing wires.
+The arcs of each individual wire are angularly interleaved with arcs of every
+other wire.
 
 **Outgoing tangent** of arc $a$ at vertex $v$:
 
@@ -213,18 +333,108 @@ $$\mathbf{t}_a(v) = \begin{cases}
 
 The sign ensures $\mathbf{t}_a(v)$ always points away from $v$ along $a$.
 
-**Surface normal** at $v$: project $v$ onto the surface via
-`GeomAPI_ProjectPointOnSurf`, evaluate via `GeomLProp_SLProps`.  Returns
-`None` on failure (degenerate patch).
+The derivative is evaluated via OCC's `Geom_Curve.DN(t, N)`, which returns the
+$N$-th derivative vector of the curve at parameter value $t$:
 
-**CCW selection rule.**  Having arrived at $v$ from arc `prev`, define:
+- **`t`** — the parameter at which to differentiate: `arc["t_start"]` or
+  `arc["t_end"]`, which are the parameter values of the arc endpoints on the
+  underlying `Geom_TrimmedCurve`.
+- **`N = 1`** — first derivative order; returns $\frac{d\mathbf{C}}{dt}$, a
+  `gp_Vec` in $\mathbb{R}^3$.
 
-$$\hat{\mathbf{e}}_1 = \frac{\mathbf{t}_\text{prev}(v)}{\|\mathbf{t}_\text{prev}(v)\|}, \qquad
-  \hat{\mathbf{e}}_2 = \hat{N} \times \hat{\mathbf{e}}_1$$
+The result has units of (length / parameter unit) and its magnitude depends on
+the curve's parameterisation — e.g.\ for a circle of radius $r$ parameterised
+by arc length, $\|d\mathbf{C}/dt\| = r$.  Only the **direction** matters for
+angular ordering, so the result is normalised before projection onto the
+tangent plane.
 
-so that $(\hat{\mathbf{e}}_1, \hat{\mathbf{e}}_2, \hat{N})$ is a right-handed
-frame with $\hat{\mathbf{e}}_1$ pointing backward (away from $v$, toward where
-we came from).  For each candidate arc $c$, project its outgoing tangent:
+**Surface normal** at $v$.  Angular ordering requires a consistent notion of
+"counterclockwise" at $v$.  Since the face lies on a curved surface in
+$\mathbb{R}^3$, angles between arcs must be measured in the **tangent plane**
+of the surface at $v$, not in the ambient 3D space.  The tangent plane is the
+2D subspace of $\mathbb{R}^3$ spanned by the two partial derivatives
+$\mathbf{S}_u$ and $\mathbf{S}_v$ at the surface point corresponding to $v$.
+Its normal — the vector perpendicular to both $\mathbf{S}_u$ and $\mathbf{S}_v$:
+
+$$\mathbf{N}(u,v) = \mathbf{S}_u(u,v) \times \mathbf{S}_v(u,v)$$
+
+— is the surface normal $\hat{N}$.  It defines the "up" direction at $v$:
+angles are then measured as seen when looking down along $\hat{N}$.
+
+To evaluate $\hat{N}$ at a 3D vertex position $\mathbf{p}$, we need the
+parametric coordinates $(u^*, v^*)$ on the surface that correspond to
+$\mathbf{p}$.  These are found by **point-to-surface projection**:
+
+$$\min_{(u,v)} \|\mathbf{p} - \mathbf{S}(u,v)\|^2$$
+
+This is a 2D nonlinear least-squares problem (vs.\ the 1D version for
+point-to-curve projection).  The first-order optimality conditions are:
+
+$$(\mathbf{p} - \mathbf{S}(u^*, v^*)) \cdot \mathbf{S}_u(u^*, v^*) = 0$$
+$$(\mathbf{p} - \mathbf{S}(u^*, v^*)) \cdot \mathbf{S}_v(u^*, v^*) = 0$$
+
+i.e., the residual vector $\mathbf{p} - \mathbf{S}(u^*, v^*)$ is perpendicular
+to both tangent vectors — hence parallel to $\mathbf{N}(u^*, v^*)$.  These
+two equations in two unknowns are solved iteratively (Newton's method on
+$(u,v)$), which OCC implements in `GeomAPI_ProjectPointOnSurf`.  The surface
+normal $\hat{N}$ is then:
+
+$$\hat{N} = \frac{\mathbf{S}_u(u^*, v^*) \times \mathbf{S}_v(u^*, v^*)}
+                 {\|\mathbf{S}_u(u^*, v^*) \times \mathbf{S}_v(u^*, v^*)\|}$$
+
+evaluated via `GeomLProp_SLProps` at $(u^*, v^*)$.  Returns `None` on failure
+(degenerate patch or projection divergence).
+
+**CCW selection rule.**  Having arrived at $v$ via arc `prev`, define the
+tangent-plane projection operator:
+
+$$\Pi(\mathbf{x}) = \mathbf{x} - (\mathbf{x} \cdot \hat{N})\,\hat{N}$$
+
+which strips the $\hat{N}$ component and retains only the part of $\mathbf{x}$
+lying in the tangent plane $T_v S$.  Then:
+
+$$\hat{\mathbf{e}}_1 = \frac{\Pi(\mathbf{t}_\text{prev}(v))}{\|\Pi(\mathbf{t}_\text{prev}(v))\|},
+\qquad
+\hat{\mathbf{e}}_2 = \hat{N} \times \hat{\mathbf{e}}_1$$
+
+**Do $\hat{\mathbf{e}}_1, \hat{\mathbf{e}}_2$ span the tangent plane?**
+Yes.  $\hat{\mathbf{e}}_1 = \Pi(\mathbf{t}_\text{prev}) / \|\cdots\|$ lies in
+$T_v S$ by construction (projection removes all $\hat{N}$ content).
+$\hat{\mathbf{e}}_2 = \hat{N} \times \hat{\mathbf{e}}_1$ is perpendicular to
+$\hat{N}$ (so also in $T_v S$) and perpendicular to $\hat{\mathbf{e}}_1$.
+The triple $(\hat{\mathbf{e}}_1, \hat{\mathbf{e}}_2, \hat{N})$ is
+right-handed and orthonormal, and $\{\hat{\mathbf{e}}_1, \hat{\mathbf{e}}_2\}$
+is an orthonormal basis for $T_v S$.
+
+**Why project the arc tangents onto the tangent plane?**
+Curve tangents $\mathbf{t}_a(v) = d\mathbf{C}/dt$ are 3D vectors lying in
+$\mathbb{R}^3$, not necessarily in $T_v S$.  For a curve on a flat surface
+(plane) they already lie in $T_v S$; for a curve on a curved surface
+(cylinder, BSpline) they may have a small $\hat{N}$ component due to the
+extrinsic curvature of the embedding.  Projecting removes this component so
+that angular comparisons are made entirely within the tangent plane — i.e.\
+"as seen from above the surface along $\hat{N}$" — which is the geometrically
+correct notion of angle between curves on a surface.
+
+**Role of the previously traversed arc.**
+$\hat{\mathbf{e}}_1$ is set to the tangent-plane projection of
+$\mathbf{t}_\text{prev}(v)$ — the outgoing tangent of the arc we just
+traversed, evaluated at $v$ and pointing back toward the vertex we came from.
+This is the **backward direction**.  All candidate arc angles are then measured
+CCW relative to this backward direction: $\theta = 0$ corresponds to turning
+back the way we came, $\theta = \pi$ corresponds to going straight ahead
+(smooth continuation), and $\theta \in (0, \pi)$ is a left turn.  The
+selection of the minimum strictly-positive angle picks the arc that is
+**first encountered sweeping CCW from backward**, which is the arc bounding
+the smallest angular sector to the left of the traversed arc.  This sector is
+the "interior" between two consecutive boundary arcs at $v$ — exactly what
+the 2-manifold alternating-sector constraint requires.
+
+For each candidate arc $c$, project and normalise:
+
+$$\hat{\mathbf{t}}_c = \frac{\Pi(\mathbf{t}_c(v))}{\|\Pi(\mathbf{t}_c(v))\|}$$
+
+then measure:
 
 $$\theta_c = \operatorname{atan2}(\hat{\mathbf{t}}_c \cdot \hat{\mathbf{e}}_2,\;
                                   \hat{\mathbf{t}}_c \cdot \hat{\mathbf{e}}_1), \qquad
@@ -234,7 +444,10 @@ Select:
 
 $$c^* = \operatorname*{arg\,min}_{c:\,\tilde\theta_c > 0} \tilde\theta_c$$
 
-This is the **first arc counterclockwise from the backward direction**.
+This is the **first arc counterclockwise from the backward direction** in
+the tangent plane at $v$.  Note that `DN(t, 1)` is called with exactly two
+arguments: the parameter value $t$ (`t_start` or `t_end` of the arc) and
+derivative order $1$, returning a `gp_Vec` $\in \mathbb{R}^3$.
 
 **Why this is correct.**  The face interior occupies exactly one angular sector
 at $v$ (Jordan curve theorem on the surface).  The sector is bounded on each
@@ -250,29 +463,229 @@ arcs for each new wire, so holes are extracted as separate cycles automatically.
 
 ---
 
-## 6 — pcurves (Step 4)
+## 6 — Parametric surfaces, pcurves, and the B-Rep data structure
 
-A **pcurve** (parameter-space curve) is a 2D curve $c : [t_0, t_1] \to \mathbb{R}^2$
-in the UV domain of surface $S$ satisfying:
+### 6.1 — Parametric surfaces: UV → 3D
 
-$$S(c(t)) = \mathbf{C}(t) \quad \forall\, t \in [t_0, t_1]$$
+Every surface is an evaluation map $S : \mathbb{R}^2 \to \mathbb{R}^3$.
+Each primitive is characterised by its intrinsic geometric parameters (a point,
+an axis direction, a radius, etc.) together with a **local orthonormal frame**
+$(\mathbf{e}_1, \mathbf{e}_2, \mathbf{e}_3)$ fixed at construction time, where
+$\mathbf{e}_3$ is the primary axis direction and $\{\mathbf{e}_1, \mathbf{e}_2\}$
+are any two unit vectors spanning its orthogonal complement.  In OCC this frame
+is stored as a `gp_Ax3` object.
 
-where $\mathbf{C}$ is the 3D edge curve.  Every edge has one pcurve per
-adjacent face.  OCC requires them for:
-1. Defining the trim region of a face in UV space (surface is trimmed to the
-   region enclosed by the outer wire's pcurves).
-2. STEP export (pcurves are stored explicitly as `PCURVE` entities).
-3. Boolean operations, shelling, and offset (OCC's internal algorithms operate
-   in UV space).
+**Plane** — anchor point $\mathbf{p}_0 \in \mathbb{R}^3$, unit normal $\mathbf{n}$;
+frame $\mathbf{e}_3 = \mathbf{n}$, $(\mathbf{e}_1, \mathbf{e}_2)$ any orthonormal
+basis of the plane; $u, v \in \mathbb{R}$:
+$$S(u,v) \;=\; \mathbf{p}_0 + u\,\mathbf{e}_1 + v\,\mathbf{e}_2$$
 
-**Analytical surfaces** (plane, cylinder, cone, sphere) have closed-form
-inverse maps from $\mathbb{R}^3$ to UV.  `BRepBuilderAPI_MakeFace(surface, wire)`
-computes pcurves internally without any extra step.
+**Cylinder** — axis point $\mathbf{c}$, unit axis direction $\mathbf{a}$, radius $r$;
+frame $\mathbf{e}_3 = \mathbf{a}$, $(\mathbf{e}_1, \mathbf{e}_2) \perp \mathbf{a}$;
+$u \in [0,2\pi)$, $v \in \mathbb{R}$:
+$$S(u,v) \;=\; \mathbf{c} + r\cos u\;\mathbf{e}_1 + r\sin u\;\mathbf{e}_2 + v\,\mathbf{a}$$
+$u$ is the angular coordinate around the axis; $v$ is the signed axial distance
+from $\mathbf{c}$.
 
-**BSpline surfaces** have no closed-form inverse.  Finding UV from a 3D point
-requires solving $\min_{(u,v)} \|S(u,v) - \mathbf{p}\|^2$ numerically.
-`BRepBuilderAPI_MakeFace` does **not** perform this computation automatically
-for BSpline surfaces, leaving the face without valid pcurves.
+**Sphere** — centre $\mathbf{c}$, radius $r$; frame $\mathbf{e}_3$ toward the
+north pole; $u \in [0,2\pi)$, $v \in [-\tfrac{\pi}{2}, \tfrac{\pi}{2}]$:
+$$S(u,v) \;=\; \mathbf{c} + r\cos v\cos u\;\mathbf{e}_1
+                           + r\cos v\sin u\;\mathbf{e}_2
+                           + r\sin v\;\mathbf{e}_3$$
+$u$ is longitude, $v$ is latitude ($v=0$ equator, $v=\pm\pi/2$ poles).
+
+**Cone** — apex $\mathbf{v}$, unit axis direction $\mathbf{a}$ pointing from apex
+into the cone body, semi-angle $\theta$;
+frame $\mathbf{e}_3 = \mathbf{a}$, $(\mathbf{e}_1, \mathbf{e}_2) \perp \mathbf{a}$;
+$u \in [0,2\pi)$, $v \ge 0$:
+$$S(u,v) \;=\; \mathbf{v} + v\sin\theta\cos u\;\mathbf{e}_1
+                           + v\sin\theta\sin u\;\mathbf{e}_2
+                           + v\cos\theta\;\mathbf{a}$$
+$v$ is the slant distance from the apex along a generator.
+
+**BSpline** — $u \in [u_0,u_n]$, $v \in [v_0,v_m]$:
+$$S(u,v) \;=\; \sum_{i=0}^{n}\sum_{j=0}^{m} N_i^p(u)\,N_j^q(v)\,\mathbf{P}_{ij}$$
+Tensor product of B-spline bases of degrees $p,q$; no closed-form inverse.
+Constructed via `GeomAPI_PointsToBSplineSurface`.
+
+### 6.2 — Inverse maps: 3D → UV
+
+For a point $\mathbf{p} \in \mathbb{R}^3$ lying on surface $S$, the closed-form
+inverses use the same frame vectors and intrinsic parameters as Section 6.1:
+
+**Plane** — let $\mathbf{q} = \mathbf{p} - \mathbf{p}_0$:
+$$S^{-1}(\mathbf{p}) \;=\; \bigl(\mathbf{q}\cdot\mathbf{e}_1,\;\mathbf{q}\cdot\mathbf{e}_2\bigr)$$
+Both coordinates are orthogonal projections; the inverse is a linear map.
+
+**Cylinder** — let $\mathbf{q} = \mathbf{p} - \mathbf{c}$:
+$$S^{-1}(\mathbf{p}) \;=\; \bigl(\operatorname{atan2}(\mathbf{q}\cdot\mathbf{e}_2,\;\mathbf{q}\cdot\mathbf{e}_1),\;\mathbf{q}\cdot\mathbf{a}\bigr)$$
+$u$ recovers the angle by unwrapping the lateral projection; $v$ is the axial projection.
+
+**Sphere** — let $\hat{\mathbf{q}} = (\mathbf{p} - \mathbf{c})/r$:
+$$S^{-1}(\mathbf{p}) \;=\; \bigl(\operatorname{atan2}(\hat{\mathbf{q}}\cdot\mathbf{e}_2,\;\hat{\mathbf{q}}\cdot\mathbf{e}_1),\;\arcsin(\hat{\mathbf{q}}\cdot\mathbf{e}_3)\bigr)$$
+
+**Cone** — let $\mathbf{q} = \mathbf{p} - \mathbf{v}$:
+$$S^{-1}(\mathbf{p}) \;=\; \bigl(\operatorname{atan2}(\mathbf{q}\cdot\mathbf{e}_2,\;\mathbf{q}\cdot\mathbf{e}_1),\;\mathbf{q}\cdot\mathbf{a}/\cos\theta\bigr)$$
+The axial projection is scaled by $1/\cos\theta$ to recover the slant distance $v$.
+
+**BSpline:** no closed form; requires solving
+$\min_{(u,v)}\|S(u,v)-\mathbf{p}\|^2$ by Newton iteration
+(`GeomAPI_ProjectPointOnSurf`).
+
+For analytical primitives OCC uses these closed-form expressions internally
+(not Newton iteration).  The frame vectors $\mathbf{e}_1, \mathbf{e}_2, \mathbf{e}_3$
+correspond to the X, Y, Z directions of the `gp_Ax3` object stored in the surface.
+
+### 6.3 — Pcurves: definition, analytical computation, and role
+
+A **pcurve** of edge $e$ on face $f$ is a 2D curve $c : [t_0,t_1] \to \mathbb{R}^2$
+in the UV domain of surface $S_f$ satisfying:
+
+$$S_f(c(t)) = \mathbf{C}_e(t) \quad \forall\,t \in [t_0, t_1]$$
+
+i.e.\ the pcurve is the composition $c = S_f^{-1} \circ \mathbf{C}_e$.  For
+analytical surfaces this composition is evaluated in closed form by substituting
+the 3D curve $\mathbf{C}_e(t)$ into the inverse map.
+
+**Concrete examples** (all intersections arising in the Point2CAD pipeline):
+
+*Line on a plane* — $\mathbf{C}(t) = \mathbf{A} + t\mathbf{d}$ (plane–plane intersection):
+$$c(t) = \bigl((\mathbf{A}-\mathbf{O})\cdot\mathbf{X} + t\,(\mathbf{d}\cdot\mathbf{X}),\;
+               (\mathbf{A}-\mathbf{O})\cdot\mathbf{Y} + t\,(\mathbf{d}\cdot\mathbf{Y})\bigr)$$
+The inverse of the plane is linear, so a 3D line maps to a **2D line**
+(`Geom2d_Line`).
+
+*Circle on a cylinder, plane cut perpendicular to axis* — the circle lies at
+constant height $h$, $\mathbf{C}(t) = \mathbf{O} + r\cos t\,\mathbf{X} + r\sin t\,\mathbf{Y} + h\mathbf{Z}$:
+$$c(t) = \bigl(t,\; h\bigr)$$
+The $\operatorname{atan2}$ applied to $(\cos t, \sin t)$ returns $t$ exactly;
+the axial projection returns the constant $h$.  The pcurve is a **horizontal
+line** $v = h$ in UV space (`Geom2d_Line`, direction $(1,0)$).
+
+*Circle on a cylinder, oblique plane cut* — the intersection is still
+parameterised by angle $t$ but the height now varies:
+$v(t) = h_0 + A\cos t + B\sin t$ (from the plane equation).
+$$c(t) = \bigl(t,\; h_0 + A\cos t + B\sin t\bigr)$$
+This is a **sinusoidal (trigonometric) curve** in UV space, which OCC
+represents as a `Geom2d_BSplineCurve` approximation.
+
+*Circle on a plane* — the circle lies entirely in the plane, so the plane's
+inverse (a linear map) maps it to a **2D circle** (`Geom2d_Circle`).
+
+*Generator line on a cylinder* — at fixed angle $\phi_0$,
+$\mathbf{C}(t) = \mathbf{O} + r\cos\phi_0\,\mathbf{X} + r\sin\phi_0\,\mathbf{Y} + t\mathbf{Z}$:
+$$c(t) = \bigl(\phi_0,\; t\bigr)$$
+A **vertical line** $u = \phi_0$ (`Geom2d_Line`, direction $(0,1)$).
+
+The pattern is: the type of the pcurve is determined by the composition of the
+3D curve type with the surface's inverse map.  Linear inverses (plane) preserve
+curve type.  Trigonometric inverses (cylinder, sphere, cone) generally degrade
+circles to sinusoids in UV space.
+
+OCC's `BRepLib::BuildCurve2d` (called internally by `BRepBuilderAPI_MakeFace`)
+handles the known (surface type, 3D curve type) pairs analytically and falls
+back to numerical BSpline approximation for pairs it cannot resolve in closed form.
+
+**Every edge in a valid B-Rep has exactly two pcurves** — one for each of
+its two adjacent faces — even though geometrically they encode the same 3D
+curve.  The two pcurves live in different UV spaces and generally look
+different: for example the intersection circle between a plane and a cylinder
+is a horizontal line $v = h$ in the cylinder's UV space, but a circle in the
+plane's UV space (the plane's inverse is the identity up to a rigid frame
+change, which maps a circle to a circle).
+
+**Why pcurves are required:**
+
+1. **Trimming.**  A face is a bounded region of an infinite surface.  OCC
+   defines this region entirely in UV space as the area enclosed by the
+   pcurves of the face's boundary wires.  Without pcurves the surface cannot
+   be trimmed — OCC does not know where the face ends.
+
+2. **Inside/outside determination.**  The orientation (direction of traversal)
+   of the pcurve in UV space defines which side is the face interior.  By
+   convention the interior is to the left of the pcurve when traversed in its
+   natural direction.  This is what gives the face its outward normal
+   orientation.
+
+3. **STEP standard.**  ISO 10303-21 stores pcurves as explicit `PCURVE`
+   entities.  A face without valid pcurves appears as an unbounded surface
+   patch and is dropped or treated as invalid by importing applications.
+
+4. **Downstream algorithms.**  Boolean operations, shelling, offsetting, and
+   meshing all operate in UV space.  Pcurves are the bridge from 3D topology
+   to 2D parameterisation.
+
+### 6.4 — What is a B-Rep file?
+
+A B-Rep solid is a hierarchy of topological entities, each paired with a
+geometric object:
+
+| Topological entity | Geometric object | Notes |
+|---|---|---|
+| **Vertex** | Point $\mathbf{p} \in \mathbb{R}^3$ | 0-dimensional |
+| **Edge** | 3D curve $\mathbf{C}(t)$ + **two pcurves** $c_L(t), c_R(t)$ + two vertex refs | shared between exactly 2 faces |
+| **Wire** | Ordered, oriented sequence of edges | closed loop |
+| **Face** | Surface $S(u,v)$ + one or more wires | bounded region in UV |
+| **Shell** | Connected collection of faces | open or closed |
+| **Solid** | Closed shell(s) | encloses a volume |
+
+The pcurves are the critical piece that connects the 1D topology (edges) to
+the 2D topology (faces).  Each edge carries **two** pcurves because it borders
+two faces, each with its own UV space.
+
+In our pipeline the pcurves are **not computed explicitly**.  For analytical
+faces `BRepBuilderAPI_MakeFace(surface, wire)` computes them internally using
+the closed-form inverse maps.  For INR (BSpline) faces the UV-bounds path
+`BRepBuilderAPI_MakeFace(surface, u_min, u_max, v_min, v_max, tol)` generates
+iso-parameter boundary edges whose pcurves are trivial straight lines in UV
+space (the iso-$u$ and iso-$v$ lines).  `BRepBuilderAPI_Sewing` then stitches
+the faces together, computing and validating pcurves at shared edges.
+`breplib.BuildCurves3d` rebuilds the 3D curves from pcurves where needed.
+`ShapeFix_Shape` repairs any invalid pcurves during healing.  All of this
+happens inside OCC; the STEP writer exports the final pcurves as explicit
+`PCURVE` entities.
+
+### 6.5 — BSpline faces: sidestepping explicit pcurve computation
+
+For analytical faces, the closed-form inverse maps make pcurve computation
+trivial — OCC evaluates them directly.  For BSpline faces there is no
+closed-form inverse, so computing a pcurve explicitly requires projecting the
+3D intersection arc onto the UV domain point-by-point via Newton iteration.
+Our pipeline sidesteps this entirely by using a **rectangular UV-bounds face**:
+
+$$\texttt{BRepBuilderAPI\_MakeFace}(S,\; u_\text{min},\; u_\text{max},\; v_\text{min},\; v_\text{max},\; \varepsilon)$$
+
+The boundary of this face consists entirely of iso-parameter curves of $S$ —
+lines in UV space by definition, requiring no inversion of the surface map.
+The bounds for the open direction (e.g.\ $v_\text{min}, v_\text{max}$) are
+estimated by projecting sample points from the neighboring intersection arcs
+onto the BSpline surface and taking the parameter extremes with a small margin.
+
+The iso-parameter boundary $S(u, v_\text{min})$ is not the exact 3D
+intersection curve — it deviates from it by roughly the BSpline fitting
+residual $\varepsilon_S$.  This gap is bridged by `BRepBuilderAPI_Sewing`:
+it identifies the iso-parameter edge of the BSpline face and the intersection
+curve edge of the neighboring analytical face as geometrically coincident
+(within sewing tolerance) and merges them.  At the merged edge, sewing
+computes the pcurve on the BSpline side numerically, delegating all pcurve
+complexity to the sewing API.  If sewing succeeds the resulting BRep is
+topologically valid and the pcurve error is bounded by the sewing tolerance —
+consistent with the fitting residual already present throughout the pipeline.
+
+**Manual pcurve computation (alternative).**  The exact approach is to project
+each intersection arc $\mathbf{C}_e(t)$ onto the BSpline UV space: sample
+$t_k$, solve $\min_{(u,v)}\|S(u,v) - \mathbf{C}_e(t_k)\|^2$ via Newton for
+each sample to obtain $(u_k, v_k)$, then fit a `Geom2d_BSplineCurve` through
+the sequence.  This pcurve is used directly when building the face with
+explicit wires, making the boundary exactly the intersection curve.  However,
+this approach is significantly more expensive (a nonlinear solve per sample
+point per arc) and risks compounding errors: Newton iteration on a BSpline
+surface can diverge near low-curvature regions or close to the seam; the
+subsequent 2D BSpline fit introduces an additional approximation layer; and
+any accumulated error exceeding the BRep tolerance causes `BRepCheck_Analyzer`
+or sewing to reject the face.  The UV-bounds approach avoids all of these
+failure modes at the cost of delegating the boundary approximation to the
+sewing tolerance.
 
 ---
 
