@@ -220,19 +220,57 @@ def compute_all_intersections(adj, surface_ids, results, occ_surfaces, tol = 1e-
     }
 
 
-def sample_curve(curve, n_points = 200, line_extent = 1.0):
+def sample_curve(curve, boundary_pts=None, threshold=None,
+                 n_points=200, extension_factor=0.15, line_extent=1.0):
     """
     Sample a Geom_Curve into an (n_points, 3) numpy array.
 
-    Lines have an infinite parameter domain; they are clipped to
-    [-line_extent, +line_extent].  Set line_extent to a value comparable
-    to the diameter of your normalised point cloud (typically ~1).
+    When *boundary_pts* and *threshold* are provided the sample range is
+    determined by projecting boundary_pts onto the curve and taking the span
+    of the resulting parameters (extended by extension_factor on each side).
+    This is used for **visualisation only** and does not affect B-Rep
+    construction — it ensures that closed curves (e.g. full 2π ellipses from
+    cylinder∩plane intersections) are displayed only over the arc that covers
+    the actual shared boundary.
+
+    Without boundary_pts the full parameter domain is sampled.  Infinite
+    parameter bounds (Geom_Line) are clamped to ±line_extent so that
+    np.linspace produces a usable range.
     """
     t0 = curve.FirstParameter()
     t1 = curve.LastParameter()
-    if not math.isfinite(t0) or abs(t0) >= _OCC_INF: t0 = -line_extent
-    if not math.isfinite(t1) or abs(t1) >= _OCC_INF: t1 =  line_extent
+    is_inf = abs(t0) >= _OCC_INF or abs(t1) >= _OCC_INF
 
+    if boundary_pts is not None and threshold is not None and len(boundary_pts) >= 2:
+        params = []
+        for pt in boundary_pts:
+            proj = GeomAPI_ProjectPointOnCurve(
+                gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])), curve
+            )
+            # No distance filter: visualization-only path — just need the
+            # parameter span, not geometric accuracy.
+            if proj.NbPoints() > 0:
+                params.append(proj.LowerDistanceParameter())
+
+        if len(params) >= 2:
+            ta   = float(min(params))
+            tb   = float(max(params))
+            span = tb - ta
+            ta  -= extension_factor * span
+            tb  += extension_factor * span
+            if not is_inf:
+                ta = max(ta, t0)
+                tb = min(tb, t1)
+            pts = np.zeros((n_points, 3))
+            for i, t in enumerate(np.linspace(ta, tb, n_points)):
+                p = curve.Value(t)
+                pts[i] = (p.X(), p.Y(), p.Z())
+            return pts
+
+    # Fallback: full parameter domain (boundary projection unavailable or
+    # yielded fewer than 2 projections within threshold).
+    if is_inf:
+        t0, t1 = -line_extent, line_extent
     pts = np.zeros((n_points, 3))
     for i, t in enumerate(np.linspace(t0, t1, n_points)):
         p = curve.Value(t)

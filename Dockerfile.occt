@@ -7,6 +7,8 @@ RUN apt-get update && \
         gosu \
         wget \
         libgl1-mesa-glx \
+        firefox \
+        x11-apps \
         libxrender1 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 

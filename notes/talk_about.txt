@@ -1,28 +1,22 @@
-- Different runtimes across different numpy versions.
-- Showcase full pipeline results for different point clouds
-- Discuss that the final result of Point2CAD is not a true CAD - requires true BRep parametric representation
-- What about master thesis, it's likely that the actual work will deviate from the proposed one in master thesis application
-- A lot of notes regarding mathematical machinery, mesh operations and discrepancies between paper and implementation, 10-ish pages,
-  maybe more?
+- Different cylinder fitting runtimes across different numpy versions.
 
 ---- Post Point2CAD ----
-- CADRecode simply did not work for 2 sample point clouds. It has a context length of 256, single ABC clusters contain up to 1000 points.
-- Point2Primitive seems to be the closest to a full BRep model out of all papers (along with CADRecode of course), it describes a CAD model
-  in terms of sketch/extrude operations and it does not (at least for now) seem to have a limit on the number of input points.
-- Current occupation: Use Point2CAD fitted surfaces and construct a real BRep model from them. Convert INR to BSpline, perform intersections
-  using OpenCascade Python bindings, clip the objects to the input point cloud. If successful, a real contribution, no one has done this
-  so far up to my knowledge.
-- Another interesting direction: Instead of 2 steps: fit INR + fit a BSpline, somehow jointly train INR to adapt a BSpline, this
-  would be another research novelty.
-- What has been done so far: 
-    - Cluster adjacency matrix: Compute median distance over nearest neighbor distances for all clusters, m. Declare clusters adjacent
-      if 2-percentile nearest neighbor distance (configurable) falls within m * threshold (1.5, configurable)
-    
-    - Compute analytical intersections between adjacents clusters via OCC. In the case of simlper intersections (plane/plane, plane/sphere,
-    use handwritten solutions). Result: parametric curves.
+- CADRecode simply did not work for 2 sample point clouds. It has a context length of 256, single ABC clusters contain up to 1000 points, 
+possibly even more (freeform surface sample point cloud, the freeform cluster contains 7.2k points). Furthermore, the dataset used for trainig 
+was procedurally generated - CADQuery scripts, and as such limits to CAD models that can be represented as a sequence of 
+sketch/extrude operations, limiting bias for industrial point clouds. We examine this by passing an ABC CAD model - point cloud downsampled
+to 256, the resulting CADQuery model is nowhere neal the original point cloud (demonstration in Kaggle notebook).
 
-    - Trim curves to boundary points. First, if the resulting curve has a compact parameter space, we will not perform any trimming (for now
-      at least). If the curve has an infinite parameter space, project boundary points (points from clusters that matched the distance threshold
-      in adjacency matrix computation), and compute the minimum and maximum parameter values for projected points (using lowest distance points
-      for reference if there are multiple projections for a single point). Extend this minimum and maximum thresholds by relative extension
-      parameter, and generate a trimmed curve with this new parameter space.
+- Point2Primitive is similar, in a sense that it represents a CAD model as a sequence of sketch/extrude operations. This model 
+uses the DeepCAD dataset, which is fundamentally different from the ABC dataset because the ABC CAD models are not annotated with
+sketch/extruce operations. Again, suffers from "simplicity bias" - CAD models representable as sequences of sketch/extrude operations.
+Uses a transformer neural network, so the same flaw as CADRecode - limited context length, 2048 in this case.
+
+- P2CadNet: Trained on the same datasret as Point2Primitive, also represents a CAD model as a sequence of sketch/extrude commands,
+also uses tranformers and as such suffers from limited context length.
+
+Thoughts on these models: DeepCAD inherently limits the expressive power of a model if we take the deep-learning centric approach - 
+complexity of models is limited to sketch/extrude sequences. Furthermore, the usage of transformers puts an upper bound on the resolution
+of the input point cloud - both properties are not desired in practice./
+
+Idea: Extend Point2CAD primitive surface fitting to facilitate a full BRep model, rather than a discrete mesh approximation.

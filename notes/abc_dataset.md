@@ -3,85 +3,113 @@
 ## Overview
 
 The ABC dataset contains CAD models sourced from Onshape. Each 10k chunk is organized into
-three subdirectories: `obj/`, `feat/`, and `meta/`. Despite the "10k models per chunk" claim,
-only ~7,168 models have complete data (OBJ + features). The remaining ~2,832 directories
-either contain metadata only (e.g., directories 00000000-00000001) or are empty.
+subdirectories by file type. The practical model count depends on the format:
+
+| Format | Models available | Notes |
+|--------|-----------------|-------|
+| STEP   | **10,000** | Full B-Rep, all models in the chunk |
+| OBJ    | ~7,168 | Tessellated mesh, subset only |
+| feat   | ~7,168 | Feature annotations, same subset |
+| meta   | ~10,000 | Onshape document metadata |
+
+The previously noted "10k vs 7.1k discrepancy" only applies to OBJ + feat. STEP files exist
+for the full 10,000 models per batch and are the canonical ground truth for point cloud
+generation and evaluation.
 
 ## Directory Structure
 
 ```
 abc_dataset/
-  obj/          7,168 .obj files (triangle meshes)
-  feat/         7,168 .yml files (geometric features)
-  meta/        10,001 .yml files (Onshape document metadata)
-  obj_v00.txt          archive download URLs
-  meta_v00.txt         archive download URLs
+  abc_0000_step_v00/    10,000 STEP files (full CAD B-Rep, all models)
+  abc_0000_stat_v00/     7,168 YAML statistics files
+  obj/                   7,168 .obj files (triangle meshes, tessellated from CAD)
+  feat/                  7,168 .yml files (surface/curve feature annotations, mesh-indexed)
+  meta/                 ~10,000 .yml files (Onshape document metadata)
+  obj_v00.txt                  archive download manifest
+  meta_v00.txt                 archive download manifest
 ```
 
-Each subdirectory contains up to 10,000 numbered directories (00000000 through 00009999),
-with each directory holding files for one CAD model variant.
+Each subdirectory holds up to 10,000 numbered sub-directories (00000000–00009999),
+one per CAD model variant.
 
 ## File Naming Convention
-
-All files follow the pattern:
 
 ```
 [8-digit_ID]_[32-char_HASH]_[type]_[variant].[ext]
 ```
 
-- **8-digit ID**: model index (00000000 - 00009999)
+- **8-digit ID**: model index (00000000–00009999)
 - **32-char HASH**: Onshape document content hash
-- **type**: `trimesh` (obj), `features` (feat), `metadata` (meta)
-- **variant**: integer variant index (000, 001, ...)
-- **ext**: `.obj` or `.yml`
+- **type**: `step`, `trimesh`, `features`, `metadata`, `stat`
+- **variant**: integer variant index (000, 001, …)
+- **ext**: `.step`, `.obj`, or `.yml`
 
 Example: `00000002_1ffb81a71e5b402e966b9341_trimesh_001.obj`
+
+## STEP Files (canonical ground truth B-Rep)
+
+STEP files contain the full exact B-Rep: analytical surfaces (planes, cylinders, cones,
+spheres, tori) as OCC `Geom_Surface` objects, plus spline surfaces for freeform patches,
+all bounded by exact edge and vertex topology.
+
+Key properties:
+- Available for all 10,000 models per batch
+- Each `TopoDS_Face` corresponds to one surface patch with a known analytical type
+- Face topology (wires, edges, vertices) is fully encoded
+
+Loading with pythonocc:
+```python
+from OCC.Core.STEPControl import STEPControl_Reader
+from OCC.Core.TopExp      import TopExp_Explorer
+from OCC.Core.TopAbs      import TopAbs_FACE
+from OCC.Core             import topods
+from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+
+reader = STEPControl_Reader()
+reader.ReadFile(step_path)
+reader.TransferRoots()
+shape = reader.OneShape()
+
+exp = TopExp_Explorer(shape, TopAbs_FACE)
+while exp.More():
+    face    = topods.Face(exp.Current())
+    adaptor = BRepAdaptor_Surface(face)
+    stype   = adaptor.GetType()   # GeomAbs_Plane, GeomAbs_Cylinder, etc.
+    exp.Next()
+```
 
 ## OBJ Files
 
 Standard ASCII OBJ format with vertices, normals, and triangular faces.
-No texture coordinates are present.
-
-### Structure
+No texture coordinates.
 
 ```
 v  x y z          # vertex position
 vn x y z          # vertex normal
-f  v1//vn1 v2//vn2 v3//vn3   # triangular face (vertex//normal, 1-indexed)
+f  v1//vn1 v2//vn2 v3//vn3   # triangle (vertex//normal, 1-indexed)
 ```
 
-Face format is `f v//vn` — vertex index paired with normal index, no texture coordinate slot.
-
-### Typical Sizes
-
-| Metric   | Range (from samples) |
-|----------|---------------------|
-| Vertices | 18k - 114k          |
-| Normals  | 22k - 120k          |
-| Faces    | 37k - 228k          |
-
-Normal count slightly exceeds vertex count because different faces sharing
-a vertex can have distinct normals (hard edges). Face count is roughly 2x vertex count.
+Typical sizes: 18k–114k vertices, 37k–228k faces.
 
 ## FEAT (Features) Files
 
-YAML files with two top-level keys: `curves` and `surfaces`.
+YAML files with `curves` and `surfaces` keys. **Mesh-indexed** — references face and
+vertex indices from the corresponding OBJ, not the STEP geometry directly.
 
 ### Surfaces
 
-Each entry describes a geometric surface patch and the mesh faces belonging to it.
-
 ```yaml
 surfaces:
-  - type: Plane              # surface type
-    location: [x, y, z]      # reference point
-    face_indices: [0, 1, ...]  # 0-indexed into OBJ faces
-    vert_indices: [0, 1, ...]  # 0-indexed into OBJ vertices
-    vert_parameters: [...]     # per-vertex 2D parametrization
-    # additional fields depending on type (e.g., radius for Cylinder)
+  - type: Cylinder
+    location: [x, y, z]
+    z_axis: [dx, dy, dz]
+    radius: r
+    face_indices: [0, 1, ...]   # 0-indexed into OBJ faces
+    vert_indices: [0, 1, ...]
+    vert_parameters: [...]      # per-vertex UV in the surface's parametric domain
 ```
 
-**Surface types and their frequency across the full chunk:**
+Surface type frequencies across batch 0:
 
 | Type      | Count   |
 |-----------|---------|
@@ -95,20 +123,17 @@ surfaces:
 
 ### Curves
 
-Each entry describes a boundary or intersection curve on the model.
-
 ```yaml
 curves:
-  - type: Line               # curve type
-    sharp: true               # whether the edge is sharp
-    vert_indices: [0, 1, ...] # 0-indexed into OBJ vertices
-    vert_parameters: [...]    # curve parameterization values
+  - type: Line
+    sharp: true
+    vert_indices: [...]
+    vert_parameters: [...]
     location: [x, y, z]
-    direction: [dx, dy, dz]   # Line-specific
-    # additional fields depending on type (e.g., radius for Circle, knots/poles for BSpline)
+    direction: [dx, dy, dz]
 ```
 
-**Curve types and their frequency:**
+Curve type frequencies:
 
 | Type       | Count   |
 |------------|---------|
@@ -118,37 +143,59 @@ curves:
 | Ellipse    |  28,733 |
 | Revolution |     559 |
 
-## META (Metadata) Files
+## Point Cloud Generation: OBJ vs STEP
 
-YAML files containing Onshape document metadata. Not needed for point cloud generation,
-but useful for traceability.
+### OBJ + feat sampler (`--sampler obj`, ~7.1k models)
 
-Key fields: `id`, `name`, `description`, `createdAt`, `modifiedAt`, `createdBy`, `owner`,
-`permission`, `public`, `tags`, `thumbnail`.
+Area-weighted barycentric sampling on the tessellated mesh. Surface labels from
+`feat.surfaces[i].face_indices`.
 
-## The 10k vs 7.1k Discrepancy
+**Limitations:**
+1. *Tessellation error* — OBJ triangles are planar approximations of curved surfaces.
+   For a cylinder of radius r with N facets, max deviation ≈ r(1 − cos(π/N)).
+2. *Non-uniform density* — CAD tessellators refine near high curvature; the mesh area
+   of curved patches is slightly smaller than the true analytical area.
+3. *Boundary label noise* — triangles straddling two surface patches may receive the
+   wrong label.
+4. *Reduced coverage* — only ~7,168 models have both OBJ and feat files.
 
-The dataset advertises 10k models per chunk, but only 7,168 have both OBJ and features files.
+### STEP sampler (`--sampler step`, default, 10k models)
 
-| Directory      | obj | feat | meta |
-|----------------|-----|------|------|
-| 00000000-00000001 | no  | no   | yes  |
-| 00000002-00009999 | 7,168 | 7,168 | 9,999 |
+Loads the exact B-Rep via OCC. Each `TopoDS_Face` is one cluster (cluster ID = face
+index in `TopExp_Explorer` traversal order). For each face a UV grid is evaluated on
+the exact `Geom_Surface`, decomposed into triangles, and points sampled area-weighted
+from those triangles.
 
-The 10k count refers to all Onshape documents in the chunk. Some documents failed geometry
-extraction (no OBJ produced) or feature annotation (no FEAT produced). The practical count
-for Point2CAD preprocessing is the intersection: **7,168 models** with both mesh geometry
-and surface/curve annotations.
+**Advantages:**
+- Points lie exactly on the analytical surface — no tessellation bias
+- Available for all 10,000 models per batch
+- Labels come directly from B-Rep face identity
 
-## Relevance to Point2CAD
+**Trade-off:** Requires pythonocc (run inside Docker). The UV-grid triangulation
+approximates the area element; increasing `--grid_res` (default 50) improves accuracy
+at the cost of speed.
 
-For generating segmented point clouds (`.xyzc` format):
+**One-face = one-cluster assumption:** A single analytical surface can theoretically
+appear as multiple `TopoDS_Face` entries in the B-Rep (e.g., a cylinder split at its
+seam). In practice, Parasolid-based STEP files (the source of ABC) represent each
+primitive surface as a single face. Even when splitting does occur, each face is still
+a coherent patch of the same analytical type, so the fitting step is unaffected — at
+worst the model is slightly over-segmented.
 
-1. Load OBJ to get vertices and triangular faces
-2. Load corresponding FEAT `.yml` to get `surfaces[i].face_indices` (0-indexed)
-3. Build a face-to-surface mapping from `face_indices`
-4. Sample points via area-weighted barycentric sampling, inheriting the surface label
-5. Export as `.xyzc` (x, y, z, cluster_id)
+### Running the STEP sampler
 
-Surface types Plane, Cylinder, Cone, and Sphere map directly to primitive fitters.
-Torus, Extrusion, BSpline, and Other require INR fitting.
+```bash
+# Single model
+python scripts/abc_preprocess.py \
+    --abc_dir /path/to/abc_dataset \
+    --model_id 00000042 \
+    --sampler step \
+    --output_dir output/point_clouds
+
+# Batch (all 10k models)
+python scripts/abc_preprocess.py \
+    --abc_dir /path/to/abc_dataset \
+    --sampler step \
+    --batch \
+    --output_dir output/point_clouds
+```

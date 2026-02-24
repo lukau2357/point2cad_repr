@@ -18,8 +18,8 @@ import time
 import glob as _glob
 
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(__file__))
+import open3d as o3d
+from scipy.spatial import Delaunay, ConvexHull
 
 # Curve-type → RGB colour used by the visualizer
 CURVE_TYPE_COLORS = {
@@ -34,12 +34,59 @@ CURVE_TYPE_COLORS = {
 
 
 # ---------------------------------------------------------------------------
+# Boundary strip visualization helper
+# ---------------------------------------------------------------------------
+
+def _boundary_mesh(pts, color=None):
+    """
+    Build a filled TriangleMesh from boundary strip points.
+
+    Projects the 3D points onto their PCA best-fit plane, Delaunay-triangulates
+    in 2D, then lifts the triangulation back to the original 3D coordinates.
+    Falls back to a fan-triangulation of the 2D convex hull if Delaunay fails.
+    Returns None when both methods fail or the input is degenerate.
+
+    Note: ConvexHull.vertices are indices into the original pts array, so no
+    remapping is needed for either triangulation method.
+    """
+    if color is None:
+        color = [0.5, 0.5, 0.5]
+    if len(pts) < 3:
+        return None
+
+    centered = pts - pts.mean(axis=0)
+    _, _, Vt  = np.linalg.svd(centered, full_matrices=False)
+    pts2d     = centered @ Vt[:2].T   # (N, 2) projection onto best-fit plane
+
+    triangles = None
+    try:
+        triangles = Delaunay(pts2d).simplices
+    except Exception as e:
+        print(f"[boundary_mesh] Delaunay failed ({e}), trying convex hull fallback")
+        try:
+            verts = ConvexHull(pts2d).vertices   # ordered hull vertex indices
+            # Fan-triangulation from verts[0]: (v0, v_i, v_{i+1})
+            triangles = np.array([
+                [verts[0], verts[i], verts[i + 1]]
+                for i in range(1, len(verts) - 1)
+            ])
+        except Exception as e2:
+            print(f"[boundary_mesh] Convex hull fallback also failed ({e2}), skipping")
+            return None
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices  = o3d.utility.Vector3dVector(pts)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    mesh.compute_vertex_normals()
+    mesh.paint_uniform_color(color)
+    return mesh
+
+
+# ---------------------------------------------------------------------------
 # Visualize mode  (host, no OCC)
 # ---------------------------------------------------------------------------
 
 def run_visualize(args):
-    import open3d as o3d
-
     out_dir = os.path.join(args.output_dir, args.visualize_id)
 
     meta         = np.load(os.path.join(out_dir, "metadata.npz"), allow_pickle=True)
@@ -66,6 +113,7 @@ def run_visualize(args):
 
     trimmed_linesets   = []
     untrimmed_linesets = []
+    boundary_pcds      = []
     for inter_path in sorted(_glob.glob(os.path.join(out_dir, "inter_*.npz"))):
         d          = np.load(inter_path, allow_pickle=True)
         curve_type = str(d["curve_type"])
@@ -79,18 +127,30 @@ def run_visualize(args):
             trimmed_linesets.append(_lineset(d[f"curve_points_{k}"], color))
         for k in range(n_raw):
             untrimmed_linesets.append(_lineset(d[f"untrimmed_curve_points_{k}"], color))
+        if "boundary_pts" in d:
+            bpts = d["boundary_pts"]
+            if len(bpts) > 0:
+                if args.boundary_mesh:
+                    bgeom = _boundary_mesh(bpts)
+                    if bgeom is not None:
+                        boundary_pcds.append(bgeom)
+                else:
+                    bpcd = o3d.geometry.PointCloud()
+                    bpcd.points = o3d.utility.Vector3dVector(bpts)
+                    bpcd.paint_uniform_color([0.5, 0.5, 0.5])
+                    boundary_pcds.append(bpcd)
 
-    # INR surface meshes
-    inr_meshes = []
-    for mesh_path in sorted(_glob.glob(os.path.join(out_dir, "inr_mesh_*.npz"))):
-        ci   = int(os.path.basename(mesh_path).replace("inr_mesh_", "").replace(".npz", ""))
+    # Fitted surface meshes (all surface types)
+    surface_meshes = []
+    for mesh_path in sorted(_glob.glob(os.path.join(out_dir, "surface_mesh_*.npz"))):
+        ci   = int(os.path.basename(mesh_path).replace("surface_mesh_", "").replace(".npz", ""))
         d    = np.load(mesh_path)
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
         mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
         mesh.compute_vertex_normals()
         mesh.paint_uniform_color(clust_colors[ci].tolist())
-        inr_meshes.append(mesh)
+        surface_meshes.append(mesh)
 
     # Vertices
     vertex_pcd  = None
@@ -120,19 +180,24 @@ def run_visualize(args):
     vis2.get_render_option().point_size = 8.0
 
     vis3 = o3d.visualization.Visualizer()
-    vis3.create_window("Point clouds + trimmed curves", width=W, height=H,
-                       left=0, top=50 + H + 40)
+
+    vis3.create_window("Point clouds + trimmed curves + boundary strips",
+                       width=W, height=H, left=0, top=50 + H + 40)
     for pcd in cluster_pcds:
         vis3.add_geometry(pcd)
     for ls in trimmed_linesets:
         vis3.add_geometry(ls)
+    for bpcd in boundary_pcds:
+        vis3.add_geometry(bpcd)
     vis3.get_render_option().point_size = 2.0
 
     vis4 = o3d.visualization.Visualizer()
-    vis4.create_window("INR surfaces", width=W, height=H, left=W, top=50 + H + 40)
-    for mesh in inr_meshes:
+    vis4.create_window("Fitted surfaces", width=W, height=H, left=W, top=50 + H + 40)
+    for mesh in surface_meshes:
         vis4.add_geometry(mesh)
 
+    vis3.get_render_option().mesh_show_back_face = True
+    vis4.get_render_option().mesh_show_back_face = True
     visualizers = [vis1, vis2, vis3, vis4]
     running     = [True] * len(visualizers)
     while all(running):
@@ -230,7 +295,14 @@ def run_compute(args):
 
     adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters, threshold_factor = 1.5)
     print(f"\nSpacing={spacing:.5f}  threshold={threshold:.5f}")
-    print(f"Adjacent pairs: {adjacency_pairs(adj)}\n")
+    print(f"Adjacent pairs: {adjacency_pairs(adj)}")
+    for (i, j), bpts in sorted(boundary_strips.items()):
+        print(f"  boundary ({i},{j}): {len(bpts)} points")
+    print()
+
+    # Remove everything from previous runs
+    for _stale in _glob.glob(os.path.join(out_dir, "*")):
+        os.remove(_stale)
 
     # ------------------------------------------------------------------
     # Save metadata + cluster files so the visualizer always has
@@ -247,13 +319,12 @@ def run_compute(args):
     )
     for i, cluster in enumerate(clusters):
         np.save(os.path.join(out_dir, f"cluster_{i}.npy"), cluster)
-    for i, (sid, mesh) in enumerate(zip(surface_ids, fit_meshes)):
-        if sid == SURFACE_INR:
-            np.savez(
-                os.path.join(out_dir, f"inr_mesh_{i}.npz"),
-                vertices  = np.asarray(mesh.vertices),
-                triangles = np.asarray(mesh.triangles),
-            )
+    for i, mesh in enumerate(fit_meshes):
+        np.savez(
+            os.path.join(out_dir, f"surface_mesh_{i}.npz"),
+            vertices  = np.asarray(mesh.vertices),
+            triangles = np.asarray(mesh.triangles),
+        )
     print(f"Cluster files saved to {out_dir}/")
 
     # ------------------------------------------------------------------
@@ -285,6 +356,10 @@ def run_compute(args):
             n_curves           = len(inter_trim["curves"]),
             n_untrimmed_curves = len(inter_raw["curves"]),
         )
+        boundary_pts = boundary_strips.get((i, j), np.empty((0, 3)))
+        kw["n_boundary_pts"] = len(boundary_pts)
+        if len(boundary_pts) > 0:
+            kw["boundary_pts"] = boundary_pts
         for k, curve in enumerate(inter_trim["curves"]):
             t0, t1 = curve.FirstParameter(), curve.LastParameter()
             p0, p1 = curve.Value(t0), curve.Value(t1)
@@ -295,7 +370,10 @@ def run_compute(args):
             )
             print(f"  trimmed  curve[{k}] [{t0:.6f}, {t1:.6f}]"
                   f"  endpoint_dist={endpoint_dist:.6e}")
-            kw[f"curve_points_{k}"] = sample_curve(curve, n_points=200, line_extent=1.0)
+            kw[f"curve_points_{k}"] = sample_curve(
+                curve, boundary_pts=boundary_pts, threshold=threshold,
+                n_points=200, extension_factor=0.15,
+            )
         for k, curve in enumerate(inter_raw["curves"]):
             print(f"  raw      curve[{k}]"
                   f" [{curve.FirstParameter():.6f}, {curve.LastParameter():.6f}]")
@@ -333,7 +411,7 @@ def run_compute(args):
     print_face_wires_summary(face_wires)
 
     # ------------------------------------------------------------------
-    # Step 5a: BRep assembly — manual arc/wire approach
+    # Step 4a: BRep assembly — manual arc/wire approach
     # ------------------------------------------------------------------
     step_path = os.path.join(out_dir, f"{pc_id}.step")
     shape = build_brep_shape(face_arcs, occ_surfs, vertices,
@@ -343,7 +421,7 @@ def run_compute(args):
     export_step(shape, step_path)
 
     # ------------------------------------------------------------------
-    # Step 5b: BRep assembly — BOPAlgo_MakerVolume approach
+    # Step 4b: BRep assembly — BOPAlgo_MakerVolume approach
     # ------------------------------------------------------------------
     # step_path_bop = os.path.join(out_dir, f"{pc_id}_bop.step")
     # shape_bop = build_brep_shape_bop(occ_surfs, clusters, adj, tolerance=1e-3, margin=0.1)
@@ -370,6 +448,9 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="output_brep",
                         help="Directory for saved results")
     parser.add_argument("-seed", type=int, default=41, help="Reproducibility seed")
+    parser.add_argument("--boundary_mesh", action="store_true",
+                        help="Visualize boundary strips as filled Delaunay meshes "
+                             "instead of point clouds (visualize mode only)")
     parser.add_argument("--bspline_method", type=str, default="uv_bounds",
                         choices=["uv_bounds", "explicit_pcurve"],
                         help="How BSpline (INR) faces are constructed. "
