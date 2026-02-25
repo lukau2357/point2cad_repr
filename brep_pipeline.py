@@ -293,12 +293,25 @@ def run_compute(args):
         )
         print(f"Cluster {cid}: {SURFACE_NAMES[sid]}")
 
-    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters, threshold_factor = 1.8, percentile = 98)
+    adj, threshold, spacing, boundary_strips, per_pair_thresholds = compute_adjacency_matrix(clusters, threshold_factor=args.threshold_factor)
     print(f"\nSpacing={spacing:.5f}  threshold={threshold:.5f}")
     print(f"Adjacent pairs: {adjacency_pairs(adj)}")
     for (i, j), bpts in sorted(boundary_strips.items()):
         print(f"  boundary ({i},{j}): {len(bpts)} points")
     print()
+
+    # Build the adjacency matrix used for intersection computation.
+    # In full-adjacency mode every surface pair is intersected; the
+    # compute_adjacency_matrix result is still used for spacing / logging.
+    if args.full_adjacency:
+        n_surf   = len(clusters)
+        inter_adj = np.ones((n_surf, n_surf), dtype=bool)
+        np.fill_diagonal(inter_adj, False)
+        print(f"[full_adjacency] intersecting all {n_surf * (n_surf - 1) // 2} pairs")
+        threshold_vertex = args.k_real * spacing
+    else:
+        inter_adj        = adj
+        threshold_vertex = 1e-4   # unchanged from original pipeline
 
     # Remove everything from previous runs
     for _stale in _glob.glob(os.path.join(out_dir, "*")):
@@ -331,11 +344,21 @@ def run_compute(args):
     # Surface-surface intersection + trimming
     # ------------------------------------------------------------------
     raw_intersections   = compute_all_intersections(
-        adj, surface_ids, fit_results, occ_surfs
+        inter_adj, surface_ids, fit_results, occ_surfs
     )
-    trim_intersections_ = trim_intersections(
-        raw_intersections, boundary_strips, threshold, extension_factor=0.15
-    )
+    if args.full_adjacency:
+        trim_intersections_ = trim_intersections(
+            raw_intersections, clusters,
+            k_real=args.k_real, k_strip=args.k_strip,
+            extension_factor=0.15,
+        )
+    else:
+        trim_intersections_ = trim_intersections(
+            raw_intersections, clusters,
+            boundary_strips=boundary_strips, threshold=threshold,
+            per_pair_thresholds=per_pair_thresholds,
+            extension_factor=0.15,
+        )
 
     # Sample curves to numpy for the visualizer (no OCC on host).
     for (i, j) in raw_intersections:
@@ -356,7 +379,7 @@ def run_compute(args):
             n_curves           = len(inter_trim["curves"]),
             n_untrimmed_curves = len(inter_raw["curves"]),
         )
-        boundary_pts = boundary_strips.get((i, j), np.empty((0, 3)))
+        boundary_pts = inter_trim.get("boundary_pts", np.empty((0, 3)))
         kw["n_boundary_pts"] = len(boundary_pts)
         if len(boundary_pts) > 0:
             kw["boundary_pts"] = boundary_pts
@@ -385,7 +408,8 @@ def run_compute(args):
     # ------------------------------------------------------------------
     # Vertex finding
     # ------------------------------------------------------------------
-    vertices, vertex_edges = compute_vertices(adj, trim_intersections_)
+    vertices, vertex_edges = compute_vertices(inter_adj, trim_intersections_,
+                                               threshold=threshold_vertex)
     print(f"Found {len(vertices)} vertices")
     np.savez(os.path.join(out_dir, "vertices.npz"), vertices=vertices)
 
@@ -448,14 +472,27 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="output_brep",
                         help="Directory for saved results")
     parser.add_argument("-seed", type=int, default=41, help="Reproducibility seed")
+    parser.add_argument("--threshold_factor", type=float, default=1.3,
+                        help="Adjacency detection threshold = threshold_factor * "
+                             "per-pair local spacing")
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
                              "instead of point clouds (visualize mode only)", default = True)
+    parser.add_argument("--full_adjacency", action="store_true",
+                        help="Intersect all surface pairs, not just adjacent ones; "
+                             "uses curve-proximity phantom filtering instead of "
+                             "pre-computed boundary strips")
+    parser.add_argument("--k_real", type=float, default=4.0,
+                        help="[full adjacency] phantom detection threshold = "
+                             "k_real * per-pair inter-cluster median NN distance")
+    parser.add_argument("--k_strip", type=float, default=1.8,
+                        help="[full adjacency] boundary-strip threshold = "
+                             "k_strip * per-pair inter-cluster median NN distance")
     parser.add_argument("--bspline_method", type=str, default="uv_bounds",
                         choices=["uv_bounds", "explicit_pcurve"],
                         help="How BSpline (INR) faces are constructed. "
                              "'uv_bounds': rectangular UV-bounds face, sewing "
-                             "bridges the gap to adjacent analytical faces (default). "
+                             "bridges the gap to adjacent analytical faces. "
                              "'explicit_pcurve': wire-based face with pcurves "
                              "computed by breplib.BuildCurve2d for each edge.")
     args = parser.parse_args()

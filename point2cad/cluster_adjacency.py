@@ -7,47 +7,60 @@ def _reference_spacing(clusters):
     nn_dists = []
     for cluster in clusters:
         tree = KDTree(cluster)
-        d, _ = tree.query(cluster, k = 2)  # k=2: skip self-match
-        # if for point x in cluster C y is the closest, then for point y x is the closest point in C
-        # if distance(x, y) = l, l will be repeated in the resuling array two times. Could perhaps bias median computation?
+        d, _ = tree.query(cluster, k=2)
         nn_dists.append(d[:, 1])
     return float(np.median(np.concatenate(nn_dists)))
 
 
-def compute_adjacency_matrix(clusters, percentile = 98, threshold_factor = 1.5, spacing = None):
+def _local_spacing(cluster):
+    """Median nearest-neighbour distance within a single cluster."""
+    tree = KDTree(cluster)
+    d, _ = tree.query(cluster, k=2)
+    return float(np.median(d[:, 1]))
+
+
+def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None):
     """
     Compute the symmetric cluster adjacency matrix.
 
-    For each ordered pair (i, j) with i < j, build a KDTree from the larger
-    cluster and query every point in the smaller cluster. The representative
-    distance is the (100 - percentile)th percentile of those NN distances
-    (e.g. percentile=98 → 2nd percentile = robust minimum). Clusters are
-    declared adjacent when that distance is within threshold_factor * spacing.
+    Adjacency is determined per cluster pair using an adaptive threshold:
+
+        threshold_ij = threshold_factor * max(local_spacing_i, local_spacing_j)
+
+    where local_spacing_k is the median NN distance within cluster k alone.
+    Two clusters are adjacent when the minimum NN distance from the smaller
+    to the larger is within threshold_ij.  Using the per-cluster local spacing
+    handles uneven sampling densities: sparse clusters get a proportionally
+    larger threshold so narrow shared boundaries are not missed.
 
     Args:
         clusters:         list of np.ndarray (Ni, 3)
-        percentile:       configurable robustness knob, e.g. 98 or 99
-        threshold_factor: adjacency threshold = threshold_factor * spacing
-        spacing:          reference point spacing; computed from clusters if None
+        threshold_factor: adjacency threshold = threshold_factor * local_spacing
+        spacing:          if provided, used as the global reference spacing
+                          returned for downstream consumers; does not affect
+                          the per-pair adaptive detection logic.
 
     Returns:
         adj:             (n, n) bool array, symmetric, diagonal is False
-        threshold:       distance threshold used
-        spacing:         reference spacing used
+        threshold:       global threshold (threshold_factor * global_spacing),
+                         returned for backward compatibility
+        spacing:         global reference spacing
         boundary_strips: dict (i, j) i<j -> (N, 3) float32 array, union of
                          boundary points from both clusters (points in smaller
-                         within threshold of larger, plus their NNs in larger).
+                         within threshold_ij of larger, plus their NNs in larger).
                          Only populated for adjacent pairs.
     """
     n = len(clusters)
 
     if spacing is None:
         spacing = _reference_spacing(clusters)
-    threshold = threshold_factor * spacing
+    global_threshold = threshold_factor * spacing
 
-    low_pct = 100 - percentile  # e.g. 98 → 2nd percentile of NN distances
-    adj = np.zeros((n, n), dtype = bool)
+    local_spacings = [_local_spacing(c) for c in clusters]
+
+    adj = np.zeros((n, n), dtype=bool)
     boundary_strips = {}
+    per_pair_thresholds = {}
 
     for i in range(n):
         for j in range(i + 1, n):
@@ -55,20 +68,21 @@ def compute_adjacency_matrix(clusters, percentile = 98, threshold_factor = 1.5, 
             larger, smaller = (ci, cj) if len(ci) >= len(cj) else (cj, ci)
 
             tree = KDTree(larger)
-            nn_dists, nn_idx = tree.query(smaller, k = 1)
-            close_dist = np.percentile(nn_dists, low_pct)
-            # close_dist = nn_dists.min()
-            if close_dist <= threshold:
-                adj[i, j] = adj[j, i] = True
+            nn_dists, nn_idx = tree.query(smaller, k=1)
 
-                mask         = nn_dists <= threshold
+            threshold_ij = threshold_factor * min(local_spacings[i], local_spacings[j])
+            if nn_dists.min() <= threshold_ij:
+                adj[i, j] = adj[j, i] = True
+                per_pair_thresholds[(i, j)] = threshold_ij
+
+                mask = nn_dists <= threshold_ij
                 strip_smaller = smaller[mask]
-                strip_larger  = larger[nn_idx[mask]]
+                strip_larger = larger[nn_idx[mask]]
                 boundary_strips[(i, j)] = np.vstack(
                     [strip_smaller, strip_larger]
                 ).astype(np.float32)
 
-    return adj, threshold, spacing, boundary_strips
+    return adj, global_threshold, spacing, boundary_strips, per_pair_thresholds
 
 def adjacency_pairs(adj):
     """Return list of (i, j) pairs with i < j where adj[i, j] is True."""
