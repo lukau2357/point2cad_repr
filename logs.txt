@@ -1,2 +1,146 @@
-https://archive.nyu.edu/bitstream/2451/44309/3/abc_0000_step_v00.7z
-https://archive.nyu.edu/bitstream/2451/44310/3/abc_0001_step_v00.7z
+Cluster 0: plane
+Cluster 1: plane
+Cluster 2: plane
+Cluster 3: plane
+Cluster 4: plane
+Cluster 5: cylinder
+
+Spacing=0.00387  threshold=0.00696
+Adjacent pairs: [(0, 2), (0, 5), (1, 2), (1, 4), (1, 5), (2, 3), (2, 4), (3, 5), (4, 5)]
+  boundary (0,2): 30 points
+  boundary (0,5): 36 points
+  boundary (1,2): 28 points
+  boundary (1,4): 24 points
+  boundary (1,5): 74 points
+  boundary (2,3): 92 points
+  boundary (2,4): 120 points
+  boundary (3,5): 296 points
+  boundary (4,5): 258 points
+
+Cluster files saved to output_brep/00000949/
+(0,2)  plane ∩ plane  type=line  method=analytical  raw=1  trimmed=1
+  trimmed  curve[0] [-0.123857, 0.100777]  endpoint_dist=2.246347e-01
+  raw      curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+(0,5)  plane ∩ cylinder  type=curve  method=occ  raw=1  trimmed=1
+  trimmed  curve[0] [0.000000, 6.283185]  endpoint_dist=2.743031e-17
+  raw      curve[0] [0.000000, 6.283185]
+(1,2)  plane ∩ plane  type=line  method=analytical  raw=1  trimmed=1
+  trimmed  curve[0] [-0.127800, 0.118487]  endpoint_dist=2.462877e-01
+  raw      curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+(1,4)  plane ∩ plane  type=line  method=analytical  raw=1  trimmed=1
+  trimmed  curve[0] [-0.051998, 0.065479]  endpoint_dist=1.174766e-01
+  raw      curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+(1,5)  plane ∩ cylinder  type=curve  method=occ  raw=1  trimmed=1
+  trimmed  curve[0] [0.000000, 6.283185]  endpoint_dist=2.743031e-17
+  raw      curve[0] [0.000000, 6.283185]
+(2,3)  plane ∩ plane  type=line  method=analytical  raw=1  trimmed=1
+  trimmed  curve[0] [-0.545486, 0.629004]  endpoint_dist=1.174489e+00
+  raw      curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+(2,4)  plane ∩ plane  type=line  method=analytical  raw=1  trimmed=1
+  trimmed  curve[0] [-0.646532, 0.580823]  endpoint_dist=1.227355e+00
+  raw      curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+(3,5)  plane ∩ cylinder  type=curve  method=occ  raw=2  trimmed=2
+  trimmed  curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]  endpoint_dist=4.000000e+100
+  trimmed  curve[1] [-0.640366, 0.638915]  endpoint_dist=1.279281e+00
+  raw      curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+  raw      curve[1] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+(4,5)  plane ∩ cylinder  type=curve  method=occ  raw=2  trimmed=2
+  trimmed  curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]  endpoint_dist=4.000000e+100
+  trimmed  curve[1] [-0.632017, 0.636692]  endpoint_dist=1.268710e+00
+  raw      curve[0] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+  raw      curve[1] [-20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000, 20000000000000000318057822195198360936721617127890562779562655115495677544340762121626939971713630208.000000]
+Found 12 vertices
+[topology] BasisCurve unavailable for edge (0, 5): split wrap-around at seam, added vertex 12
+[topology] BasisCurve unavailable for edge (1, 5): split wrap-around at seam, added vertex 13
+Edge arcs summary: 9 edges → 19 arcs total
+  edge (0, 2)  arc[0]  [-0.0998, 0.1002]  v_start=0  v_end=1  open
+  edge (0, 5)  arc[0]  [1.1004, 2.0275]  v_start=3  v_end=2  open
+  edge (0, 5)  arc[1]  [2.0275, 4.2420]  v_start=2  v_end=4  open
+  edge (0, 5)  arc[2]  [4.2420, 5.1691]  v_start=4  v_end=5  open
+  edge (0, 5)  arc[3]  [5.1691, 6.2832]  v_start=5  v_end=12  open
+  edge (0, 5)  arc[4]  [0.0000, 1.1004]  v_start=12  v_end=3  open
+  edge (1, 2)  arc[0]  [-0.1002, 0.0998]  v_start=6  v_end=7  open
+  edge (1, 4)  arc[0]  [-0.0390, 0.0610]  v_start=6  v_end=8  open
+  edge (1, 5)  arc[0]  [1.1004, 2.0275]  v_start=10  v_end=9  open
+  edge (1, 5)  arc[1]  [2.0275, 4.2420]  v_start=9  v_end=11  open
+  edge (1, 5)  arc[2]  [4.2420, 5.1691]  v_start=11  v_end=8  open
+  edge (1, 5)  arc[3]  [5.1691, 6.2832]  v_start=8  v_end=13  open
+  edge (1, 5)  arc[4]  [0.0000, 1.1004]  v_start=13  v_end=10  open
+  edge (2, 3)  arc[0]  [-0.5051, 0.4948]  v_start=7  v_end=0  open
+  edge (2, 4)  arc[0]  [-0.5051, 0.4948]  v_start=6  v_end=1  open
+  edge (3, 5)  arc[0]  [-0.5019, 0.4980]  v_start=9  v_end=2  open
+  edge (3, 5)  arc[1]  [-0.5019, 0.4980]  v_start=10  v_end=3  open
+  edge (4, 5)  arc[0]  [-0.5019, 0.4980]  v_start=11  v_end=4  open
+  edge (4, 5)  arc[1]  [-0.5019, 0.4980]  v_start=8  v_end=5  open
+Face arcs summary: 6 faces
+  face  0  arcs=6  (open=6  closed=0)
+  face  1  arcs=7  (open=7  closed=0)
+  face  2  arcs=4  (open=4  closed=0)
+  face  3  arcs=3  (open=3  closed=0)
+  face  4  arcs=4  (open=4  closed=0)
+  face  5  arcs=14  (open=14  closed=0)
+[topology] face 0: vertex 0 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 0: vertex 1 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 0: open chain at vertex 1 — wire left incomplete
+[topology] face 5: vertex 3 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 5: vertex 2 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 5: vertex 4 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 5: vertex 5 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 5: vertex 10 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 5: vertex 9 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 5: vertex 11 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 5: vertex 8 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 5: open chain at vertex 9 — wire left incomplete
+[topology] face 5: open chain at vertex 11 — wire left incomplete
+[topology] face 5: open chain at vertex 3 — wire left incomplete
+[topology] face 5: open chain at vertex 10 — wire left incomplete
+[topology] face 1: vertex 7 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 1: vertex 8 has odd degree 3 — topology is degenerate (missing or spurious arc)
+[topology] face 1: open chain at vertex 7 — wire left incomplete
+[topology] face 1: open chain at vertex 8 — wire left incomplete
+[topology] face 4: vertex 1 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[32;1m
+*******************************************************************
+******        Statistics on Transfer (Write)                 ******[0m
+[32;1m
+*******************************************************************
+******        Transfer Mode = 0  I.E.  As Is       ******[0m
+[32;1m******        Transferring Shape, ShapeType = 0                      ******[0m
+[32;1m** WorkSession : Sending all data[0m
+[32;1m Step File Name : output_brep/00000949/00000949.step(298 ents)  Write  Done[0m
+[topology] face 4: vertex 11 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 4: vertex 4 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 4: vertex 5 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 4: open chain at vertex 5 — wire left incomplete
+[topology] face 4: open chain at vertex 1 — wire left incomplete
+[topology] face 4: open chain at vertex 4 — wire left incomplete
+[topology] face 3: vertex 7 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 3: vertex 0 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 3: vertex 9 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 3: vertex 2 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 3: vertex 10 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 3: vertex 3 has odd degree 1 — topology is degenerate (missing or spurious arc)
+[topology] face 3: open chain at vertex 0 — wire left incomplete
+[topology] face 3: open chain at vertex 2 — wire left incomplete
+[topology] face 3: open chain at vertex 3 — wire left incomplete
+Wire assembly summary: 6 faces
+  face  0  wires=1
+    wire[0]  arcs=5  (3→2,fwd)  (2→4,fwd)  (4→5,fwd)  (5→12,fwd)  (12→3,fwd)
+  face  1  wires=0
+  face  2  wires=1
+    wire[0]  arcs=4  (0→1,fwd)  (6→1,rev)  (6→7,fwd)  (7→0,fwd)
+  face  3  wires=0
+  face  4  wires=0
+  face  5  wires=1
+    wire[0]  arcs=4  (3→2,fwd)  (9→2,rev)  (10→9,rev)  (10→3,fwd)
+[brep] face 1: no wires — skipping
+[brep] face 4: no wires — skipping
+[brep] face 3: no wires — skipping
+[brep] Sewing faces ...
+[brep] Fixing shape ...
+[brep] SameParameter done
+[brep] OrientClosedSolid: skipped (shape type 0, expected shell or solid)
+[brep] Results of BRep correctness analyzer: True
+STEP written to output_brep/00000949/00000949.step
+
+All results saved to output_brep/00000949/

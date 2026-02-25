@@ -927,3 +927,127 @@ C. *BRepAlgoAPI splitter.*  Build each surface as a large finite patch and each
 D. *Accept open shell.*  For applications requiring only visualization and
    measurement (not solid booleans), an open shell of individually correct face
    patches is sufficient.  Export each face as a separate STEP entity.
+
+---
+
+## 12 — Denormalisation: inverting the input normalisation on the output shape
+
+The pipeline normalises the input point cloud before fitting.  The forward
+transform is:
+
+$$
+P_\text{norm} = \frac{1}{s} \, R \, (P - \bar{P})
+$$
+
+where $\bar{P}$ is the point-cloud mean, $R$ is a rotation matrix (PCA-derived,
+orthogonal), and $s = \max(\text{extents})$ is the largest bounding-box extent.
+The inverse (denormalisation) is:
+
+$$
+P_\text{real} = s \, R^\top P_\text{norm} + \bar{P}
+$$
+
+This is a **similarity transform** (uniform scale + rotation + translation) and
+is therefore exactly representable as a single `gp_Trsf`.  Once the assembled
+`TopoDS_Shape` is available, a single `BRepBuilderAPI_Transform` call applies
+the inverse to all faces, edges, and vertices at once — no per-surface parameter
+manipulation is required.
+
+### Implementation
+
+```python
+import numpy as np
+from OCC.Core.gp               import gp_Trsf, gp_Vec, gp_Pnt
+from OCC.Core.BRepBuilderAPI   import BRepBuilderAPI_Transform
+
+
+def normalize_points(pts):
+    """
+    Returns (pts_norm, mean, R, scale).
+    Store mean, R, scale to denormalise the output shape later.
+    Uses eigh (not eig): the scatter matrix pts.T @ pts is symmetric PSD,
+    so eigh guarantees real eigenvalues sorted in ascending order.
+    """
+    mean = pts.mean(axis=0)
+    pts  = pts - mean
+    _, U = np.linalg.eigh(pts.T @ pts)      # columns = eigenvectors, ascending order
+    R    = rotation_matrix_a_to_b(U[:, 0], np.array([1.0, 0.0, 0.0]))
+    pts  = (R @ pts.T).T
+    extents = pts.max(axis=0) - pts.min(axis=0)
+    scale   = float(np.max(extents)) + 1e-7
+    return (pts / scale).astype(np.float32), mean, R, scale
+
+
+def build_denorm_trsf(mean: np.ndarray, R: np.ndarray, scale: float) -> gp_Trsf:
+    """
+    Build the gp_Trsf that inverts the normalisation:
+        P_real = scale * R^T * P_norm + mean
+
+    Decomposed as three similarity transforms composed right-to-left
+    (innermost applied first):
+        T_denorm = T_translate(+mean) * T_rotate(R^T) * T_scale(scale)
+
+    gp_Trsf.Multiply right-appends:  me = me * arg  (arg is applied first),
+    so starting from the outermost (translation) and multiplying inward gives
+    the correct composition order.
+    """
+    # Pure rotation by R^T  (scale = 1, translation = 0)
+    Rt    = R.T
+    t_rot = gp_Trsf()
+    t_rot.SetValues(
+        Rt[0, 0], Rt[0, 1], Rt[0, 2], 0.0,
+        Rt[1, 0], Rt[1, 1], Rt[1, 2], 0.0,
+        Rt[2, 0], Rt[2, 1], Rt[2, 2], 0.0,
+    )
+
+    # Uniform scaling by scale about the origin
+    t_scale = gp_Trsf()
+    t_scale.SetScale(gp_Pnt(0.0, 0.0, 0.0), scale)
+
+    # Translation by +mean  (initialise t_denorm here — outermost operation)
+    t_denorm = gp_Trsf()
+    t_denorm.SetTranslation(gp_Vec(float(mean[0]), float(mean[1]), float(mean[2])))
+
+    # Compose: T_translate * T_rotate * T_scale
+    t_denorm.Multiply(t_rot)    # → T_translate * T_rotate
+    t_denorm.Multiply(t_scale)  # → T_translate * T_rotate * T_scale
+
+    return t_denorm
+
+
+def apply_denorm_to_shape(shape, mean, R, scale):
+    """Apply the denormalisation transform to an assembled TopoDS_Shape."""
+    trsf = build_denorm_trsf(mean, R, scale)
+    # copy=True: returns a new shape rather than modifying in place
+    return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+```
+
+### Alternative: build the forward transform and invert it
+
+If the forward `gp_Trsf` is already available (e.g. built during normalisation),
+`gp_Trsf.Inverted()` avoids constructing the inverse manually:
+
+```python
+def build_fwd_trsf(mean, R, scale):
+    t_trans = gp_Trsf()
+    t_trans.SetTranslation(gp_Vec(-float(mean[0]), -float(mean[1]), -float(mean[2])))
+
+    t_rot = gp_Trsf()
+    t_rot.SetValues(
+        R[0, 0], R[0, 1], R[0, 2], 0.0,
+        R[1, 0], R[1, 1], R[1, 2], 0.0,
+        R[2, 0], R[2, 1], R[2, 2], 0.0,
+    )
+
+    t_scale = gp_Trsf()
+    t_scale.SetScale(gp_Pnt(0.0, 0.0, 0.0), 1.0 / scale)
+
+    t_fwd = gp_Trsf()
+    t_fwd.SetTranslation(gp_Vec(-float(mean[0]), -float(mean[1]), -float(mean[2])))
+    t_fwd.Multiply(t_rot)
+    t_fwd.Multiply(t_scale)
+    return t_fwd
+
+t_inv = build_fwd_trsf(mean, R, scale).Inverted()
+shape_real = BRepBuilderAPI_Transform(shape, t_inv, True).Shape()
+```

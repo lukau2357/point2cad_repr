@@ -245,7 +245,7 @@ def run_compute(args):
 
     def normalize_points(pts):
         pts = pts - np.mean(pts, axis=0, keepdims=True)
-        S, U = np.linalg.eig(pts.T @ pts)
+        S, U = np.linalg.eigh(pts.T @ pts)
         R    = pfu.rotation_matrix_a_to_b(U[:, np.argmin(S)], np.array([1, 0, 0]))
         pts  = (R @ pts.T).T
         extents = np.max(pts, axis=0) - np.min(pts, axis=0)
@@ -293,7 +293,7 @@ def run_compute(args):
         )
         print(f"Cluster {cid}: {SURFACE_NAMES[sid]}")
 
-    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters, threshold_factor = 1.5)
+    adj, threshold, spacing, boundary_strips = compute_adjacency_matrix(clusters, threshold_factor = 1.8, percentile = 98)
     print(f"\nSpacing={spacing:.5f}  threshold={threshold:.5f}")
     print(f"Adjacent pairs: {adjacency_pairs(adj)}")
     for (i, j), bpts in sorted(boundary_strips.items()):
@@ -450,7 +450,7 @@ if __name__ == "__main__":
     parser.add_argument("-seed", type=int, default=41, help="Reproducibility seed")
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
-                             "instead of point clouds (visualize mode only)")
+                             "instead of point clouds (visualize mode only)", default = True)
     parser.add_argument("--bspline_method", type=str, default="uv_bounds",
                         choices=["uv_bounds", "explicit_pcurve"],
                         help="How BSpline (INR) faces are constructed. "

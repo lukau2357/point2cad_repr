@@ -1,11 +1,30 @@
-import numpy as np, glob, os         
-out_dir = '/home/lukau/Desktop/point2cad_repr/output_brep/00949'                              
-for p in sorted(glob.glob(os.path.join(out_dir, 'inter_*.npz')))[:3]:
-    d = np.load(p, allow_pickle=True)
-    print(os.path.basename(p), 'type=', str(d['curve_type']), 'n_curves=', int(d['n_curves']))
-    for k in range(int(d['n_curves'])):          
-        pts = d[f'curve_points_{k}']          
-        print(f'  curve_points_{k}: shape={pts.shape}  min={pts.min(0)}  max={pts.max(0)}')          
-    for k in range(int(d['n_untrimmed_curves'])):
-        pts = d[f'untrimmed_curve_points_{k}']
-        print(f'  untrimmed_curve_points_{k}: shape={pts.shape}  min={pts.min(0)}  max={pts.max(0)}')
+import os, glob
+
+from OCC.Core.STEPControl import STEPControl_Reader
+from OCC.Core.TopExp      import TopExp_Explorer
+from OCC.Core.TopAbs      import TopAbs_FACE
+from OCC.Core.TopoDS           import topods
+from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+
+step_id = "00000000"
+step_path = "../abc_dataset/abc_0000_step_v00"
+step_path = os.path.join(step_path, step_id)
+steps = glob.glob(os.path.join(step_path, "*.step"))
+
+if not steps:
+    print("No step file found for given ID")
+    exit(0)
+
+step = steps[0]
+reader = STEPControl_Reader()
+reader.ReadFile(step)
+reader.TransferRoots()
+shape = reader.OneShape()
+
+exp = TopExp_Explorer(shape, TopAbs_FACE)
+while exp.More():
+    face    = topods.Face(exp.Current())
+    adaptor = BRepAdaptor_Surface(face)
+    stype   = adaptor.GetType()   # GeomAbs_Plane, GeomAbs_Cylinder, etc.
+    print(stype)
+    exp.Next()

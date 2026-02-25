@@ -57,7 +57,7 @@ def compute_adjacency_matrix(clusters, percentile = 98, threshold_factor = 1.5, 
             tree = KDTree(larger)
             nn_dists, nn_idx = tree.query(smaller, k = 1)
             close_dist = np.percentile(nn_dists, low_pct)
-
+            # close_dist = nn_dists.min()
             if close_dist <= threshold:
                 adj[i, j] = adj[j, i] = True
 
