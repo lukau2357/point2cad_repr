@@ -63,30 +63,6 @@ def _gp_dir(v):
 def _result(curves, points, curve_type, method):
     return {"curves": curves, "points": points, "type": curve_type, "method": method}
 
-def _curve_sample_range(curve, cluster_pts):
-    """Return a finite (t0, t1) sampling range for a curve.
-
-    For compact curves the existing parameter bounds are used.
-    For infinite curves (Geom_Line from plane∩plane) the range is clamped to
-    a bounding-box diagonal centred on the projection of the cluster centroid
-    onto the curve.
-    """
-    t0 = curve.FirstParameter()
-    t1 = curve.LastParameter()
-    if abs(t0) < _OCC_INF and abs(t1) < _OCC_INF:
-        return float(t0), float(t1)
-    # Infinite bounds: project the cluster centroid onto the line to find a
-    # sensible centre parameter, then span ± bbox diagonal from there.
-    bbox_min = cluster_pts.min(axis=0)
-    bbox_max = cluster_pts.max(axis=0)
-    diag     = float(np.linalg.norm(bbox_max - bbox_min))
-    centroid = cluster_pts.mean(axis=0)
-    proj = GeomAPI_ProjectPointOnCurve(
-        gp_Pnt(float(centroid[0]), float(centroid[1]), float(centroid[2])), curve
-    )
-    t_center = float(proj.LowerDistanceParameter()) if proj.NbPoints() > 0 else 0.0
-    return t_center - diag, t_center + diag
-
 # ---------------------------------------------------------------------------
 # Analytical intersections
 # ---------------------------------------------------------------------------
@@ -304,191 +280,195 @@ def sample_curve(curve, boundary_pts=None, threshold=None,
 
 
 # ---------------------------------------------------------------------------
-# Curve trimming
+# Curve trimming (vertex-based)
 # ---------------------------------------------------------------------------
 
-def trim_curve(curve, boundary_pts, threshold, extension_factor = 0.05):
-    """
-    Trim a Geom_Curve to the portion covering the shared boundary.
 
-    Only curves with at least one infinite parameter bound are trimmed.
-    Curves with a compact (finite) parameter domain — such as Geom_TrimmedCurve
-    returned by GeomAPI_IntSS or Geom_Circle — are returned unchanged; they are
-    continuous functions on a compact set and their existing bounds are
-    already well-defined.
+_CLOSURE_TOL = 1e-7   # mirrors topology.CLOSURE_TOL
 
-    For infinite curves (e.g. Geom_Line from plane∩plane), the trim interval
-    [t_min, t_max] is computed by projecting boundary_pts onto the curve and
-    taking the span of the projected parameters.  The interval is then extended
-    symmetrically by extension_factor * span on each side to avoid gaps at the
-    trimmed endpoints.
 
-    Parameters
-    ----------
-    curve            : Geom_Curve
-    boundary_pts     : (N, 3) float array — boundary strip (from compute_adjacency_matrix)
-    threshold        : adjacency threshold used as projection tolerance
-    extension_factor : relative extension applied symmetrically to the trim
-                       interval (default 0.05 → 5 % of span on each side)
-    """
+def _curve_is_closed(curve):
+    """True when C(t_min) and C(t_max) coincide — mirrors topology.curve_is_closed."""
     t0 = curve.FirstParameter()
     t1 = curve.LastParameter()
-
-    # Compact parameter space → leave the curve unchanged
-    if abs(t0) < _OCC_INF and abs(t1) < _OCC_INF:
-        return curve
-
-    if len(boundary_pts) == 0:
-        return curve
-
-    params = []
-    for pt in boundary_pts:
-        # https://dev.opencascade.org/doc/refman/html/class_geom2d_a_p_i___project_point_on_curve.html
-        proj = GeomAPI_ProjectPointOnCurve(
-            gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])), curve
-        )
-        if proj.NbPoints() > 0 and proj.LowerDistance() <= threshold:
-            params.append(proj.LowerDistanceParameter())
-
-    if len(params) < 2:
-        return curve
-
-    t_min = float(min(params))
-    t_max = float(max(params))
-
-    if t_max <= t_min:
-        return curve
-
-    span   = t_max - t_min
-    t_min -= extension_factor * span
-    t_max += extension_factor * span
-
-    try:
-        return Geom_TrimmedCurve(curve, t_min, t_max)
-    except Exception:
-        return curve
+    if abs(t0) >= _OCC_INF or abs(t1) >= _OCC_INF:
+        return False
+    p0 = curve.Value(t0)
+    p1 = curve.Value(t1)
+    return math.sqrt(
+        (p1.X() - p0.X()) ** 2 +
+        (p1.Y() - p0.Y()) ** 2 +
+        (p1.Z() - p0.Z()) ** 2
+    ) < _CLOSURE_TOL
 
 
-def trim_intersections(intersections, clusters,
-                       boundary_strips=None, threshold=None,
-                       per_pair_thresholds=None,
-                       k_real=4.0, k_strip=1.8, n_samples=80,
-                       extension_factor=0.05):
+def filter_vertices_by_proximity(vertices, vertex_edges,
+                                  cluster_means, cluster_sigma_inv,
+                                  chi2_threshold):
     """
-    Trim intersection curves to their shared boundary portions.
+    Remove vertices outside the Mahalanobis ellipsoid of any constituent cluster.
 
-    Two modes are supported, selected by whether *boundary_strips* is provided:
-
-    **Constrained adjacency** (``boundary_strips`` is not None)
-        Original flow, unchanged.  Pre-computed boundary strips from
-        ``compute_adjacency_matrix`` are used directly with ``trim_curve``.
-        All raw curves are kept; no phantom filtering is performed.
-
-    **Full adjacency** (``boundary_strips`` is None)
-        New flow.  For each pair (i, j) a per-pair reference spacing is
-        computed as the median NN distance from the smaller cluster to the
-        larger cluster.  Each curve is sampled at *n_samples* points and
-        queried against ``clusters[i] ∪ clusters[j]``:
-
-        - ``d.min() > k_real * pair_spacing`` → phantom curve, discard.
-        - Otherwise cluster points within ``k_strip * pair_spacing`` of the
-          curve become the boundary strip for trimming.
-
-        Any curve still infinite after trimming is also discarded.
-
-    In both modes every result dict in the returned mapping gains a
-    ``"boundary_pts"`` key: the (M, 3) float32 array of boundary points for
-    that pair (empty when none exist).
+    For each vertex, every cluster involved in its incident edges must
+    satisfy  (v - mu)^T Sigma_inv (v - mu) <= chi2_threshold.
 
     Parameters
     ----------
-    intersections    : dict (i, j) -> result dict (from compute_all_intersections)
-    clusters         : list of (Ni, 3) float arrays — one per surface cluster
-    boundary_strips  : dict (i, j) -> (N, 3) float32, or None for full adjacency
-    threshold        : adjacency threshold used by the constrained flow
-    k_real           : phantom detection multiplier  [full adjacency only]
-    k_strip          : boundary-strip multiplier      [full adjacency only]
-    n_samples        : sample points per curve        [full adjacency only]
-    extension_factor : relative extension passed to trim_curve
+    vertices           : (M, 3) float64 array
+    vertex_edges       : list[set] of length M
+    cluster_means      : list of (3,) arrays
+    cluster_sigma_inv  : list of (3, 3) arrays
+    chi2_threshold     : float
+
+    Returns
+    -------
+    filtered vertices (M', 3) and the corresponding vertex_edges list.
+    """
+    if len(vertices) == 0:
+        return vertices, vertex_edges
+
+    keep = []
+    for vpos, edges in zip(vertices, vertex_edges):
+        involved = set()
+        for edge in edges:
+            involved.update(edge)
+
+        ok = True
+        for cidx in involved:
+            diff = vpos - cluster_means[cidx]
+            d2 = diff @ cluster_sigma_inv[cidx] @ diff
+            if d2 > chi2_threshold:
+                ok = False
+                break
+        keep.append(ok)
+
+    keep = np.array(keep, dtype=bool)
+    return vertices[keep], [vertex_edges[i] for i in range(len(vertex_edges)) if keep[i]]
+
+
+def trim_by_vertices(raw_intersections, vertices, vertex_edges,
+                     extension_factor=0.05,
+                     phantom_vertex_dist=1e-3):
+    """
+    Trim intersection curves using vertex parameters.
+
+    * **Closed curves**: left unchanged — ``build_edge_arcs`` splits them at
+      their vertices; trimming here would discard the wrap-around arc needed
+      by the second adjacent face.
+
+    * **Phantom filter**: when an edge has multiple open curves (e.g. OCC
+      returns both generators of a cylinder for a plane∩cylinder pair),
+      vertex attribution is edge-level so both curves see the same incident
+      vertices.  The real curve has those vertices ON it (projection distance
+      ≈ 0); the phantom generator is ~2·radius away.  Any open curve whose
+      minimum vertex projection distance exceeds ``phantom_vertex_dist`` is
+      discarded.  The filter is skipped when fewer than 2 vertices are
+      available (fail-safe).
+
+    * **Open curves with ≥ 2 incident vertices**: trimmed to
+      ``[t_min − ext, t_max + ext]`` where ``t_min``/``t_max`` are the
+      parameters obtained by projecting the incident vertices onto the curve
+      and ``ext = extension_factor * span``.
+
+    * **Open curves with < 2 incident vertices**:
+        - Already compact (finite OCC bounds): kept as-is.
+        - Infinite bounds: discarded (no vertex support to guide trimming).
+
+    * Curves still infinite after trimming: discarded.
+
+    Parameters
+    ----------
+    raw_intersections  : dict (i,j) -> result dict
+    vertices           : (M, 3) float64 array
+    vertex_edges       : list[set] of length M
+    extension_factor   : relative extension applied to the trim interval
+    phantom_vertex_dist: curves whose closest incident-vertex projection
+                         distance exceeds this are discarded as phantoms
+                         (default 1e-3; real curves have distance ≈ 0,
+                         phantom generators have distance ≈ 2·radius)
     """
     trimmed = {}
 
-    # ------------------------------------------------------------------
-    # Constrained adjacency: original flow
-    # ------------------------------------------------------------------
-    if boundary_strips is not None:
-        for (i, j), inter in intersections.items():
-            bpts = boundary_strips.get((i, j), np.empty((0, 3), dtype=np.float32))
-            # Use per-pair threshold for projection check if available,
-            # otherwise fall back to the global threshold.
-            thr = (per_pair_thresholds.get((i, j), threshold)
-                   if per_pair_thresholds is not None else threshold)
-            new_curves = []
-            for c in inter["curves"]:
-                tc = trim_curve(c, bpts, thr, extension_factor)
-                if abs(tc.FirstParameter()) >= _OCC_INF or abs(tc.LastParameter()) >= _OCC_INF:
-                    continue  # still infinite after trimming — phantom, discard
-                new_curves.append(tc)
-            trimmed[(i, j)] = {
-                **inter,
-                "curves":       new_curves,
-                "boundary_pts": np.asarray(bpts, dtype=np.float32),
-            }
-        return trimmed
+    edge_to_vpos = {}
+    for v_idx in range(len(vertices)):
+        for edge in vertex_edges[v_idx]:
+            edge_to_vpos.setdefault(edge, []).append(vertices[v_idx])
 
-    # ------------------------------------------------------------------
-    # Full adjacency: phantom filtering + proximity-based boundary strips
-    # ------------------------------------------------------------------
-    for (i, j), inter in intersections.items():
-        if not inter["curves"]:
-            trimmed[(i, j)] = {**inter, "boundary_pts": np.empty((0, 3), dtype=np.float32)}
-            continue
+    for (i, j), inter in raw_intersections.items():
+        vpositions = edge_to_vpos.get((i, j), [])
 
-        ci, cj          = clusters[i], clusters[j]
-        larger, smaller = (ci, cj) if len(ci) >= len(cj) else (cj, ci)
-        inter_tree      = KDTree(larger)
-        inter_dists, _  = inter_tree.query(smaller, k=1)
-        pair_spacing    = float(np.median(inter_dists))
+        # Split into closed and open curves
+        closed_curves = []
+        open_curves   = []
+        for c in inter["curves"]:
+            (closed_curves if _curve_is_closed(c) else open_curves).append(c)
 
-        threshold_real  = k_real  * pair_spacing
-        threshold_strip = k_strip * pair_spacing
+        # ------------------------------------------------------------------
+        # Phantom filter: for edges with multiple open curves, discard those
+        # whose incident vertices are all far from the curve geometry.
+        # ------------------------------------------------------------------
+        if len(open_curves) > 1 and len(vpositions) >= 2:
+            def _min_vertex_dist(c):
+                best = float("inf")
+                for vpos in vpositions:
+                    proj = GeomAPI_ProjectPointOnCurve(
+                        gp_Pnt(float(vpos[0]), float(vpos[1]), float(vpos[2])), c
+                    )
+                    if proj.NbPoints() > 0:
+                        best = min(best, float(proj.LowerDistance()))
+                return best
 
-        cluster_pts = np.vstack([ci, cj]).astype(np.float64)
-        tree        = KDTree(cluster_pts)
+            dists = [_min_vertex_dist(c) for c in open_curves]
+            kept  = [c for c, d in zip(open_curves, dists) if d <= phantom_vertex_dist]
+            open_curves = kept if kept else open_curves  # fail-safe
 
-        keep_curves = []
-        all_bnd_idx = set()
+        # ------------------------------------------------------------------
+        # Trim surviving open curves by vertex parameters
+        # ------------------------------------------------------------------
+        new_curves = list(closed_curves)
 
-        for curve in inter["curves"]:
-            t0, t1 = _curve_sample_range(curve, cluster_pts)
-            sample_pts = np.zeros((n_samples, 3), dtype=np.float64)
-            for k, t in enumerate(np.linspace(t0, t1, n_samples)):
-                p = curve.Value(t)
-                sample_pts[k] = (p.X(), p.Y(), p.Z())
+        for c in open_curves:
+            t0_orig     = c.FirstParameter()
+            t1_orig     = c.LastParameter()
+            is_infinite = abs(t0_orig) >= _OCC_INF or abs(t1_orig) >= _OCC_INF
 
-            dists, idx = tree.query(sample_pts, k=1)
+            trimmed_c = None
+            if len(vpositions) >= 2:
+                params = []
+                for vpos in vpositions:
+                    proj = GeomAPI_ProjectPointOnCurve(
+                        gp_Pnt(float(vpos[0]), float(vpos[1]), float(vpos[2])), c
+                    )
+                    if proj.NbPoints() > 0:
+                        params.append(float(proj.LowerDistanceParameter()))
 
-            if float(dists.min()) > threshold_real:
-                continue   # phantom — discard
+                if len(params) >= 2:
+                    t_min = min(params)
+                    t_max = max(params)
+                    if t_max > t_min:
+                        span   = t_max - t_min
+                        t_min -= extension_factor * span
+                        t_max += extension_factor * span
+                        try:
+                            trimmed_c = Geom_TrimmedCurve(c, t_min, t_max)
+                        except Exception:
+                            pass
 
-            close_mask    = dists <= threshold_strip
-            curve_bnd_idx = np.unique(idx[close_mask])
-            all_bnd_idx.update(curve_bnd_idx.tolist())
+            if trimmed_c is None:
+                if is_infinite:
+                    continue   # no vertex support, can't trim — discard
+                trimmed_c = c  # compact OCC arc — keep as-is
 
-            curve_bpts = cluster_pts[curve_bnd_idx].astype(np.float32)
-            trimmed_c  = trim_curve(curve, curve_bpts, threshold_strip, extension_factor)
+            if (abs(trimmed_c.FirstParameter()) >= _OCC_INF or
+                    abs(trimmed_c.LastParameter()) >= _OCC_INF):
+                continue
 
-            tc0 = trimmed_c.FirstParameter()
-            tc1 = trimmed_c.LastParameter()
-            if abs(tc0) >= _OCC_INF or abs(tc1) >= _OCC_INF:
-                continue   # still infinite after trimming — discard
+            new_curves.append(trimmed_c)
 
-            keep_curves.append(trimmed_c)
-
-        bnd_arr = (cluster_pts[sorted(all_bnd_idx)].astype(np.float32)
-                   if all_bnd_idx else np.empty((0, 3), dtype=np.float32))
-
-        trimmed[(i, j)] = {**inter, "curves": keep_curves, "boundary_pts": bnd_arr}
+        trimmed[(i, j)] = {
+            **inter,
+            "curves":       new_curves,
+            "boundary_pts": np.empty((0, 3), dtype=np.float32),
+        }
 
     return trimmed
 
@@ -562,7 +542,10 @@ def compute_vertices(adj, intersections, threshold = 1e-4):
                     if best_dist < threshold:
                         for m in range(1, ext.NbExtrema() + 1):
                             if ext.Distance(m) <= best_dist + 1e-10:
-                                t1, t2 = ext.Parameters(m)
+                                try:
+                                    t1, t2 = ext.Parameters(m)
+                                except Exception:
+                                    continue
                                 p1 = ca.Value(t1)
                                 p2 = cb.Value(t2)
                                 midpoint = np.array([

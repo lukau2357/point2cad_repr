@@ -218,42 +218,33 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
                     t_first, v_first = incident_params[0]
                     t_wrap_end = t_first + span
 
+                    # For the wrap-around arc we need a curve that accepts
+                    # parameters beyond [t_min, t_max].  Three cases:
+                    #   1. Geom_TrimmedCurve → BasisCurve() gives the periodic basis
+                    #   2. Raw closed curve (e.g. Geom_Circle) → use it directly
+                    #   3. Non-closed, no BasisCurve → seam-split fallback
                     basis = _basis_curve(curve)
+                    if basis is None and curve_is_closed(curve):
+                        basis = curve
+                    wrap_ok = False
                     if basis is not None:
-                        arcs_for_edge.append({
-                            "curve":   _make_arc(basis, t_last, t_wrap_end),
-                            "v_start": v_last,
-                            "v_end":   v_first,
-                            "t_start": t_last,
-                            "t_end":   t_wrap_end,
-                            "closed":  False,
-                        })
-                    else:
-                        # Fallback: split wrap-around at the seam, insert a
-                        # synthetic seam vertex at C(t_min) = C(t_max).
-                        seam_idx = len(verts)
-                        verts.append(_pnt_to_np(curve.Value(t_min)))
-                        vedge_sets.append({edge_key})
-                        print(
-                            f"[topology] BasisCurve unavailable for edge {edge_key}: "
-                            f"split wrap-around at seam, added vertex {seam_idx}"
-                        )
-                        arcs_for_edge.append({
-                            "curve":   _make_arc(curve, t_last, t_max),
-                            "v_start": v_last,
-                            "v_end":   seam_idx,
-                            "t_start": t_last,
-                            "t_end":   t_max,
-                            "closed":  False,
-                        })
-                        arcs_for_edge.append({
-                            "curve":   _make_arc(curve, t_min, t_first),
-                            "v_start": seam_idx,
-                            "v_end":   v_first,
-                            "t_start": t_min,
-                            "t_end":   t_first,
-                            "closed":  False,
-                        })
+                        try:
+                            arcs_for_edge.append({
+                                "curve":   _make_arc(basis, t_last, t_wrap_end),
+                                "v_start": v_last,
+                                "v_end":   v_first,
+                                "t_start": t_last,
+                                "t_end":   t_wrap_end,
+                                "closed":  False,
+                            })
+                            wrap_ok = True
+                        except Exception:
+                            pass  # OCC rejected wrap parameters — skip arc
+                    if not wrap_ok:
+                        # Cannot represent wrap-around arc — skip it.
+                        # The interior arcs cover the genuine portion;
+                        # the back portion would be filtered anyway.
+                        pass
 
             else:
                 # Open curve.
@@ -284,6 +275,131 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
 
     out_vertices = np.array(verts, dtype=np.float64) if verts else np.zeros((0, 3))
     return edge_arcs, out_vertices, vedge_sets
+
+
+# ---------------------------------------------------------------------------
+# Step 1b — Proximity filters (curve-level and arc-level)
+# ---------------------------------------------------------------------------
+
+def _passes_mahal(curve, t0, t1,
+                   mu_i, sigma_inv_i, mu_j, sigma_inv_j, chi2_threshold,
+                   n_samples, min_close_fraction):
+    """
+    Return True if at least min_close_fraction of n_samples points sampled
+    uniformly on curve over [t0, t1] lie within the Mahalanobis ellipsoid
+    of both cluster i and cluster j.
+    Returns True when no point can be evaluated (safe default).
+    """
+    n_close = 0
+    n_total = 0
+    for k in range(n_samples):
+        t = t0 + (t1 - t0) * k / max(n_samples - 1, 1)
+        try:
+            p = curve.Value(t)
+            pt = np.array([p.X(), p.Y(), p.Z()])
+            n_total += 1
+            diff_i = pt - mu_i
+            diff_j = pt - mu_j
+            d2_i = diff_i @ sigma_inv_i @ diff_i
+            d2_j = diff_j @ sigma_inv_j @ diff_j
+            if d2_i <= chi2_threshold and d2_j <= chi2_threshold:
+                n_close += 1
+        except Exception:
+            pass
+    return n_total == 0 or n_close / n_total >= min_close_fraction
+
+
+def filter_curves_by_proximity(intersections,
+                                cluster_means, cluster_sigma_inv, chi2_threshold,
+                                n_samples=20, min_close_fraction=0.5):
+    """
+    Discard intersection curves not physically present on both adjacent surfaces.
+
+    For each curve on edge (i, j), n_samples points are sampled uniformly
+    and tested against the Mahalanobis ellipsoids of both cluster i and
+    cluster j.  Curves where fewer than min_close_fraction of sampled points
+    lie inside both ellipsoids are discarded.
+
+    Parameters
+    ----------
+    intersections        : dict (i,j) -> {"curves": list[Geom_Curve], ...}
+    cluster_means        : list of (3,) arrays
+    cluster_sigma_inv    : list of (3,3) arrays
+    chi2_threshold       : float
+    n_samples            : int
+    min_close_fraction   : float
+
+    Returns
+    -------
+    filtered dict with the same structure; entries with no surviving curves
+    are retained (empty "curves" list) so downstream sampling loops stay intact.
+    """
+    filtered = {}
+    for edge_key, inter in intersections.items():
+        i, j = edge_key
+        kept = []
+        for curve in inter["curves"]:
+            t0, t1 = curve.FirstParameter(), curve.LastParameter()
+            # Closed curves (full circles, ellipses) are genuine intersections;
+            # the arc-level filter handles back-arc removal after vertex splitting.
+            if curve_is_closed(curve):
+                kept.append(curve)
+                continue
+            if _passes_mahal(curve, t0, t1,
+                             cluster_means[i], cluster_sigma_inv[i],
+                             cluster_means[j], cluster_sigma_inv[j],
+                             chi2_threshold,
+                             n_samples, min_close_fraction):
+                kept.append(curve)
+            else:
+                print(f"[intersection] curve filter: edge {edge_key}  "
+                      f"[{t0:.4f}, {t1:.4f}] → discarded")
+        filtered[edge_key] = {**inter, "curves": kept}
+    return filtered
+
+
+def filter_arcs_by_proximity(edge_arcs,
+                              cluster_means, cluster_sigma_inv, chi2_threshold,
+                              n_samples=20, min_close_fraction=0.5):
+    """
+    Discard arcs not physically present on both adjacent surfaces.
+
+    For each arc on edge (i, j), sample n_samples points uniformly and
+    test against the Mahalanobis ellipsoids of both cluster i and cluster j.
+    Arcs where fewer than min_close_fraction of sampled points lie inside
+    both ellipsoids are discarded.
+
+    Parameters
+    ----------
+    edge_arcs            : dict (i,j) -> list[arc_dict]
+    cluster_means        : list of (3,) arrays
+    cluster_sigma_inv    : list of (3,3) arrays
+    chi2_threshold       : float
+    n_samples            : int
+    min_close_fraction   : float
+
+    Returns
+    -------
+    filtered_edge_arcs : dict (i,j) -> list[arc_dict]
+    """
+    filtered = {}
+    for edge_key, arcs in edge_arcs.items():
+        i, j = edge_key
+        kept = []
+        for arc in arcs:
+            if _passes_mahal(arc["curve"], arc["t_start"], arc["t_end"],
+                             cluster_means[i], cluster_sigma_inv[i],
+                             cluster_means[j], cluster_sigma_inv[j],
+                             chi2_threshold,
+                             n_samples, min_close_fraction):
+                kept.append(arc)
+            else:
+                print(f"[topology] arc filter: edge {edge_key}  "
+                      f"v_start={arc['v_start']} v_end={arc['v_end']}  "
+                      f"→ discarded")
+
+        filtered[edge_key] = kept
+    return filtered
 
 
 # ---------------------------------------------------------------------------
