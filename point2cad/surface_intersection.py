@@ -302,49 +302,6 @@ def _curve_is_closed(curve):
     ) < _CLOSURE_TOL
 
 
-def filter_vertices_by_proximity(vertices, vertex_edges,
-                                  cluster_means, cluster_sigma_inv,
-                                  chi2_threshold):
-    """
-    Remove vertices outside the Mahalanobis ellipsoid of any constituent cluster.
-
-    For each vertex, every cluster involved in its incident edges must
-    satisfy  (v - mu)^T Sigma_inv (v - mu) <= chi2_threshold.
-
-    Parameters
-    ----------
-    vertices           : (M, 3) float64 array
-    vertex_edges       : list[set] of length M
-    cluster_means      : list of (3,) arrays
-    cluster_sigma_inv  : list of (3, 3) arrays
-    chi2_threshold     : float
-
-    Returns
-    -------
-    filtered vertices (M', 3) and the corresponding vertex_edges list.
-    """
-    if len(vertices) == 0:
-        return vertices, vertex_edges
-
-    keep = []
-    for vpos, edges in zip(vertices, vertex_edges):
-        involved = set()
-        for edge in edges:
-            involved.update(edge)
-
-        ok = True
-        for cidx in involved:
-            diff = vpos - cluster_means[cidx]
-            d2 = diff @ cluster_sigma_inv[cidx] @ diff
-            if d2 > chi2_threshold:
-                ok = False
-                break
-        keep.append(ok)
-
-    keep = np.array(keep, dtype=bool)
-    return vertices[keep], [vertex_edges[i] for i in range(len(vertex_edges)) if keep[i]]
-
-
 def trim_by_vertices(raw_intersections, vertices, vertex_edges,
                      extension_factor=0.05,
                      phantom_vertex_dist=1e-3):

@@ -281,13 +281,53 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
 # Step 1b — Proximity filters (curve-level and arc-level)
 # ---------------------------------------------------------------------------
 
-def _passes_mahal(curve, t0, t1,
-                   mu_i, sigma_inv_i, mu_j, sigma_inv_j, chi2_threshold,
-                   n_samples, min_close_fraction):
+def filter_vertices_by_proximity(vertices, vertex_edges,
+                                  cluster_trees, cluster_thresholds):
+    """
+    Remove vertices too far from any constituent cluster's point cloud.
+
+    For each vertex, every cluster involved in its incident edges must have
+    its nearest data point within that cluster's NN-distance threshold
+    (from ``build_cluster_proximity``).
+
+    Parameters
+    ----------
+    vertices           : (M, 3) float64 array
+    vertex_edges       : list[set] of length M
+    cluster_trees      : list[KDTree]
+    cluster_thresholds : list[float]
+
+    Returns
+    -------
+    filtered vertices (M', 3) and the corresponding vertex_edges list.
+    """
+    if len(vertices) == 0:
+        return vertices, vertex_edges
+
+    keep = []
+    for vpos, edges in zip(vertices, vertex_edges):
+        involved = set()
+        for edge in edges:
+            involved.update(edge)
+
+        ok = True
+        for cidx in involved:
+            d, _ = cluster_trees[cidx].query(vpos, k=1)
+            if d > cluster_thresholds[cidx]:
+                ok = False
+                break
+        keep.append(ok)
+
+    keep = np.array(keep, dtype=bool)
+    return vertices[keep], [vertex_edges[i] for i in range(len(vertex_edges)) if keep[i]]
+
+
+def _passes_nn(curve, t0, t1, tree_i, tree_j, threshold_i, threshold_j,
+               n_samples, min_close_fraction):
     """
     Return True if at least min_close_fraction of n_samples points sampled
-    uniformly on curve over [t0, t1] lie within the Mahalanobis ellipsoid
-    of both cluster i and cluster j.
+    uniformly on curve over [t0, t1] are within NN-distance threshold of
+    both cluster i and cluster j.
     Returns True when no point can be evaluated (safe default).
     """
     n_close = 0
@@ -298,34 +338,30 @@ def _passes_mahal(curve, t0, t1,
             p = curve.Value(t)
             pt = np.array([p.X(), p.Y(), p.Z()])
             n_total += 1
-            diff_i = pt - mu_i
-            diff_j = pt - mu_j
-            d2_i = diff_i @ sigma_inv_i @ diff_i
-            d2_j = diff_j @ sigma_inv_j @ diff_j
-            if d2_i <= chi2_threshold and d2_j <= chi2_threshold:
+            d_i, _ = tree_i.query(pt, k=1)
+            d_j, _ = tree_j.query(pt, k=1)
+            if d_i <= threshold_i and d_j <= threshold_j:
                 n_close += 1
         except Exception:
             pass
     return n_total == 0 or n_close / n_total >= min_close_fraction
 
 
-def filter_curves_by_proximity(intersections,
-                                cluster_means, cluster_sigma_inv, chi2_threshold,
+def filter_curves_by_proximity(intersections, cluster_trees, cluster_thresholds,
                                 n_samples=20, min_close_fraction=0.5):
     """
     Discard intersection curves not physically present on both adjacent surfaces.
 
     For each curve on edge (i, j), n_samples points are sampled uniformly
-    and tested against the Mahalanobis ellipsoids of both cluster i and
-    cluster j.  Curves where fewer than min_close_fraction of sampled points
-    lie inside both ellipsoids are discarded.
+    and tested for NN-distance proximity to both cluster i and cluster j.
+    Curves where fewer than min_close_fraction of sampled points are within
+    both clusters' thresholds are discarded.
 
     Parameters
     ----------
     intersections        : dict (i,j) -> {"curves": list[Geom_Curve], ...}
-    cluster_means        : list of (3,) arrays
-    cluster_sigma_inv    : list of (3,3) arrays
-    chi2_threshold       : float
+    cluster_trees        : list[KDTree]
+    cluster_thresholds   : list[float]
     n_samples            : int
     min_close_fraction   : float
 
@@ -340,16 +376,16 @@ def filter_curves_by_proximity(intersections,
         kept = []
         for curve in inter["curves"]:
             t0, t1 = curve.FirstParameter(), curve.LastParameter()
-            # Closed curves (full circles, ellipses) are genuine intersections;
-            # the arc-level filter handles back-arc removal after vertex splitting.
+            # Closed curves bypass the curve filter — they can't be
+            # evaluated as all-or-nothing.  The arc-level filter handles
+            # removal of spurious closed-curve arcs after vertex splitting.
             if curve_is_closed(curve):
                 kept.append(curve)
                 continue
-            if _passes_mahal(curve, t0, t1,
-                             cluster_means[i], cluster_sigma_inv[i],
-                             cluster_means[j], cluster_sigma_inv[j],
-                             chi2_threshold,
-                             n_samples, min_close_fraction):
+            if _passes_nn(curve, t0, t1,
+                          cluster_trees[i], cluster_trees[j],
+                          cluster_thresholds[i], cluster_thresholds[j],
+                          n_samples, min_close_fraction):
                 kept.append(curve)
             else:
                 print(f"[intersection] curve filter: edge {edge_key}  "
@@ -358,23 +394,21 @@ def filter_curves_by_proximity(intersections,
     return filtered
 
 
-def filter_arcs_by_proximity(edge_arcs,
-                              cluster_means, cluster_sigma_inv, chi2_threshold,
-                              n_samples=20, min_close_fraction=0.5):
+def filter_arcs_by_proximity(edge_arcs, cluster_trees, cluster_thresholds,
+                              n_samples=20, min_close_fraction=0.35):
     """
     Discard arcs not physically present on both adjacent surfaces.
 
     For each arc on edge (i, j), sample n_samples points uniformly and
-    test against the Mahalanobis ellipsoids of both cluster i and cluster j.
-    Arcs where fewer than min_close_fraction of sampled points lie inside
-    both ellipsoids are discarded.
+    check NN-distance proximity to both cluster i and cluster j.  Arcs
+    where fewer than min_close_fraction of sampled points are within both
+    clusters' thresholds are discarded.
 
     Parameters
     ----------
     edge_arcs            : dict (i,j) -> list[arc_dict]
-    cluster_means        : list of (3,) arrays
-    cluster_sigma_inv    : list of (3,3) arrays
-    chi2_threshold       : float
+    cluster_trees        : list[KDTree]
+    cluster_thresholds   : list[float]
     n_samples            : int
     min_close_fraction   : float
 
@@ -387,11 +421,10 @@ def filter_arcs_by_proximity(edge_arcs,
         i, j = edge_key
         kept = []
         for arc in arcs:
-            if _passes_mahal(arc["curve"], arc["t_start"], arc["t_end"],
-                             cluster_means[i], cluster_sigma_inv[i],
-                             cluster_means[j], cluster_sigma_inv[j],
-                             chi2_threshold,
-                             n_samples, min_close_fraction):
+            if _passes_nn(arc["curve"], arc["t_start"], arc["t_end"],
+                          cluster_trees[i], cluster_trees[j],
+                          cluster_thresholds[i], cluster_thresholds[j],
+                          n_samples, min_close_fraction):
                 kept.append(arc)
             else:
                 print(f"[topology] arc filter: edge {edge_key}  "
@@ -578,6 +611,15 @@ def _select_next_arc_angular(v_cur, prev_arc, candidates, face_idx, occ_surfaces
         if a < 1e-8:             # avoid selecting the backward direction itself
             a += 2 * math.pi
         return a
+
+    # Edge continuity: prefer candidates from the same edge as prev_arc.
+    # This keeps the wire on a single intersection curve before switching
+    # to a different curve at a shared vertex.
+    prev_edge = prev_arc.get("edge_key")
+    if prev_edge is not None:
+        same_edge = [c for c in candidates if c[0].get("edge_key") == prev_edge]
+        if same_edge:
+            return min(same_edge, key=lambda c: _ccw_angle(*c))
 
     return min(candidates, key=lambda c: _ccw_angle(*c))
 
@@ -1189,69 +1231,167 @@ def _cluster_uv_bounds(surface, cluster_pts, rel_margin=0.1):
     return umin_r - mu, umax_r + mu, vmin_r - mv, vmax_r + mv
 
 
-def build_brep_shape_bop(occ_surfaces, clusters, adj, tolerance=1e-3, margin=0.1):
+def _uv_bounds_from_3d_points(surface, points_3d, rel_margin=1.0):
+    """
+    Project 3D points onto `surface` and return (umin, umax, vmin, vmax)
+    expanded by rel_margin * span on each side, clipped to the surface's
+    natural UV domain.
+
+    A large rel_margin (default 1.0 = 100%) is appropriate for
+    BOPAlgo_MakerVolume which needs face patches to overlap generously;
+    the boolean operation trims them to the correct extent.
+
+    Returns None if projection fails for all points.
+    """
+    u_vals, v_vals = [], []
+    for pt in points_3d:
+        pnt = gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2]))
+        try:
+            proj = GeomAPI_ProjectPointOnSurf(pnt, surface)
+            if proj.NbPoints() > 0:
+                u, v = proj.LowerDistanceParameters()
+                u_vals.append(u)
+                v_vals.append(v)
+        except Exception:
+            pass
+
+    if not u_vals:
+        return None
+
+    umin_r, umax_r = min(u_vals), max(u_vals)
+    vmin_r, vmax_r = min(v_vals), max(v_vals)
+    mu = rel_margin * max(umax_r - umin_r, 1e-6)
+    mv = rel_margin * max(vmax_r - vmin_r, 1e-6)
+
+    umin_out = umin_r - mu
+    umax_out = umax_r + mu
+    vmin_out = vmin_r - mv
+    vmax_out = vmax_r + mv
+
+    # Clip to the surface's natural UV domain to avoid wrapping past
+    # periodic boundaries.
+    su1, su2, sv1, sv2 = surface.Bounds()
+    umin_out = max(umin_out, su1)
+    umax_out = min(umax_out, su2)
+    vmin_out = max(vmin_out, sv1)
+    vmax_out = min(vmax_out, sv2)
+
+    return umin_out, umax_out, vmin_out, vmax_out
+
+
+def build_brep_shape_bop(occ_surfaces, vertices, vertex_edges, face_arcs,
+                          surface_ids=None,
+                          tolerance=1e-3, rel_margin=0.05,
+                          curve_samples=100):
     """
     Build a TopoDS_Shape using BOPAlgo_MakerVolume.
 
-    Each surface is converted to a finite TopoDS_Face:
-      - Geom_BSplineSurface: uses the natural UV domain of the BSpline directly.
-      - Analytical surfaces (plane, cylinder, cone, sphere): UV bounds are
-        estimated by projecting the surface's own cluster points plus the
-        cluster points of all adjacent surfaces onto the surface.  Using
-        neighbour points ensures that cylinders extend far enough to
-        intersect adjacent planes without over-extending to non-adjacent ones.
+    Face patch UV bounds are determined from the intersection geometry:
 
-    All faces are passed to BOPAlgo_MakerVolume, which internally computes
-    surface-surface intersections, trims the faces, assembles wires, and
-    builds a solid (or compound of solids).
+      1. **Vertices exist** for the face: project incident vertices onto the
+         surface → UV bounding box (cheapest, most precise).
+      2. **No vertices, but closed curves** on the face: sample points along
+         incident closed curves → UV bounding box.
+      3. **Geom_BSplineSurface**: uses the natural UV domain.
+
+    UV bounds are clipped to surface.Bounds() to prevent wrapping past
+    periodic boundaries.
 
     Parameters
     ----------
-    occ_surfaces : list[Geom_Surface or None]
-    clusters     : list[np.ndarray (N,3)]   — one per surface, same indexing
-    adj          : np.ndarray (N,N) bool/int adjacency matrix
-    tolerance    : float
-
-    Returns
-    -------
-    TopoDS_Shape, or None on failure
+    occ_surfaces   : list[Geom_Surface or None]
+    vertices       : np.ndarray (M, 3)
+    vertex_edges   : list[set]
+    face_arcs      : dict i -> list[arc_dict]
+    surface_ids    : list[int] or None
+    tolerance      : float
+    rel_margin     : float — relative UV margin (default 5%)
+    curve_samples  : int — samples per closed curve for fallback UV bounds
     """
     n = len(occ_surfaces)
 
+    # Per-face incident vertices from surviving arcs.
+    face_vertex_positions = {}
+    for face_idx, arcs in face_arcs.items():
+        vset = set()
+        for arc in arcs:
+            if arc.get("v_start") is not None:
+                vset.add(arc["v_start"])
+            if arc.get("v_end") is not None:
+                vset.add(arc["v_end"])
+        if vset:
+            face_vertex_positions[face_idx] = [vertices[v] for v in vset]
+
     occ_faces = []
-    for i, (surface, cluster) in enumerate(zip(occ_surfaces, clusters)):
+    for i in range(n):
+        surface = occ_surfaces[i]
         if surface is None:
             continue
 
         dtype = surface.DynamicType().Name()
+        face = None
         try:
-            if dtype == "Geom_BSplineSurface":
-                fm = BRepBuilderAPI_MakeFace(surface, tolerance)
-            else:
-                neighbour_pts = [cluster] + [
-                    clusters[j] for j in range(n)
-                    if j != i and adj[i, j]
-                ]
-                combined = np.concatenate(neighbour_pts, axis=0)
-                bounds = _cluster_uv_bounds(surface, combined, rel_margin=margin)
-                if bounds is None:
-                    print(f"[bop] face {i}: UV projection failed — skipping")
-                    continue
-                umin, umax, vmin, vmax = bounds
-                fm = BRepBuilderAPI_MakeFace(surface, umin, umax, vmin, vmax, tolerance)
+            # Tier 1: incident vertices.
+            vpos_list = face_vertex_positions.get(i)
+            if vpos_list:
+                bounds = _uv_bounds_from_3d_points(
+                    surface, np.array(vpos_list), rel_margin=rel_margin
+                )
+                if bounds is not None:
+                    umin, umax, vmin, vmax = bounds
+                    fm = BRepBuilderAPI_MakeFace(surface, umin, umax,
+                                                 vmin, vmax, tolerance)
+                    if fm.IsDone():
+                        face = fm.Face()
+                        print(f"[bop] face {i}: UV from {len(vpos_list)} "
+                              f"vertices [{umin:.3f},{umax:.3f}]×"
+                              f"[{vmin:.3f},{vmax:.3f}]")
 
-            if fm.IsDone():
-                occ_faces.append(fm.Face())
+            # Tier 2: sample closed curves.
+            if face is None:
+                arcs = face_arcs.get(i, [])
+                sample_pts = []
+                for arc in arcs:
+                    if not arc.get("closed", False):
+                        continue
+                    t0, t1 = arc["t_start"], arc["t_end"]
+                    for k in range(curve_samples):
+                        t = t0 + (t1 - t0) * k / max(curve_samples - 1, 1)
+                        try:
+                            p = arc["curve"].Value(t)
+                            sample_pts.append([p.X(), p.Y(), p.Z()])
+                        except Exception:
+                            pass
+                if sample_pts:
+                    bounds = _uv_bounds_from_3d_points(
+                        surface, np.array(sample_pts),
+                        rel_margin=rel_margin
+                    )
+                    if bounds is not None:
+                        umin, umax, vmin, vmax = bounds
+                        fm = BRepBuilderAPI_MakeFace(
+                            surface, umin, umax, vmin, vmax, tolerance
+                        )
+                        if fm.IsDone():
+                            face = fm.Face()
+                            print(f"[bop] face {i}: UV from "
+                                  f"{len(sample_pts)} curve samples "
+                                  f"[{umin:.3f},{umax:.3f}]×"
+                                  f"[{vmin:.3f},{vmax:.3f}]")
+
+            if face is not None:
+                occ_faces.append(face)
             else:
-                print(f"[bop] face {i} ({dtype}): MakeFace failed (error {fm.Error()})")
+                print(f"[bop] face {i}: could not build patch — skipping")
         except Exception as exc:
-            print(f"[bop] face {i} ({dtype}): exception during MakeFace: {exc}")
+            print(f"[bop] face {i} ({dtype}): exception: {exc}")
 
     if not occ_faces:
         print("[bop] no faces built — aborting")
         return None
 
-    print(f"[bop] built {len(occ_faces)} face patches, running BOPAlgo_MakerVolume ...")
+    print(f"[bop] built {len(occ_faces)} face patches, "
+          f"running BOPAlgo_MakerVolume ...")
     mv = BOPAlgo_MakerVolume()
     mv.SetIntersect(True)
     for face in occ_faces:
@@ -1263,6 +1403,9 @@ def build_brep_shape_bop(occ_surfaces, clusters, adj, tolerance=1e-3, margin=0.1
         return None
 
     shape = mv.Shape()
+    analyzer = BRepCheck_Analyzer(shape)
+    eval_result = analyzer.IsValid()
+    print(f"[bop] BRep correctness: {eval_result}")
     print(f"[bop] MakerVolume done — shape type: {shape.ShapeType()}")
     return shape
 

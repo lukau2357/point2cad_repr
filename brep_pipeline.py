@@ -226,11 +226,11 @@ def run_compute(args):
     from point2cad.surface_intersection import (
         compute_all_intersections,
         trim_by_vertices,
-        filter_vertices_by_proximity,
         compute_vertices,
         sample_curve,
     )
     from point2cad.topology import (
+        filter_vertices_by_proximity,
         build_edge_arcs, filter_curves_by_proximity, filter_arcs_by_proximity,
         print_edge_arcs_summary,
         face_arc_incidence, print_face_arcs_summary,
@@ -297,8 +297,13 @@ def run_compute(args):
         )
         print(f"Cluster {cid}: {SURFACE_NAMES[sid]}")
 
-    # Per-cluster Mahalanobis ellipsoids — needed by both paths.
-    cluster_means, cluster_sigma_inv, chi2_threshold = build_cluster_proximity(clusters)
+    # Per-cluster KDTrees and NN-distance thresholds — needed by both paths.
+    cluster_trees, cluster_thresholds = build_cluster_proximity(
+        clusters, percentile=args.proximity_percentile
+    )
+    
+    for i in range(len(cluster_thresholds)):
+        cluster_thresholds[i] *= 3
 
     if args.full_adjacency:
         n_surf    = len(clusters)
@@ -363,7 +368,7 @@ def run_compute(args):
     print(f"Found {len(vertices)} raw vertices")
 
     vertices, vertex_edges = filter_vertices_by_proximity(
-        vertices, vertex_edges, cluster_means, cluster_sigma_inv, chi2_threshold
+        vertices, vertex_edges, cluster_trees, cluster_thresholds
     )
     print(f"After proximity filter: {len(vertices)} vertices")
 
@@ -372,7 +377,7 @@ def run_compute(args):
         extension_factor=0.05,
     )
     trim_intersections_ = filter_curves_by_proximity(
-        trim_intersections_, cluster_means, cluster_sigma_inv, chi2_threshold
+        trim_intersections_, cluster_trees, cluster_thresholds
     )
 
     # Sample curves to numpy for the visualizer (no OCC on host).
@@ -434,7 +439,7 @@ def run_compute(args):
         trim_curves_dict, vertices, vertex_edges, threshold=1e-3
     )
     edge_arcs = filter_arcs_by_proximity(
-        edge_arcs, cluster_means, cluster_sigma_inv, chi2_threshold
+        edge_arcs, cluster_trees, cluster_thresholds
     )
     print_edge_arcs_summary(edge_arcs)
 
@@ -461,12 +466,16 @@ def run_compute(args):
     export_step(shape, step_path)
 
     # ------------------------------------------------------------------
-    # Step 4b: BRep assembly — BOPAlgo_MakerVolume approach
+    # Step 4b: BRep assembly — BOPAlgo_MakerVolume with cluster UV bounds
     # ------------------------------------------------------------------
-    # step_path_bop = os.path.join(out_dir, f"{pc_id}_bop.step")
-    # shape_bop = build_brep_shape_bop(occ_surfs, clusters, adj, tolerance=1e-3, margin=0.1)
-    # if shape_bop is not None:
-    #     export_step(shape_bop, step_path_bop)
+    step_path_bop = os.path.join(out_dir, f"{pc_id}_bop.step")
+    shape_bop = build_brep_shape_bop(
+        occ_surfs, vertices, vertex_edges, face_arcs,
+        surface_ids=surface_ids,
+        tolerance=1e-3, rel_margin=0.5,
+    )
+    if shape_bop is not None:
+        export_step(shape_bop, step_path_bop)
     print(f"\nAll results saved to {out_dir}/")
 
 
@@ -491,12 +500,10 @@ if __name__ == "__main__":
     parser.add_argument("--threshold_factor", type=float, default=1.3,
                         help="Adjacency detection threshold = threshold_factor * "
                              "per-pair local spacing")
-    parser.add_argument("--vertex_bbox_margin_percentile", type=float, default=50.0,
-                        help="[constrained adjacency] vertex proximity filter: "
-                             "percentile of intra-cluster NN distances used as "
-                             "the bounding-box extension margin per cluster. "
-                             "Vertices outside the extended bbox of any constituent "
-                             "cluster are discarded as spurious.")
+    parser.add_argument("--proximity_percentile", type=float, default=100,
+                        help="Percentile of intra-cluster NN distance distribution "
+                             "used as proximity threshold per cluster. Higher = more "
+                             "generous (default 99.0).")
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
                              "instead of point clouds (visualize mode only)", default = True)

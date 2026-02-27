@@ -84,38 +84,33 @@ def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None):
 
     return adj, global_threshold, spacing, boundary_strips, per_pair_thresholds
 
-def build_cluster_proximity(clusters, chi2_threshold=14.16, reg=1e-6):
+def build_cluster_proximity(clusters, percentile=99.0):
     """
-    Build per-cluster Mahalanobis distance test for proximity queries.
+    Build per-cluster KDTree and NN-distance threshold for proximity queries.
 
-    A point x is "close to cluster C" when its squared Mahalanobis distance
-    is within the chi-squared threshold:
+    A point x is "close to cluster C" when its nearest-neighbour distance
+    to C is within the p-th percentile of C's intra-cluster NN distances:
 
-        (x - mu)^T  Sigma_inv  (x - mu)  <=  chi2_threshold
-
-    The default chi2_threshold=14.16 corresponds to chi^2(3, 0.997) — the
-    3-sigma equivalent for a 3D Gaussian.
+        nn_dist(x, C) <= percentile(intra_nn_dists_C, p)
 
     Parameters
     ----------
-    clusters        : list of (Nk, 3) float arrays
-    chi2_threshold  : float — chi-squared cutoff (default: 3-sigma in 3D)
-    reg             : float — L2 regularisation for singular covariance
+    clusters   : list of (Nk, 3) float arrays
+    percentile : float in [0, 100] — percentile of intra-cluster NN
+                 distance distribution used as threshold (default 99.0)
 
     Returns
     -------
-    cluster_means     : list of (3,) arrays
-    cluster_sigma_inv : list of (3, 3) arrays — regularised precision matrices
-    chi2_threshold    : float — passed through for use in queries
+    trees      : list[KDTree] — one per cluster
+    thresholds : list[float]  — NN-distance threshold per cluster
     """
-    means, sigma_invs = [], []
+    trees, thresholds = [], []
     for cluster in clusters:
-        mu = cluster.mean(axis=0)
-        cov = np.cov(cluster, rowvar=False)
-        cov += reg * np.eye(3)
-        sigma_invs.append(np.linalg.inv(cov))
-        means.append(mu)
-    return means, sigma_invs, chi2_threshold
+        tree = KDTree(cluster)
+        d, _ = tree.query(cluster, k=2)
+        thresholds.append(float(np.percentile(d[:, 1], percentile)))
+        trees.append(tree)
+    return trees, thresholds
 
 
 def build_cluster_bboxes(clusters, margin_percentile=50.0):
