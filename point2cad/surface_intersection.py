@@ -134,6 +134,65 @@ def _intersect_sphere_sphere(pi, pj):
     return _intersect_plane_sphere({"a": n, "d": d_p}, pi)
 
 # ---------------------------------------------------------------------------
+# Plane ∩ Cylinder tangent fallback
+# ---------------------------------------------------------------------------
+
+def _intersect_plane_cylinder_tangent(pi_plane, pi_cyl,
+                                       tol_parallel=0.001, tol_tangent=1e-3):
+    """
+    Analytical fallback for plane ∩ cylinder when GeomAPI_IntSS returns empty.
+
+    Detects the degenerate tangent case: the plane is (nearly) parallel to the
+    cylinder axis and tangent to its surface, so the intersection is a single
+    generator (ruling) line.
+
+    The intersection curve exists iff the perpendicular distance δ from the
+    cylinder axis to the plane equals r:
+
+        δ = |D| / |n_⊥|   where D = d − n·c,  n_⊥ = n − (n·a) a
+
+    When δ = r the tangent foot on the cylinder surface is:
+
+        q = c + (D / |n_⊥|²) · n_⊥
+
+    and the result is Geom_Line(q, a).
+
+    tol_parallel : |n·a| threshold below which the plane is declared parallel
+    tol_tangent  : absolute tolerance on |δ − r|
+    """
+    n = _unit(pi_plane["a"])
+    d = float(pi_plane["d"])
+    a = _unit(pi_cyl["a"])
+    c = np.asarray(pi_cyl["center"], dtype=np.float64)
+    r = float(pi_cyl["radius"])
+
+    # Plane must be (nearly) parallel to the cylinder axis
+    alpha = float(np.dot(n, a))
+    if abs(alpha) >= tol_parallel:
+        return _result([], [], "empty", "analytical")
+
+    # Component of n perpendicular to a
+    n_perp    = n - alpha * a
+    n_perp_sq = float(np.dot(n_perp, n_perp))
+    if n_perp_sq < 1e-12:
+        return _result([], [], "empty", "analytical")
+
+    # Perpendicular distance from the cylinder axis to the plane
+    D    = d - float(np.dot(n, c))          # d − n·c
+    dist = abs(D) / math.sqrt(n_perp_sq)    # δ = |D| / |n_⊥|
+
+    # Tangency: δ ≈ r  (secant δ < r is non-degenerate and handled by OCC)
+    if abs(dist - r) > tol_tangent:
+        return _result([], [], "empty", "analytical")
+
+    # Tangent foot on the cylinder surface (lies on both the plane and cylinder)
+    q = c + (D / n_perp_sq) * n_perp
+
+    line = Geom_Line(gp_Lin(_gp_pnt(q), _gp_dir(a)))
+    return _result([line], [], "line", "analytical")
+
+
+# ---------------------------------------------------------------------------
 # OCC generic fallback
 # ---------------------------------------------------------------------------
 
@@ -167,7 +226,8 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
     """
     Compute the intersection between two adjacent surfaces.
 
-    Uses analytical formulas for plane/plane, plane/sphere and sphere/sphere.
+    Uses analytical formulas for plane/plane, plane/sphere, sphere/sphere, and
+    the plane/cylinder tangent degenerate case.
     All other pairs call GeomAPI_IntSS.
 
     Returns a dict:
@@ -194,6 +254,15 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
         return _intersect_plane_sphere(pi, pj)
     if si == SURFACE_SPHERE and sj == SURFACE_SPHERE:
         return _intersect_sphere_sphere(pi, pj)
+
+    # Plane ∩ Cylinder: try OCC first (handles circle / ellipse correctly);
+    # fall back to analytical tangent-line if OCC returns empty.
+    # TODO: add plane ∩ cone tangent fallback when needed.
+    if si == SURFACE_PLANE and sj == SURFACE_CYLINDER:
+        occ = _intersect_occ(oi, oj, tol)
+        if occ["type"] == "empty":
+            return _intersect_plane_cylinder_tangent(pi, pj)
+        return occ
 
     return _intersect_occ(oi, oj, tol)
 

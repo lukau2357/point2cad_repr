@@ -245,7 +245,6 @@ def run_compute(args):
     DEVICE  = "cuda:0" if torch.cuda.is_available() else "cpu"
     pc_id   = os.path.basename(SAMPLE).split("_")[-1].split(".")[0]
     out_dir = os.path.join(args.output_dir, pc_id)
-    os.makedirs(out_dir, exist_ok=True)
 
     def normalize_points(pts):
         pts = pts - np.mean(pts, axis=0, keepdims=True)
@@ -257,7 +256,9 @@ def run_compute(args):
 
     data            = np.loadtxt(SAMPLE)
     data[:, :3]     = normalize_points(data[:, :3])
-    unique_clusters = np.unique(data[:, -1].astype(int))
+    # data = data[data[:, -1] <= 5]
+    unique_clusters, cluster_counts = np.unique(data[:, -1].astype(int), return_counts = True)
+    os.makedirs(out_dir, exist_ok=True)
 
     np_rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
@@ -269,7 +270,7 @@ def run_compute(args):
     # Surface fitting
     # ------------------------------------------------------------------
     clusters, surface_ids, fit_results, fit_meshes, occ_surfs = [], [], [], [], []
-    for cid in unique_clusters:
+    for cid, c_count in zip(unique_clusters, cluster_counts):
         cluster = data[data[:, -1].astype(int) == cid, :3].astype(np.float32)
         clusters.append(cluster)
         res = fit_surface(
@@ -295,16 +296,17 @@ def run_compute(args):
         occ_surfs.append(
             to_occ_surface(sid, res["result"], cluster=cluster, uv_margin=0.05)
         )
-        print(f"Cluster {cid}: {SURFACE_NAMES[sid]}")
+        print(f"[surface fitter] Cluster {cid} number of points: {c_count}")
+        print(f"[surface fitter] Fitted surface: {SURFACE_NAMES[sid]}")
 
     # Per-cluster KDTrees and NN-distance thresholds — needed by both paths.
     cluster_trees, cluster_thresholds = build_cluster_proximity(
         clusters, percentile=args.proximity_percentile
     )
-    
-    for i in range(len(cluster_thresholds)):
-        cluster_thresholds[i] *= 3
 
+    for i in range(len(cluster_thresholds)):
+        cluster_thresholds[i] *= args.proximity_factor
+    
     if args.full_adjacency:
         n_surf    = len(clusters)
         inter_adj = np.ones((n_surf, n_surf), dtype=bool)
@@ -312,10 +314,11 @@ def run_compute(args):
         print(f"[full_adjacency] intersecting all {n_surf * (n_surf - 1) // 2} pairs\n")
     else:
         adj, _, spacing, boundary_strips, _ = compute_adjacency_matrix(
-            clusters, threshold_factor=args.threshold_factor
+            clusters, threshold_factor=args.spacing_factor,
+            spacing_percentile=args.spacing_percentile,
         )
         inter_adj = adj
-        print(f"\nSpacing={spacing:.5f}  threshold={args.threshold_factor * spacing:.5f}")
+        print(f"\nSpacing={spacing:.5f}  threshold={args.spacing_factor * spacing:.5f}")
         print(f"Adjacent pairs: {adjacency_pairs(adj)}")
         for (i, j), bpts in sorted(boundary_strips.items()):
             print(f"  boundary ({i},{j}): {len(bpts)} points")
@@ -497,13 +500,19 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="output_brep",
                         help="Directory for saved results")
     parser.add_argument("-seed", type=int, default=41, help="Reproducibility seed")
-    parser.add_argument("--threshold_factor", type=float, default=1.3,
-                        help="Adjacency detection threshold = threshold_factor * "
+    parser.add_argument("--spacing_percentile", type=float, default=100.0,
+                    help="Percentile of intra-cluster NN distance distribution "
+                            "used for local spacing in adjacency computation "
+                            "(default 100.0 = max NN distance).")
+    parser.add_argument("--spacing_factor", type=float, default=2,
+                        help="Adjacency detection threshold = spacing factor * "
                              "per-pair local spacing")
     parser.add_argument("--proximity_percentile", type=float, default=100,
                         help="Percentile of intra-cluster NN distance distribution "
                              "used as proximity threshold per cluster. Higher = more "
-                             "generous (default 99.0).")
+                             "generous (default 100).")
+    parser.add_argument("--proximity_factor", type=float, 
+                        help="Proximity detection threshold = proximity_factor * chosen intra-cluster NN percentile.", default = 3)
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
                              "instead of point clouds (visualize mode only)", default = True)

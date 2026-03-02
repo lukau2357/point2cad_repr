@@ -1,0 +1,71 @@
+{
+  "model_id": "00000000",
+  "step_file": "00000000_290a9120f9f249a7a05cfe9c_step_000.step",
+  "shape_type": "Compound",
+  "n_faces": 25,
+  "n_edges": 109,
+  "n_vertices": 218,
+  "surface_types": {
+    "Sphere": 7,
+    "Torus": 3,
+    "Plane": 8,
+    "Cone": 5,
+    "BSpline": 2
+  },
+  "surface_areas_by_type": {
+    "Sphere": 68368.21536952777,
+    "Torus": 13546.444978280699,
+    "Plane": 78260.09769015468,
+    "Cone": 168967.03383628046,
+    "BSpline": 75722.82459636987
+  },
+  "total_surface_area": 404864.6164706135,
+  "curve_types": {
+    "Other": 7,
+    "BSpline": 22,
+    "Circle": 56,
+    "Line": 24
+  },
+  "bounding_box": {
+    "xmin": -107.055301092637,
+    "xmax": 113.93029215494869,
+    "ymin": -101.60000009999999,
+    "ymax": 214.110602085274,
+    "zmin": -1e-07,
+    "zmax": 536.228873074583
+  },
+  "bounding_box_extents": [
+    220.98559324758568,
+    315.71060218527396,
+    536.228873174583
+  ],
+  "face_types": [
+    "Sphere",
+    "Sphere",
+    "Torus",
+    "Torus",
+    "Sphere",
+    "Sphere",
+    "Sphere",
+    "Torus",
+    "Sphere",
+    "Plane",
+    "Cone",
+    "Plane",
+    "Plane",
+    "Cone",
+    "BSpline",
+    "Plane",
+    "Cone",
+    "Cone",
+    "Plane",
+    "BSpline",
+    "Plane",
+    "Cone",
+    "Plane",
+    "Sphere",
+    "Plane"
+  ],
+  "n_sampled_points": 17111,
+  "n_clusters": 25
+}

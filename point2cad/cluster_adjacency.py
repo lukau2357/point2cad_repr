@@ -2,24 +2,25 @@ import numpy as np
 from scipy.spatial import KDTree
 
 
-def _reference_spacing(clusters):
-    """Median nearest-neighbour distance across all cluster points."""
+def _reference_spacing(clusters, percentile=100.0):
+    """p-th percentile of nearest-neighbour distances across all cluster points."""
     nn_dists = []
     for cluster in clusters:
         tree = KDTree(cluster)
         d, _ = tree.query(cluster, k=2)
         nn_dists.append(d[:, 1])
-    return float(np.median(np.concatenate(nn_dists)))
+    return float(np.percentile(np.concatenate(nn_dists), percentile))
 
 
-def _local_spacing(cluster):
-    """Median nearest-neighbour distance within a single cluster."""
+def _local_spacing(cluster, percentile=100.0):
+    """p-th percentile of nearest-neighbour distances within a single cluster."""
     tree = KDTree(cluster)
     d, _ = tree.query(cluster, k=2)
-    return float(np.median(d[:, 1]))
+    return float(np.percentile(d[:, 1], percentile))
 
 
-def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None):
+def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None,
+                              spacing_percentile=100.0):
     """
     Compute the symmetric cluster adjacency matrix.
 
@@ -27,18 +28,18 @@ def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None):
 
         threshold_ij = threshold_factor * max(local_spacing_i, local_spacing_j)
 
-    where local_spacing_k is the median NN distance within cluster k alone.
-    Two clusters are adjacent when the minimum NN distance from the smaller
-    to the larger is within threshold_ij.  Using the per-cluster local spacing
-    handles uneven sampling densities: sparse clusters get a proportionally
-    larger threshold so narrow shared boundaries are not missed.
+    where local_spacing_k is the p-th percentile of NN distances within
+    cluster k.  Two clusters are adjacent when the minimum NN distance from
+    the smaller to the larger is within threshold_ij.
 
     Args:
-        clusters:         list of np.ndarray (Ni, 3)
-        threshold_factor: adjacency threshold = threshold_factor * local_spacing
-        spacing:          if provided, used as the global reference spacing
-                          returned for downstream consumers; does not affect
-                          the per-pair adaptive detection logic.
+        clusters:            list of np.ndarray (Ni, 3)
+        threshold_factor:    adjacency threshold = threshold_factor * local_spacing
+        spacing:             if provided, used as the global reference spacing
+                             returned for downstream consumers; does not affect
+                             the per-pair adaptive detection logic.
+        spacing_percentile:  percentile of intra-cluster NN distance distribution
+                             used for local spacing (default 100.0 = max)
 
     Returns:
         adj:             (n, n) bool array, symmetric, diagonal is False
@@ -53,10 +54,10 @@ def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None):
     n = len(clusters)
 
     if spacing is None:
-        spacing = _reference_spacing(clusters)
+        spacing = _reference_spacing(clusters, percentile=spacing_percentile)
     global_threshold = threshold_factor * spacing
 
-    local_spacings = [_local_spacing(c) for c in clusters]
+    local_spacings = [_local_spacing(c, percentile=spacing_percentile) for c in clusters]
 
     adj = np.zeros((n, n), dtype=bool)
     boundary_strips = {}

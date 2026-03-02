@@ -49,6 +49,7 @@ try:
     from OCC.Core.IFSelect       import IFSelect_RetDone
     from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume
     from OCC.Core.BRepCheck      import BRepCheck_Analyzer
+    from OCC.Core.Message        import Message_ProgressRange
     OCC_AVAILABLE = True
 except ImportError:
     OCC_AVAILABLE = False
@@ -348,7 +349,7 @@ def _passes_nn(curve, t0, t1, tree_i, tree_j, threshold_i, threshold_j,
 
 
 def filter_curves_by_proximity(intersections, cluster_trees, cluster_thresholds,
-                                n_samples=20, min_close_fraction=0.5):
+                                n_samples=20, min_close_fraction=0.6):
     """
     Discard intersection curves not physically present on both adjacent surfaces.
 
@@ -395,7 +396,7 @@ def filter_curves_by_proximity(intersections, cluster_trees, cluster_thresholds,
 
 
 def filter_arcs_by_proximity(edge_arcs, cluster_trees, cluster_thresholds,
-                              n_samples=20, min_close_fraction=0.35):
+                              n_samples=20, min_close_fraction=0.6):
     """
     Discard arcs not physically present on both adjacent surfaces.
 
@@ -689,8 +690,7 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
                 deg = len(neighbours)
                 if deg % 2 != 0:
                     print(
-                        f"[topology] face {face_idx}: vertex {v} has odd degree "
-                        f"{deg} — topology is degenerate (missing or spurious arc)"
+                        f"[topology] face {face_idx}: vertex {v} has odd degree {deg}"
                     )
                 
             arc_index    = {id(a): idx for idx, a in enumerate(open_arcs)}
@@ -903,14 +903,7 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
             if id(arc) in arc_to_edge:
                 continue
             try:
-                if arc["closed"] or arc["v_start"] is None:
-                    edge = BRepBuilderAPI_MakeEdge(arc["curve"]).Edge()
-                else:
-                    edge = BRepBuilderAPI_MakeEdge(
-                        arc["curve"],
-                        occ_verts[arc["v_start"]],
-                        occ_verts[arc["v_end"]],
-                    ).Edge()
+                edge = BRepBuilderAPI_MakeEdge(arc["curve"]).Edge()
                 arc_to_edge[id(arc)] = edge
             except Exception as exc:
                 print(f"[brep] MakeEdge failed for arc on {arc.get('edge_key')}: {exc}")
@@ -1189,7 +1182,7 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
 def export_step(shape, path):
     """Export a TopoDS_Shape to a STEP file."""
     writer = STEPControl_Writer()
-    writer.Transfer(shape, STEPControl_AsIs)
+    writer.Transfer(shape, STEPControl_AsIs, True, Message_ProgressRange())
     ok = writer.Write(path) == IFSelect_RetDone
     if ok:
         print(f"STEP written to {path}")

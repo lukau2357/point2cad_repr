@@ -16,18 +16,28 @@ Point2CAD).
 
 ## 0a — Reference spacing
 
-All distance thresholds in the pipeline are expressed as multiples of a single
-**reference spacing** $\sigma$, defined as the median nearest-neighbour
-distance across all cluster points:
+Two spacing measures are used:
+
+**Global reference spacing** $\sigma$ — the $p$-th percentile of nearest-neighbour
+distances across all cluster points (default $p = 100$, i.e.\ the maximum):
 
 $$
 \begin{align*}
-D_i &= \{\argmin_{y \in C_i, y \neq x}||x - y||_{2} \mid x \in C_i\} \\
-\sigma &= \operatorname{median} \cup_{i=1}^{N}D_i\\
+D_i &= \{\min_{y \in C_i, y \neq x}\|x - y\|_{2} \mid x \in C_i\} \\
+\sigma &= \operatorname{percentile}_p\!\left(\bigcup_{i=1}^{N}D_i\right)
 \end{align*}
 $$
 
-$N$ is the number of clusters, and $\sigma$ is the adapative threshold, used for the following step.
+$\sigma$ is returned for backward compatibility but does not directly control
+adjacency detection (see below).
+
+**Per-cluster local spacing** $\sigma_i$ — the $p$-th percentile of
+nearest-neighbour distances within cluster $C_i$ alone:
+
+$$\sigma_i = \operatorname{percentile}_p(D_i)$$
+
+Per-cluster spacings drive the per-pair adjacency threshold (Section 0b) and
+are also the basis for the proximity filter thresholds (Section 0d).
 
 ---
 
@@ -39,39 +49,106 @@ produces spurious curves for non-adjacent surfaces.
 
 **Algorithm.**  For each unordered pair $(i, j)$ with $i < j$:
 
-1. Build a KDTree on the larger cluster (say $C_i$).
-2. Query every point of the smaller cluster $C_j$, obtaining nearest-neighbour
-   distances $\{d_k\}_{k=1}^{|C_j|}$.
-3. Compute the **robust minimum** — the $p$-th percentile of $\{d_k\}$ (default
-   $p = 2$, i.e.\ the 2nd-percentile distance):
+1. Let $C_\text{larger}$, $C_\text{smaller}$ be the two clusters sorted by size.
+2. Build a KDTree on $C_\text{larger}$.
+3. Query every point of $C_\text{smaller}$, obtaining nearest-neighbour
+   distances $\{d_k\}$.
+4. Compute the **per-pair adaptive threshold**:
 
-$$\hat{d}_{ij} = \operatorname{percentile}_p(\{d_k\})$$
+$$\tau_{ij} = \tau \cdot \max(\sigma_i, \sigma_j)$$
 
-4. Declare clusters adjacent if $\hat{d}_{ij} \le \tau \cdot \sigma$, where
-   $\tau = 1.5$ is the threshold factor.
+where $\tau$ is the spacing factor (CLI: `--spacing_factor`, default $\tau = 2$) and $\sigma_i,
+\sigma_j$ are the local spacings from Section 0a.
 
-Using the $p$-th percentile rather than the minimum makes the test robust to
-outliers and to slight cluster overlap near shared boundaries.  Two clusters
-that touch along a narrow strip will have a few points very close to each
-other; the 2nd percentile captures this even if the bulk of one cluster is far
-from the other.
+5. Declare clusters adjacent if $\min_k d_k \le \tau_{ij}$.
 
-**Boundary strips.**  For each adjacent pair $(i, j)$, retain the subset of
-points whose nearest-neighbour distance to the opposite cluster is at most
-$\tau \cdot \sigma$:
+Using the plain minimum rather than a percentile statistic makes the test
+sensitive to even a single pair of very close points across the boundary,
+which is the correct condition for adjacency.
 
-$$B_{ij} = \{x \in C_i : d(x, C_j) \le \tau\sigma\}
-  \cup \{x \in C_j : d(x, C_i) \le \tau\sigma\} $$
+**Boundary strips.**  For each adjacent pair $(i, j)$, the boundary strip
+is constructed from the $C_\text{smaller} \to C_\text{larger}$ query:
 
-$B_{ij}$ is reused downstream in two places: trimming intersection curves
-(Section 1) and computing UV bounds for BSpline faces (Section 7).
+$$B_{ij} = \{x \in C_\text{smaller} : d(x, C_\text{larger}) \le \tau_{ij}\} \cup \{x \in C_\text{larger} : d(x,C_\text{smaller}) \le \tau_{ij}\}$$
+
+i.e.\ the union of the matching points from the smaller cluster and their
+nearest-neighbour images in the larger cluster.  Note that the strip is
+asymmetric: only one direction of NN query is performed.
+
+**Full-adjacency mode.**  When `--full_adjacency` is set all $\binom{n}{2}$
+pairs are intersected.  No adjacency matrix or boundary strips are computed;
+curve-proximity filtering (Section 0d) is used instead to discard spurious
+curves.
 
 **Output.**
 - $A \in \{0,1\}^{n \times n}$ — symmetric Boolean adjacency matrix.
 - `boundary_strips[(i,j)]` — $(|B_{ij}| \times 3)$ float32 array for each adjacent pair.
+- `per_pair_thresholds[(i,j)]` — $\tau_{ij}$ value per adjacent pair.
 ---
 
-## 0c — Surface fitting and OCC geometry objects
+## 0c — Cluster proximity for downstream filtering
+
+After adjacency detection, per-cluster KDTrees and NN-distance thresholds are
+built for use by the proximity filters described in Section 0d.
+
+**Algorithm** (`build_cluster_proximity`):
+
+For each cluster $C_i$:
+1. Build a KDTree.
+2. Compute the intra-cluster NN distances.
+3. Set the proximity threshold $\delta_i$ to the $q$-th percentile of those
+   distances (default $q = 100$, the maximum).
+
+In the pipeline the thresholds are then scaled by the **proximity factor**
+(CLI: `--proximity_factor`, default $f = 3$), which is decoupled from the
+adjacency spacing factor:
+
+$$\delta_i \leftarrow f \cdot \delta_i$$
+
+This separation allows the two concerns — adjacency detection and downstream
+proximity filtering — to be tuned independently.
+
+**Output.**
+- `cluster_trees` — one KDTree per cluster.
+- `cluster_thresholds` — $\delta_i$ per cluster (after the $\times f$ scaling).
+
+---
+
+## 0d — Proximity filtering
+
+Three separate proximity filters are applied at different stages to remove
+spurious geometry that lies outside the physical model extent.
+
+### Vertex proximity filter (`filter_vertices_by_proximity`)
+
+Applied immediately after `compute_vertices`.  A vertex $v$ is kept only if
+for **every** cluster $C_k$ incident to $v$ (i.e.\ $k \in \bigcup_{(i,j) \in
+\text{edges}(v)} \{i, j\}$):
+
+$$d(v, C_k) \le \delta_k$$
+
+where $d(v, C_k)$ is the NN distance from $v$ to the KDTree of $C_k$.
+
+### Curve proximity filter (`filter_curves_by_proximity`)
+
+Applied to the trimmed intersection dict.  For each curve on edge $(i, j)$,
+20 points are sampled uniformly along the curve.  The curve is kept if at
+least 50 % of the sampled points satisfy both:
+
+$$d(p, C_i) \le \delta_i \quad \text{and} \quad d(p, C_j) \le \delta_j$$
+
+Closed curves bypass this filter (they are handled later at the arc level).
+
+### Arc proximity filter (`filter_arcs_by_proximity`)
+
+Applied after `build_edge_arcs`.  Identical to the curve filter but operates
+on individual arcs (sub-intervals produced by vertex splitting), using a
+lower acceptance fraction of 35 % to account for arcs that only partially
+overlap the cluster boundary.
+
+---
+
+## 0e — Surface fitting and OCC geometry objects
 
 Each cluster $C_i$ is fitted with the surface type assigned by the upstream
 segmentation.  The five supported types and their OCC representations are:
@@ -140,35 +217,43 @@ returns `True` for $10^{100}$, so the comparison must use `abs(t) >= _OCC_INF`
 rather than `not math.isfinite(t)`.  In practice only `Geom_Line`
 (plane $\cap$ plane) triggers trimming.
 
-### Boundary-strip projection
+### Vertex-based trimming (`trim_by_vertices`)
 
-For the adjacent pair $(i, j)$ the boundary strip of cluster $i$ is the subset
-of its points whose nearest-neighbour distance to cluster $j$ is at most the
-adjacency threshold $\varepsilon_\text{adj}$.  The union of both strips gives
-boundary points $\{\mathbf{q}_k\}$ lying near the shared edge.
+Trimming uses the B-Rep vertices computed in Section 2 (vertex finding runs on
+the raw untrimmed curves first, then the results guide trimming).  Curves are
+handled differently depending on their topology:
 
-Each $\mathbf{q}_k$ is projected onto the intersection curve via
-`GeomAPI_ProjectPointOnCurve`, which solves:
+**Closed curves** are left unchanged.  `build_edge_arcs` (Section 3) will
+later split them at their incident vertices.  Trimming here would discard the
+wrap-around arc needed by the second adjacent face.
 
-$$t^* = \operatorname*{arg\,min}_{t \in [t_0, t_1]} \|\mathbf{C}(t) - \mathbf{q}_k\|_2^2$$
+**Phantom filter** (open curves only).  When an edge has multiple open curves
+(e.g.\ OCC returns both generators of a cylinder for a plane $\cap$ cylinder
+pair), the real curve has the incident vertices lying on it (projection
+distance $\approx 0$); the phantom generator is displaced by $\approx 2r$.
+Any open curve whose minimum vertex projection distance exceeds
+$\varepsilon_\text{phantom} = 10^{-3}$ is discarded.  The filter is skipped
+when fewer than 2 vertices are available (fail-safe).
 
-using the OCC `Extrema_ExtPC` algorithm (convex-hull pruning of Bézier
-segments, then Newton–Raphson).  Only projections with
-$\|\mathbf{C}(t^*) - \mathbf{q}_k\| < c \cdot \text{spacing}$ are kept
-(default $c = 3$).
-
-The trim interval is:
+**Open curves with $\ge 2$ incident vertices.**  Project the incident vertex
+positions $\{v_k\}$ onto the curve via `GeomAPI_ProjectPointOnCurve` to obtain
+parameters $\{t_k^*\}$. The trim interval is
 
 $$t_\text{min} = \min_k t_k^*, \qquad t_\text{max} = \max_k t_k^*$$
 
-Extended symmetrically by a relative margin $\alpha = 0.05$ to avoid endpoint
-truncation:
+Extended by a relative margin $\alpha = 0.05$:
 
 $$t_\text{min} \leftarrow t_\text{min} - \alpha(t_\text{max} - t_\text{min}), \qquad
   t_\text{max} \leftarrow t_\text{max} + \alpha(t_\text{max} - t_\text{min})$$
 
 A `Geom_TrimmedCurve` is constructed from the original curve and the computed
 interval.
+
+**Open curves with $< 2$ incident vertices.**  If the curve already has finite
+OCC bounds it is kept as-is; if it has infinite bounds (e.g.\ a `Geom_Line`)
+it is discarded because there is no vertex support to guide trimming.
+
+Curves that remain infinite after trimming are also discarded.
 
 ---
 
@@ -220,13 +305,25 @@ Interior minima satisfy the **common-perpendicular conditions**:
 $$(\mathbf{C}_1(t_1) - \mathbf{C}_2(t_2)) \cdot \mathbf{C}_1'(t_1) = 0, \qquad
   (\mathbf{C}_1(t_1) - \mathbf{C}_2(t_2)) \cdot \mathbf{C}_2'(t_2) = 0$$
 
-All local minima with $\sqrt{D} < \varepsilon_v$ are accepted as vertex
-candidates (a circle meeting a line has two such minima).  The candidate
-position is the midpoint $\tfrac{1}{2}(\mathbf{C}_1(t_1) + \mathbf{C}_2(t_2))$.
-Candidates within $\varepsilon_v$ of each other are merged by averaging.
+A **two-pass** strategy using `GeomAPI_ExtremaCurveCurve` is applied:
 
-OCC implementation: `GeomAPI_ExtremaCurveCurve` reports all local extrema of
-$D(t_1, t_2)$ via subdivision + Newton–Raphson.
+1. **First pass** — find the global minimum distance $d^*$ across all reported
+   local extrema.
+2. **Second pass** — accept every extremum within a small absolute tolerance
+   ($10^{-10}$) of $d^*$, provided $d^* < \varepsilon_v$.
+
+This two-pass approach rejects phantom curves (where $d^* \gg \varepsilon_v$)
+while correctly recovering all genuine intersection points (which have
+$d^* \approx 0$).  A circle meeting a line, for example, yields two genuine
+minima both at distance $\approx 0$.
+
+The candidate position for each accepted extremum is the midpoint
+$\tfrac{1}{2}(\mathbf{C}_1(t_1) + \mathbf{C}_2(t_2))$.  A greedy
+deduplication pass then merges candidates within $\varepsilon_v$ of each
+other by averaging.
+
+`GeomAPI_ExtremaCurveCurve` reports all local extrema of $D(t_1, t_2)$ via
+subdivision + Newton–Raphson.
 
 ---
 
@@ -261,11 +358,12 @@ Boundary tails of open curves are discarded because they lack a vertex at the
 trim boundary and are not valid B-Rep edges in a closed solid.
 
 **Wrap-around arc** for closed curves with $k \ge 1$: from $t_k^*$ back to
-$t_1^*$.  Constructed by calling `BasisCurve()` on the `Geom_TrimmedCurve` to
-obtain the underlying periodic curve (e.g.\ `Geom_Circle`), which accepts
-parameters beyond $[t_\text{min}, t_\text{max}]$.  If `BasisCurve()` is
-unavailable, a synthetic seam vertex is inserted at $C(t_\text{min})$ and the
-wrap-around is split into two sub-arcs.
+$t_1^*$ with parameter end $t_1^* + (t_\text{max} - t_\text{min})$.
+Constructed by calling `BasisCurve()` on the `Geom_TrimmedCurve` to obtain the
+underlying periodic curve (e.g.\ `Geom_Circle`), which accepts parameters
+beyond $[t_\text{min}, t_\text{max}]$.  If `BasisCurve()` is unavailable or
+OCC rejects the extended parameter range, the wrap-around arc is silently
+skipped — no seam-split fallback is attempted.
 
 Each arc dict carries:
 - `curve` — `Geom_TrimmedCurve` for this arc's interval
@@ -455,6 +553,15 @@ side by one arc.  The CCW rule selects the sector boundary immediately adjacent
 to the face interior.  The outer wire traverses CCW when viewed from $\hat{N}$;
 inner hole wires traverse CW.  Cycle extraction starts afresh from unvisited
 arcs for each new wire, so holes are extracted as separate cycles automatically.
+
+**Edge continuity heuristic.**  Before applying the general CCW rule, the
+implementation checks whether any candidates belong to the same intersection
+edge (same $(i,j)$ key) as the arc that was just traversed.  If such
+same-edge candidates exist, the CCW selection is restricted to them.  This
+keeps the wire travelling along a single intersection curve before switching
+to a different curve at a shared vertex, which produces smoother wires in
+practice.  The general CCW rule is used only when no same-edge candidates are
+available.
 
 **Failure modes:**
 - Nearly-parallel tangents: `atan2` may select the wrong arc.
@@ -818,10 +925,14 @@ to the boundary circles of adjacent planar caps.
 
 ---
 
-## 8 — Healing and validation (Steps 6–7)
+## 8 — Healing and validation (Steps 6–8)
 
-After sewing, `breplib.BuildCurves3d(shape)` ensures all edges have consistent
-3D curves (some may be missing after sewing).  `ShapeFix_Shape` then repairs:
+After sewing, the following sequence of repair and normalisation steps is applied:
+
+**Step 6 — Rebuild 3D curves.**  `breplib.BuildCurves3d(shape)` ensures all
+edges have consistent 3D curves (some may be missing after sewing merges edges).
+
+**Step 7 — Shape healing.**  `ShapeFix_Shape` repairs common defects:
 
 | Defect | Fix |
 |---|---|
@@ -837,11 +948,23 @@ fixer.Perform()
 shape = fixer.Shape()
 ```
 
-Validity is checked with `BRepCheck_Analyzer(shape).IsValid()`.  Note that
-this runs on the in-memory OCC shape; the STEP round-trip (write + re-read)
-can introduce coordinate rounding at $\sim 10^{-7}$ that degrades the result.
-FreeCAD's Check Geometry panel runs the same analyzer on the re-read shape
-and may report additional errors.
+**Step 7b — Re-parameterise edges.**  `breplib.SameParameter(shape, True)`
+updates edge tolerances so they reflect the actual deviation between each edge's
+3D curve and its two pcurves.  This fixes "Invalid curve on surface" errors
+that appear in boolean-operation pre-checks when the stored edge tolerance is
+inconsistent with the 3D/2D geometry.
+
+**Step 7c — Orient closed solid.**  For topologically closed shapes (a shell or
+solid returned by sewing), `breplib.OrientClosedSolid` ensures all face normals
+point consistently outward.  If sewing returns a shell it is first wrapped into
+a `TopoDS_Solid` via `BRepBuilderAPI_MakeSolid`.  This step fixes
+"Self-intersection found" errors caused by inward-pointing face normals.
+
+**Step 8 — Validity check.**  `BRepCheck_Analyzer(shape).IsValid()` runs the
+standard OCC topology checker on the in-memory shape.  Note that the STEP
+round-trip (write + re-read) can introduce coordinate rounding at
+$\sim 10^{-7}$ that degrades the result; FreeCAD's Check Geometry panel runs
+the same analyzer on the re-read shape and may report additional errors.
 
 ---
 
@@ -859,43 +982,98 @@ by most CAD viewers.
 
 ---
 
-## 10 — Data-flow summary
+## 10 — Alternative assembly: `build_brep_shape_bop` (BOPAlgo_MakerVolume)
+
+A second assembly path (`build_brep_shape_bop`) uses `BOPAlgo_MakerVolume`
+to perform Boolean union of finite surface patches.  It avoids explicit wire
+assembly and pcurve computation by delegating trimming to the Boolean engine.
+
+**Face patch construction.**  For each face $i$, a finite bounded patch is
+built by projecting available geometry onto the surface to determine UV bounds:
+
+1. **Vertices available** for face $i$: project incident vertex positions onto
+   the surface via `GeomAPI_ProjectPointOnSurf` → UV bounding box (cheapest,
+   most precise).
+2. **No vertices, but closed curves** on face $i$: sample points along incident
+   closed curves → UV bounding box.
+3. **BSpline surface**: use the natural UV domain `surface.Bounds()`.
+
+UV bounds are expanded by `rel_margin` (default 50 %) and clipped to the
+surface's natural domain to prevent wrapping past periodic boundaries.  The
+resulting face is `BRepBuilderAPI_MakeFace(surface, u_min, u_max, v_min,
+v_max, tolerance)`.
+
+**BOPAlgo_MakerVolume** receives all face patches and internally computes their
+intersections and Boolean union, producing a solid.  This approach is robust
+against imprecise wire connectivity but relies on the Boolean engine handling
+face overlaps — it may fail for highly irregular geometries.
+
+**Output.**  `TopoDS_Shape` (solid) or `None` if `BOPAlgo_MakerVolume` fails.
+The pipeline exports this shape as `{id}_bop.step` in addition to the primary
+`{id}.step` from `build_brep_shape`.
+
+---
+
+## 11 — Data-flow summary
 
 ```
-Geom_Surface list   +   raw (i,j) → [Geom_Curve]
+clusters + adjacency matrix
         │
-        │  Section 1: boundary-strip projection
+        │  Section 0c: build_cluster_proximity
+        ↓
+cluster_trees, cluster_thresholds (×3)
+        │
+        │  Section 0e: fit_surface + to_occ_surface
+        ↓
+Geom_Surface list + raw (i,j) → [Geom_Curve]
+        │
+        │  Section 2: compute_vertices on raw curves
+        │             GeomAPI_ExtremaCurveCurve, threshold ε_v
+        ↓
+vertices (M,3),  vertex_edges  [raw]
+        │
+        │  Section 0d: filter_vertices_by_proximity
+        ↓
+vertices (M',3), vertex_edges  [filtered]
+        │
+        │  Section 1: trim_by_vertices (vertex-based trimming, ext=0.05)
+        │             + filter_curves_by_proximity
         ↓
 trimmed (i,j) → [Geom_TrimmedCurve]
         │
-        │  Section 2: GeomAPI_ExtremaCurveCurve, threshold ε_v
-        ↓
-vertices: np.ndarray (M,3),  vertex_edges: list[set]
-        │
-        │  Section 3: arc splitting (build_edge_arcs)
+        │  Section 3: build_edge_arcs (arc splitting)
+        │             + filter_arcs_by_proximity
         ↓
 edge_arcs: (i,j) → [arc_dict]
         │
-        │  Section 4: key decomposition
+        │  Section 4: face_arc_incidence (key decomposition)
         ↓
 face_arcs: i → [arc_dict]
         │
-        │  Section 5: cycle extraction + CCW angular ordering
+        │  Section 5: assemble_wires (CCW angular ordering
+        │             + edge-continuity heuristic)
         ↓
 face_wires: i → [[(arc, forward)]]
         │
-        │  Section 7: BRepBuilderAPI_MakeFace / UV-bounds / Sewing
+        │  Section 7: build_brep_shape
+        │             BRepBuilderAPI_MakeFace / UV-bounds / Sewing
         ↓
-TopoDS_Shape (shell)
+TopoDS_Shape (shell/solid)
         │
-        │  Sections 8–9: ShapeFix + BRepCheck + STEPControl_Writer
+        │  Section 8: breplib.BuildCurves3d
+        │             ShapeFix_Shape
+        │             breplib.SameParameter
+        │             breplib.OrientClosedSolid
+        │             BRepCheck_Analyzer
         ↓
-output.step
+        │  Section 9: STEPControl_Writer
+        ↓
+output.step  (and output_bop.step via Section 10)
 ```
 
 ---
 
-## 11 — Known difficulties and alternatives
+## 12 — Known difficulties and alternatives
 
 **Wire assembly at high-degree vertices.** The CCW rule works for exact
 geometry but fails when two arcs at a degree-4 vertex are nearly tangent
@@ -930,7 +1108,7 @@ D. *Accept open shell.*  For applications requiring only visualization and
 
 ---
 
-## 12 — Denormalisation: inverting the input normalisation on the output shape
+## 13 — Denormalisation: inverting the input normalisation on the output shape
 
 The pipeline normalises the input point cloud before fitting.  The forward
 transform is:

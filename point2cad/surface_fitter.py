@@ -102,6 +102,21 @@ def cone_special_handling(results, errors, simple_error_threshold, plane_cone_ra
     return SURFACE_CONE
         
 
+def plane_special_handling(results, errors, plane_sphere_ratio_threshold):
+    """
+    If plane is selected as the best simple surface, check whether a sphere
+    fits significantly better.  Returns SURFACE_SPHERE when
+
+        plane_error / sphere_error  >=  plane_sphere_ratio_threshold
+
+    (i.e. the sphere must be much better to justify replacing the plane),
+    otherwise returns SURFACE_PLANE.
+    """
+    if ratio(errors[SURFACE_PLANE], errors[SURFACE_SPHERE]) >= plane_sphere_ratio_threshold:
+        return SURFACE_SPHERE
+    return SURFACE_PLANE
+
+
 def fit_surface(cluster,
                 inr_network_parameters,
                 np_rng,
@@ -109,6 +124,7 @@ def fit_surface(cluster,
                 simple_error_threshold = 8e-3,
                 simple_inr_ratio_threshold = 1.5,
                 plane_cone_ratio_threshold = 2.5,
+                plane_sphere_ratio_threshold = 2.5,
                 cone_theta_tolerance_degrees = 5,
                 sphere_fit_kwargs = None,
                 cylinder_fit_kwargs = None,
@@ -155,9 +171,12 @@ def fit_surface(cluster,
                 return {"surface_id": cone_results, "result": results[cone_results], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
 
         else:
-            mesh = resolve_mesh(simple_min, results[simple_min], cluster, np_rng, device,
+            surface_to_use = simple_min
+            if simple_min == SURFACE_PLANE:
+                surface_to_use = plane_special_handling(results, errors, plane_sphere_ratio_threshold)
+            mesh = resolve_mesh(surface_to_use, results[surface_to_use], cluster, np_rng, device,
             plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
-            return {"surface_id": simple_min, "result": results[simple_min], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
+            return {"surface_id": surface_to_use, "result": results[surface_to_use], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
         
     inr_result = fit_inr(cluster, inr_network_parameters, device = device, **inr_fit_kwargs)
     # print(f"Plane error: {plane_result['error']:.4f} Sphere error: {sphere_result['error']:.4f} Cylinder error: {cylinder_result['error']:.4f} Cone error: {cone_result['error']:.4f} INR error: {inr_result['error']:.4f}")
@@ -176,6 +195,8 @@ def fit_surface(cluster,
             # In that case, use INR.
             if resulting_min == -1:
                 resulting_min = global_min
+        elif resulting_min == SURFACE_PLANE:
+            resulting_min = plane_special_handling(results, errors[:-1], plane_sphere_ratio_threshold)
 
     mesh = resolve_mesh(resulting_min, results[resulting_min], cluster, np_rng, device,
                         plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)

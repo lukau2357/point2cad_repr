@@ -12,6 +12,7 @@ solver `GeomAPI_IntSS`.
 | Plane ∩ Plane | Analytical | `Geom_Line` |
 | Plane ∩ Sphere | Analytical | `Geom_Circle` or tangent `gp_Pnt` |
 | Sphere ∩ Sphere | Analytical (radical plane) | `Geom_Circle` or tangent `gp_Pnt` |
+| Plane ∩ Cylinder (axis-parallel, tangent) | Analytical fallback after OCC empty | `Geom_Line` (generator line) |
 | All other pairs | OCC `GeomAPI_IntSS` | `Geom_Curve` (concrete subtype is an OCC implementation detail, not specified in the public API; inspect with `isinstance` at runtime) |
 
 `GeomAPI_IntSS` does not expose a point query method.  When `IsDone()` is
@@ -313,6 +314,79 @@ the plane–sphere formula.
 
 ---
 
+### Plane ∩ Cylinder → Generator Line (tangent fallback)
+
+`GeomAPI_IntSS` returns `NbLines() == 0` (indistinguishable from "no intersection")
+when a plane is parallel to the cylinder axis and tangent to its surface.  The true
+intersection is a single **generator line** (ruling of the cylinder).
+
+**Setup.**
+
+$$\text{Plane}: \mathbf{n}\cdot\mathbf{x} = d \quad(\text{unit normal }\mathbf{n}) \qquad
+  \text{Cylinder}: \text{axis direction }\mathbf{a}\text{ (unit), point on axis }\mathbf{c},\text{ radius }r$$
+
+**Substituting a cylinder surface point.**  A generic point on the cylinder:
+
+$$\mathbf{p}(u,v) = \mathbf{c} + v\,\mathbf{a} + r\bigl(\cos u\,\mathbf{e}_1 + \sin u\,\mathbf{e}_2\bigr)$$
+
+where $\mathbf{e}_1, \mathbf{e}_2$ are any orthonormal pair perpendicular to $\mathbf{a}$.
+Substituting into the plane equation and letting $\alpha = \mathbf{n}\cdot\mathbf{a}$,
+$D = d - \mathbf{n}\cdot\mathbf{c}$, $B = \mathbf{n}\cdot\mathbf{e}_1$,
+$C = \mathbf{n}\cdot\mathbf{e}_2$:
+
+$$v\alpha + r(B\cos u + C\sin u) = D$$
+
+**Parallel case $\alpha \approx 0$.**  The $v$ term vanishes.  Let
+$\mathbf{n}_\perp = \mathbf{n} - \alpha\mathbf{a}$ (component of $\mathbf{n}$
+perpendicular to $\mathbf{a}$); then $B^2 + C^2 = |\mathbf{n}_\perp|^2$ and:
+
+$$r\,|\mathbf{n}_\perp|\,\cos(u - \varphi) = D, \qquad \varphi = \operatorname{atan2}(C, B)$$
+
+The perpendicular distance from the cylinder axis to the plane is
+$\delta = |D|/|\mathbf{n}_\perp|$.
+
+| $\delta$ vs $r$ | Intersection |
+|-----------------|-------------|
+| $\delta > r$ | empty |
+| $\delta = r$ | one generator line — **tangent; OCC returns empty** |
+| $\delta < r$ | two generator lines — secant; OCC handles correctly |
+
+**Tangent foot.**  For $\delta = r$ the unique solution $u_0$ yields a tangent point
+$\mathbf{q}$ on both the plane and the cylinder surface.  Without computing
+$\mathbf{e}_1, \mathbf{e}_2$ explicitly:
+
+$$\mathbf{q} = \mathbf{c} + \frac{D}{|\mathbf{n}_\perp|^2}\,\mathbf{n}_\perp$$
+
+*Proof — lies on the plane:*
+
+$$\mathbf{n}\cdot\mathbf{q}
+  = \mathbf{n}\cdot\mathbf{c} + \frac{D}{|\mathbf{n}_\perp|^2}
+    \underbrace{(\mathbf{n}\cdot\mathbf{n}_\perp)}_{=|\mathbf{n}_\perp|^2}
+  = \mathbf{n}\cdot\mathbf{c} + D = d \quad\checkmark$$
+
+($\mathbf{n}\cdot\mathbf{n}_\perp = |\mathbf{n}_\perp|^2$ because
+$\mathbf{n} = \mathbf{n}_\perp + \alpha\mathbf{a}$ and
+$\mathbf{a}\cdot\mathbf{n}_\perp = 0$.)
+
+*Proof — lies on the cylinder:*
+
+$$\operatorname{dist}(\mathbf{q}, \text{axis})
+  = \left|\frac{D}{|\mathbf{n}_\perp|^2}\mathbf{n}_\perp\right|
+  = \frac{|D|}{|\mathbf{n}_\perp|} = \delta = r \quad\checkmark$$
+
+The generator line is `Geom_Line(q, a)`.  It is subsequently trimmed to the vertex-bounded
+arc segment by the existing `trim_by_vertices` machinery.
+
+**Note on plane–cone tangency.**  A plane can also be tangent to a cone along a single
+generator line (when the plane passes through the cone apex and satisfies
+$\mathbf{n}\cdot\mathbf{d}_\text{gen} = 0$ for a generator direction
+$\mathbf{d}_\text{gen}$ with $\mathbf{d}_\text{gen}\cdot\mathbf{a} = \cos\theta$).
+OCC likely has the same limitation there, but the derivation is more involved
+(variable generator direction) and the case is less common in mechanical CAD.
+Left as a future TODO.
+
+---
+
 ## Why OCC for cylinder, cone and mixed pairs
 
 For these pairs the intersection curve is no longer a simple conic.  For
@@ -329,3 +403,9 @@ OCC's `GeomAPI_IntSS` handles this internally by:
 
 The result is always a parametric `Geom_Curve` — OCC does not expose the
 implicit algebraic form $F(x, y, z) = 0$.
+
+**Exception — plane ∩ cylinder tangent case.**  The pipeline now partially handles
+plane ∩ cylinder analytically: when OCC returns empty for this pair, a fallback
+checks whether the plane is axis-parallel and tangent ($\delta \approx r$) and, if
+so, returns the single generator line analytically (see section above).  The general
+non-degenerate plane ∩ cylinder case (circle or ellipse) still uses OCC.
