@@ -124,6 +124,48 @@ robust but resolution-dependent.
 
 ---
 
+## Part-Level Reconstruction and Evaluation
+
+### Why part-level?
+
+Some ABC models are Compounds of N independent solid parts.  Processing the
+entire Compound as one point cloud yields too many clusters (e.g. 60 for a
+10-part model), causing numerical instability in surface fitting and BRep
+construction.  The generation script (`abc_preprocess.py --by_part`) splits
+each part into a separate `.xyzc` file; `brep_pipeline.py --model_id` runs
+the reconstruction pipeline on each part independently.
+
+### Output layout (reconstruction)
+
+```
+output_brep/
+  {model_id}/
+    part_000/         ← per-part npz files + {model_id}_part_000_bop.step
+    part_001/
+    ...
+    unified/          ← merged npz files with cluster ID offsets (for visualizer)
+    unified_bop.step  ← all part STEPs merged into one Compound
+```
+
+The `unified/` directory uses globally offset cluster IDs so the visualizer
+(`brep_pipeline.py --visualize --model_id`) works without any changes.
+
+### Evaluation: part-agnostic via unified STEP
+
+Because the unified STEP (`unified_bop.step`) is a single Compound shape
+containing all reconstructed parts, evaluation is identical to the single-model
+case:
+
+1. Sample N points from `unified_bop.step` (pool all faces, area-weighted)
+2. Sample N points from the ground-truth STEP file (same logic)
+3. Compute Chamfer / Hausdorff / F-score between the two point sets
+
+No part-correspondence matching is needed.  Parts that failed BRep construction
+produce no faces in the unified STEP, which naturally increases Chamfer distance
+to the GT points in those regions — an appropriate penalty.
+
+The GT STEP does not need to be split; it is sampled as-is.
+
 ## Recommended Evaluation Pipeline
 
 For comparison with prior work (ComplexGen, HNC-CAD, ABC baselines):

@@ -325,6 +325,95 @@ other by averaging.
 `GeomAPI_ExtremaCurveCurve` reports all local extrema of $D(t_1, t_2)$ via
 subdivision + Newton–Raphson.
 
+### Infinite-domain curves and parameter bounding
+
+`GeomAPI_IntSS` returns `Geom_Curve` objects (the base pythonocc handle type).
+For several intersection types the parameter domain is unbounded:
+
+| Intersection | Returned type | Domain |
+|---|---|---|
+| Plane ∩ Cone (steep angle) | `Geom_Hyperbola` | $(-\infty, +\infty)$ |
+| Plane ∩ Cone (generator angle) | `Geom_Parabola` | $(-\infty, +\infty)$ |
+| Plane ∩ Plane | `Geom_Line` | $(-\infty, +\infty)$ |
+| Plane ∩ Cylinder (secant) | `Geom_Line` × 2 | $(-\infty, +\infty)$ |
+| Plane ∩ Cylinder / Cone (generic) | `Geom_Ellipse` | $[t_0, t_1]$ finite |
+| Cone ∩ Cylinder, Cone ∩ Cone, … | `Geom_BSplineCurve` | $[0, 1]$ |
+
+OCC internally parameterises a hyperbola as
+
+$$\mathbf{P}(t) = \mathbf{C} + a\cosh(t)\,\hat{\mathbf{X}} + b\sinh(t)\,\hat{\mathbf{Y}}$$
+
+When `GeomAPI_ExtremaCurveCurve` or `GeomAPI_ProjectPointOnCurve` is called
+without explicit parameter bounds, OCC's subdivision-step samples the curve at
+extreme parameter values.  Because $\cosh(710) > \texttt{DBL\_MAX} \approx
+1.8 \times 10^{308}$, this throws:
+
+```
+Standard_NumericError: Result of Cosh exceeds the maximum value Standard_Real
+```
+
+`Geom_Line` does not cause this error because its evaluation is linear
+($\mathbf{P}(t) = \mathbf{P}_0 + t\,\hat{\mathbf{d}}$) and IEEE 754 handles
+large-but-finite floating-point magnitudes gracefully.  `Geom_Parabola`
+evaluates $t^2$ so in principle overflows at $|t| > 10^{154}$, but in practice
+OCC's solver converges before reaching such values; however, it is bounded
+conservatively along with the others.
+
+#### Analytical parameter bounds
+
+For a model normalised to extent $L$ (default $L = 2.0$, conservative for a
+unit-cube model), the minimum parameter interval that covers all real vertices
+is derived from each curve's own geometry:
+
+**Hyperbola** — a flat conservative bound $|t| \le 10$ is used.
+$\cosh(10) \approx 11013$, $\sinh(10) \approx 11013$ — completely safe from
+overflow.  The analytical formula $|t| \le \cosh^{-1}(L/a)$ breaks when the
+hyperbola's major radius $a > L$: since $L/a < 1$, $\cosh^{-1}$ is undefined
+and the bound collapses to $\approx 0$, cutting off the actual vertex parameters.
+Because $a$ can exceed $L$ for plane-cone intersections with wide cone angles,
+the model-size-independent bound $|t| \le 10$ is used unconditionally.
+
+**Parabola** — the parameterisation is $x(t) = t^2/(4f)$, $y(t) = t$ where
+$f$ is the focal length.  Covering lateral extent $|y| \le L$ requires
+$|t| \le L$; covering axial extent $|x| \le L$ requires $|t| \le 2\sqrt{fL}$.
+Taking the maximum:
+
+$$|t| \le \max\!\left(L,\; 2\sqrt{fL}\right), \qquad f = \texttt{Focal()}$$
+
+**Line** — arc-length parameterisation; covering extent $L$ requires $|t| \le L$.
+
+**Other / unknown infinite type** — conservative fallback $|t| \le 10$.
+
+#### Why overloaded constructors are insufficient
+
+Both `GeomAPI_ExtremaCurveCurve` and `GeomAPI_ProjectPointOnCurve` have
+overloads that accept explicit parameter bounds (6-argument and 4-argument
+forms, respectively).  In practice these overloads do **not** prevent the
+overflow, because OCC's internal solver infrastructure dispatches through a
+`GeomAdaptor_Curve` whose `FirstParameter()` / `LastParameter()` still query
+the underlying `Geom_Hyperbola` — returning ±`Precision::Infinite()` (≈ ±2×10¹⁰⁰)
+regardless of the bounds passed at the API level.
+
+#### Fix: pre-wrap in `Geom_TrimmedCurve`
+
+`Geom_TrimmedCurve(base, u_min, u_max)` overrides the virtual `FirstParameter()` /
+`LastParameter()` methods at the C++ level, so every OCC solver that queries
+these on the handle gets the trim bounds directly.  The function
+`_as_safe_curve(curve, model_extent=2.0)` in `surface_intersection.py`:
+
+1. Returns the curve unchanged if its bounds are already finite.
+2. Otherwise, classifies the curve via `GeomAdaptor_Curve.GetType()`, computes
+   the analytical `t_bound` as above, and returns
+   `Geom_TrimmedCurve(curve, -t_bound, +t_bound)`.
+
+All calls to `GeomAPI_ExtremaCurveCurve` and `GeomAPI_ProjectPointOnCurve` in
+the pipeline go through `_as_safe_curve` first, using the standard 2- and
+2-argument constructors on the resulting (always-finite) curve handle.
+
+`Geom_TrimmedCurve` preserves the underlying parameterisation, so vertex
+parameters obtained from the trimmed curve are directly usable with the
+original curve's `Value(t)` method.
+
 ---
 
 ## 3 — Arc splitting (Step 1)

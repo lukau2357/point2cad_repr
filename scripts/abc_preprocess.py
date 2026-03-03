@@ -11,13 +11,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from point2cad.color_config import get_surface_color
 
 try:
-    from OCC.Core.STEPControl import STEPControl_Reader
+    from OCC.Core.STEPControl import (STEPControl_Reader, STEPControl_Writer,
+                                       STEPControl_AsIs)
     from OCC.Core.TopExp      import TopExp_Explorer
     from OCC.Core.TopAbs      import (TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX,
                                        TopAbs_SOLID, TopAbs_SHELL,
                                        TopAbs_COMPOUND, TopAbs_COMPSOLID)
-    from OCC.Core.TopoDS             import topods
-    from OCC.Core.BRep        import BRep_Tool
+    from OCC.Core.TopoDS      import topods, TopoDS_Iterator, TopoDS_Compound
+    from OCC.Core.BRep        import BRep_Tool, BRep_Builder
+    from OCC.Core.Message     import Message_ProgressRange
     from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
     from OCC.Core.GeomAbs     import (
         GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere,
@@ -264,6 +266,36 @@ def load_step(step_path):
         face_list.append(topods.Face(exp.Current()))
         exp.Next()
     return shape, face_list
+
+
+# ---------------------------------------------------------------------------
+# Part decomposition helpers
+# ---------------------------------------------------------------------------
+
+def extract_top_level_parts(shape):
+    """
+    Return the immediate sub-shapes (parts) of a Compound / CompSolid.
+    For any other shape type (Solid, Shell, …) returns [shape] so that
+    callers can always iterate uniformly over parts.
+    """
+    if shape.ShapeType() not in (TopAbs_COMPOUND, TopAbs_COMPSOLID):
+        return [shape]
+    parts = []
+    it = TopoDS_Iterator(shape)
+    while it.More():
+        parts.append(it.Value())
+        it.Next()
+    return parts if parts else [shape]
+
+
+def faces_of_shape(shape):
+    """Return all TopoDS_Face objects contained anywhere within shape."""
+    exp   = TopExp_Explorer(shape, TopAbs_FACE)
+    faces = []
+    while exp.More():
+        faces.append(topods.Face(exp.Current()))
+        exp.Next()
+    return faces
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +796,13 @@ if __name__ == "__main__":
     parser.add_argument("--batch", action="store_true",
                         help="Batch-convert all available models")
     parser.add_argument("--seed",  type=int, default=42)
-    args = parser.parse_args()
+    parser.add_argument("--no_by_part", action="store_true", default=False,
+                        help="Disable part-level decomposition and sample the whole "
+                             "STEP as one point cloud.  By default each top-level "
+                             "sub-shape produces a separate "
+                             "abc_{id}_part_{idx:03d}.xyzc + _stats.json file.")
+    args   = parser.parse_args()
+    by_part = not args.no_by_part
 
     rng = np.random.default_rng(args.seed)
     if args.stats_dir is None:
@@ -792,29 +830,76 @@ if __name__ == "__main__":
             if shape is None:
                 sys.exit(1)
 
-            stats = extract_step_stats(args.model_id, step_path, shape, face_list)
-            print_step_stats(stats)
-
-            points, labels = _sample_faces(
-                face_list, args.num_points, args.min_points_per_surface,
-                rng, grid_res=args.grid_res,
-            )
-            stats["n_sampled_points"] = int(len(points))
-            stats["n_clusters"]       = int(len(np.unique(labels)))
-
-            if args.visualize and len(points):
-                visualize_step_model(points, labels, stats["face_types"])
-
-            if len(points):
-                stem = f"abc_{args.model_id}"
-                if args.output_dir:
-                    os.makedirs(args.output_dir, exist_ok=True)
-                    export_xyzc(points, labels,
-                                os.path.join(args.output_dir, f"{stem}.xyzc"))
-                if args.stats_dir:
-                    os.makedirs(args.stats_dir, exist_ok=True)
-                    export_stats_json(stats,
-                                      os.path.join(args.stats_dir, f"{stem}_stats.json"))
+            if by_part:
+                parts = extract_top_level_parts(shape)
+                print(f"  Found {len(parts)} top-level part(s)")
+                xyzc_dir  = os.path.join(args.output_dir, f"abc_{args.model_id}") if args.output_dir else None
+                stats_dir = os.path.join(args.stats_dir, f"abc_{args.model_id}") if args.stats_dir else None
+                if xyzc_dir:
+                    os.makedirs(xyzc_dir, exist_ok=True)
+                if stats_dir:
+                    os.makedirs(stats_dir, exist_ok=True)
+                vis_points, vis_labels, vis_face_types = [], [], []
+                label_offset = 0
+                for part_idx, part in enumerate(parts):
+                    part_faces = faces_of_shape(part)
+                    if not part_faces:
+                        print(f"  Part {part_idx}: no faces, skipping")
+                        continue
+                    part_id = f"{args.model_id}_part_{part_idx}"
+                    print(f"  Part {part_idx}: {len(part_faces)} face(s)")
+                    stats = extract_step_stats(part_id, step_path, part, part_faces)
+                    print_step_stats(stats)
+                    points, labels = _sample_faces(
+                        part_faces, args.num_points, args.min_points_per_surface,
+                        rng, grid_res=args.grid_res,
+                    )
+                    if not len(points):
+                        continue
+                    stats["n_sampled_points"] = int(len(points))
+                    stats["n_clusters"]       = int(len(np.unique(labels)))
+                    if args.visualize:
+                        vis_points.append(points)
+                        vis_labels.append(labels + label_offset)
+                        vis_face_types.extend(stats["face_types"])
+                        label_offset += len(part_faces)
+                    if xyzc_dir:
+                        export_xyzc(points, labels,
+                                    os.path.join(xyzc_dir, f"{part_idx}.xyzc"))
+                    if stats_dir:
+                        export_stats_json(
+                            stats, os.path.join(stats_dir, f"{part_idx}_stats.json"))
+                if args.visualize and vis_points:
+                    visualize_step_model(
+                        np.concatenate(vis_points),
+                        np.concatenate(vis_labels),
+                        vis_face_types,
+                    )
+            else:
+                xyzc_dir  = os.path.join(args.output_dir, f"abc_{args.model_id}") if args.output_dir else None
+                stats_dir = os.path.join(args.stats_dir, f"abc_{args.model_id}") if args.stats_dir else None
+                if xyzc_dir:
+                    os.makedirs(xyzc_dir, exist_ok=True)
+                if stats_dir:
+                    os.makedirs(stats_dir, exist_ok=True)
+                stats = extract_step_stats(args.model_id, step_path, shape, face_list)
+                print_step_stats(stats)
+                points, labels = _sample_faces(
+                    face_list, args.num_points, args.min_points_per_surface,
+                    rng, grid_res=args.grid_res,
+                )
+                if len(points):
+                    stats["n_sampled_points"] = int(len(points))
+                    stats["n_clusters"]       = int(len(np.unique(labels)))
+                    if args.visualize:
+                        visualize_step_model(points, labels, stats["face_types"])
+                    stem = f"abc_{args.model_id}"
+                    if xyzc_dir:
+                        export_xyzc(points, labels,
+                                    os.path.join(xyzc_dir, f"{stem}.xyzc"))
+                    if stats_dir:
+                        export_stats_json(
+                            stats, os.path.join(stats_dir, f"{stem}_stats.json"))
 
         else:  # obj sampler
             result = analyze_model(args.abc_dir, args.model_id)
@@ -857,18 +942,56 @@ if __name__ == "__main__":
                 shape, face_list = load_step(step_path)
                 if shape is None:
                     continue
-                stats          = extract_step_stats(mid, step_path, shape, face_list)
-                points, labels = _sample_faces(
-                    face_list, args.num_points, args.min_points_per_surface,
-                    rng, grid_res=args.grid_res,
-                )
-                if len(points):
-                    stats["n_sampled_points"] = int(len(points))
-                    stats["n_clusters"]       = int(len(np.unique(labels)))
-                    if args.stats_dir:
-                        export_stats_json(
-                            stats, os.path.join(args.stats_dir, f"{stem}_stats.json"))
-            else:
+
+                if by_part:
+                    parts     = extract_top_level_parts(shape)
+                    xyzc_dir  = os.path.join(args.output_dir, f"abc_{mid}")
+                    stats_dir = os.path.join(args.stats_dir, f"abc_{mid}") if args.stats_dir else None
+                    os.makedirs(xyzc_dir, exist_ok=True)
+                    if stats_dir:
+                        os.makedirs(stats_dir, exist_ok=True)
+                    for part_idx, part in enumerate(parts):
+                        part_faces = faces_of_shape(part)
+                        if not part_faces:
+                            continue
+                        part_id        = f"{mid}_part_{part_idx}"
+                        stats          = extract_step_stats(part_id, step_path,
+                                                            part, part_faces)
+                        points, labels = _sample_faces(
+                            part_faces, args.num_points, args.min_points_per_surface,
+                            rng, grid_res=args.grid_res,
+                        )
+                        if not len(points):
+                            continue
+                        stats["n_sampled_points"] = int(len(points))
+                        stats["n_clusters"]       = int(len(np.unique(labels)))
+                        export_xyzc(points, labels,
+                                    os.path.join(xyzc_dir, f"{part_idx}.xyzc"))
+                        if stats_dir:
+                            export_stats_json(
+                                stats,
+                                os.path.join(stats_dir, f"{part_idx}_stats.json"))
+                else:
+                    xyzc_dir  = os.path.join(args.output_dir, f"abc_{mid}")
+                    stats_dir = os.path.join(args.stats_dir, f"abc_{mid}") if args.stats_dir else None
+                    os.makedirs(xyzc_dir, exist_ok=True)
+                    if stats_dir:
+                        os.makedirs(stats_dir, exist_ok=True)
+                    stats          = extract_step_stats(mid, step_path, shape, face_list)
+                    points, labels = _sample_faces(
+                        face_list, args.num_points, args.min_points_per_surface,
+                        rng, grid_res=args.grid_res,
+                    )
+                    if len(points):
+                        stats["n_sampled_points"] = int(len(points))
+                        stats["n_clusters"]       = int(len(np.unique(labels)))
+                        export_xyzc(points, labels,
+                                    os.path.join(xyzc_dir, f"abc_{mid}.xyzc"))
+                        if stats_dir:
+                            export_stats_json(
+                                stats,
+                                os.path.join(stats_dir, f"abc_{mid}_stats.json"))
+            else:  # obj sampler
                 obj_path, feat_path = find_model_files(args.abc_dir, mid)
                 vertices, faces     = load_obj(obj_path)
                 surfaces, _         = load_features(feat_path)
@@ -877,12 +1000,11 @@ if __name__ == "__main__":
                     vertices, faces, face_labels,
                     args.num_points, args.min_points_per_surface, rng,
                 )
+                if len(points) == 0:
+                    print(f"  [{i+1}/{len(model_ids)}] {mid}: skipped (no valid geometry)")
+                    continue
+                export_xyzc(points, labels, os.path.join(args.output_dir, f"{stem}.xyzc"))
 
-            if len(points) == 0:
-                print(f"  [{i+1}/{len(model_ids)}] {mid}: skipped (no valid geometry)")
-                continue
-
-            export_xyzc(points, labels, os.path.join(args.output_dir, f"{stem}.xyzc"))
             if (i + 1) % 100 == 0:
                 print(f"  Progress: {i+1}/{len(model_ids)}")
 

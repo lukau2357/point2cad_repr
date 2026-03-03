@@ -29,15 +29,27 @@ except ImportError:
     from point2cad.cluster_adjacency import adjacency_pairs, adjacency_triangles
 
 try:
-    from OCC.Core.gp        import gp_Pnt, gp_Dir, gp_Lin, gp_Circ, gp_Ax2
-    from OCC.Core.Geom      import Geom_Line, Geom_Circle, Geom_TrimmedCurve
-    from OCC.Core.GeomAPI   import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve, GeomAPI_ExtremaCurveCurve
-    from OCC.Core.Precision import precision
-    _OCC_INF     = precision.Infinite()
+    from OCC.Core.gp          import gp_Pnt, gp_Dir, gp_Lin, gp_Circ, gp_Ax2
+    from OCC.Core.Geom        import Geom_Line, Geom_Circle, Geom_TrimmedCurve
+    from OCC.Core.GeomAPI     import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve, GeomAPI_ExtremaCurveCurve
+    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
+    from OCC.Core.GeomAbs     import (GeomAbs_Line, GeomAbs_Circle, GeomAbs_Ellipse,
+                                       GeomAbs_Hyperbola, GeomAbs_Parabola,
+                                       GeomAbs_BezierCurve, GeomAbs_BSplineCurve,
+                                       GeomAbs_OtherCurve)
+    from OCC.Core.Precision   import precision
+    _OCC_INF = precision.Infinite()
+    _GEOMABS_NAMES = {
+        GeomAbs_Line: "Line", GeomAbs_Circle: "Circle", GeomAbs_Ellipse: "Ellipse",
+        GeomAbs_Hyperbola: "Hyperbola", GeomAbs_Parabola: "Parabola",
+        GeomAbs_BezierCurve: "Bezier", GeomAbs_BSplineCurve: "BSpline",
+        GeomAbs_OtherCurve: "Other",
+    }
     OCC_AVAILABLE = True
 except ImportError as err:
-    _OCC_INF      = float("inf")
-    OCC_AVAILABLE = False
+    _OCC_INF       = float("inf")
+    _GEOMABS_NAMES = {}
+    OCC_AVAILABLE  = False
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -62,6 +74,58 @@ def _gp_dir(v):
 
 def _result(curves, points, curve_type, method):
     return {"curves": curves, "points": points, "type": curve_type, "method": method}
+
+
+def _as_safe_curve(curve, model_extent=2.0):
+    """
+    Return the curve unchanged if it has finite parameter bounds, or wrapped in
+    Geom_TrimmedCurve with analytically-derived finite bounds otherwise.
+
+    Motivation: GeomAPI_ExtremaCurveCurve and GeomAPI_ProjectPointOnCurve
+    internally call curve.FirstParameter() / LastParameter() (virtual dispatch)
+    to initialise their numerical solvers, ignoring any explicit bounds passed
+    in overloaded constructors.  For Geom_Hyperbola the native bounds are
+    ±Precision::Infinite() (≈ ±2e100), causing cosh(2e100) → Standard_
+    NumericError.  Wrapping in Geom_TrimmedCurve overrides those virtual calls
+    at the C++ level so the solvers see only the safe interval.
+
+    The trim bounds are derived analytically so the trimmed portion covers all
+    geometry within a model of extent `model_extent` (default 2.0, generous for
+    a unit-cube model):
+
+      Geom_Hyperbola : t ∈ [−10, +10]   (cosh(10)≈11013, safe and model-size-independent)
+      Geom_Parabola  : t ∈ [−max(L, 2√(fL)), +max(L, 2√(fL))]  f = Focal()
+      Geom_Line      : t ∈ [−L, +L]  (arc-length parameterisation)
+      other/unknown  : t ∈ [−10, +10]  (conservative fallback)
+
+    See notes/brep_construction.md §2 for the derivations.
+    """
+    t0 = curve.FirstParameter()
+    t1 = curve.LastParameter()
+    if abs(t0) < _OCC_INF and abs(t1) < _OCC_INF:
+        return curve   # already finite — no wrapping needed
+
+    L       = model_extent
+    adaptor = GeomAdaptor_Curve(curve)
+    ctype   = adaptor.GetType()
+
+    if ctype == GeomAbs_Hyperbola:
+        # Use a flat conservative bound: cosh(10) ≈ 11013, sinh(10) ≈ 11013 —
+        # completely safe from overflow and large enough to cover any vertex in a
+        # unit-cube model regardless of the hyperbola's major radius.
+        # The analytical arccosh(L/a) formula breaks when a > L because then
+        # L/a < 1 and arccosh is undefined, collapsing the bound to ≈ 0.
+        t_bound = 10.0
+    elif ctype == GeomAbs_Parabola:
+        f       = max(adaptor.Parabola().Focal(), 1e-10)
+        t_bound = max(L, 2.0 * math.sqrt(f * L))
+    elif ctype == GeomAbs_Line:
+        t_bound = L
+    else:
+        t_bound = 10.0   # conservative fallback for unknown infinite-domain types
+
+    return Geom_TrimmedCurve(curve, -t_bound, t_bound)
+
 
 # ---------------------------------------------------------------------------
 # Analytical intersections
@@ -196,7 +260,7 @@ def _intersect_plane_cylinder_tangent(pi_plane, pi_cyl,
 # OCC generic fallback
 # ---------------------------------------------------------------------------
 
-def _intersect_occ(occ_surf_i, occ_surf_j, tol):
+def _intersect_occ(occ_surf_i, occ_surf_j, tol, label=""):
     # https://dev.opencascade.org/doc/refman/html/class_geom_a_p_i___int_s_s.html#details
     try:
         inter = GeomAPI_IntSS(occ_surf_i, occ_surf_j, tol)
@@ -207,12 +271,20 @@ def _intersect_occ(occ_surf_i, occ_surf_j, tol):
         return _result([], [], "failed", "occ")
 
     curves = [inter.Line(k) for k in range(1, inter.NbLines() + 1)]
-    
+
     if not curves:
         # GeomAPI_IntSS exposes no point query; NbLines()==0 after IsDone()
         # means either no intersection or point tangency (indistinguishable
         # at this API level).
         return _result([], [], "empty", "occ")
+
+    prefix = f"[intersect] {label}: " if label else "[intersect] "
+    for c in curves:
+        t0, t1 = c.FirstParameter(), c.LastParameter()
+        gtype  = _GEOMABS_NAMES.get(GeomAdaptor_Curve(c).GetType(), "?")
+        t0_str = f"{t0:.4g}" if abs(t0) < _OCC_INF else "-inf"
+        t1_str = f"{t1:.4g}" if abs(t1) < _OCC_INF else "+inf"
+        print(f"  {prefix}{gtype}  t=[{t0_str}, {t1_str}]")
 
     return _result(curves, [], "curve", "occ")
 
@@ -222,7 +294,7 @@ def _intersect_occ(occ_surf_i, occ_surf_j, tol):
 
 def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
                        surface_id_j, result_j, occ_surf_j,
-                       tol = 1e-6):
+                       tol = 1e-6, label = ""):
     """
     Compute the intersection between two adjacent surfaces.
 
@@ -259,12 +331,12 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
     # fall back to analytical tangent-line if OCC returns empty.
     # TODO: add plane ∩ cone tangent fallback when needed.
     if si == SURFACE_PLANE and sj == SURFACE_CYLINDER:
-        occ = _intersect_occ(oi, oj, tol)
+        occ = _intersect_occ(oi, oj, tol, label=label)
         if occ["type"] == "empty":
             return _intersect_plane_cylinder_tangent(pi, pj)
         return occ
 
-    return _intersect_occ(oi, oj, tol)
+    return _intersect_occ(oi, oj, tol, label=label)
 
 
 def compute_all_intersections(adj, surface_ids, results, occ_surfaces, tol = 1e-6):
@@ -284,7 +356,8 @@ def compute_all_intersections(adj, surface_ids, results, occ_surfaces, tol = 1e-
         (i, j): intersect_surfaces(
             surface_ids[i], results[i], occ_surfaces[i],
             surface_ids[j], results[j], occ_surfaces[j],
-            tol = tol,
+            tol   = tol,
+            label = f"({i},{j}) {SURFACE_NAMES[surface_ids[i]]}∩{SURFACE_NAMES[surface_ids[j]]}",
         )
         for i, j in adjacency_pairs(adj)
     }
@@ -434,10 +507,11 @@ def trim_by_vertices(raw_intersections, vertices, vertex_edges,
         # ------------------------------------------------------------------
         if len(open_curves) > 1 and len(vpositions) >= 2:
             def _min_vertex_dist(c):
-                best = float("inf")
+                best  = float("inf")
+                c_s   = _as_safe_curve(c)
                 for vpos in vpositions:
                     proj = GeomAPI_ProjectPointOnCurve(
-                        gp_Pnt(float(vpos[0]), float(vpos[1]), float(vpos[2])), c
+                        gp_Pnt(float(vpos[0]), float(vpos[1]), float(vpos[2])), c_s
                     )
                     if proj.NbPoints() > 0:
                         best = min(best, float(proj.LowerDistance()))
@@ -460,9 +534,10 @@ def trim_by_vertices(raw_intersections, vertices, vertex_edges,
             trimmed_c = None
             if len(vpositions) >= 2:
                 params = []
+                c_safe = _as_safe_curve(c)
                 for vpos in vpositions:
                     proj = GeomAPI_ProjectPointOnCurve(
-                        gp_Pnt(float(vpos[0]), float(vpos[1]), float(vpos[2])), c
+                        gp_Pnt(float(vpos[0]), float(vpos[1]), float(vpos[2])), c_safe
                     )
                     if proj.NbPoints() > 0:
                         params.append(float(proj.LowerDistanceParameter()))
@@ -550,7 +625,9 @@ def compute_vertices(adj, intersections, threshold = 1e-4):
             for ca in curves_a:
                 for cb in curves_b:
                     try:
-                        ext = GeomAPI_ExtremaCurveCurve(ca, cb)
+                        ca_s = _as_safe_curve(ca)
+                        cb_s = _as_safe_curve(cb)
+                        ext = GeomAPI_ExtremaCurveCurve(ca_s, cb_s)
                     except Exception as err:
                         print(f"[compute_vertices] ExtremaCurveCurve exception ({ea},{eb}): {err}")
                         continue

@@ -182,6 +182,44 @@ primitive surface as a single face. Even when splitting does occur, each face is
 a coherent patch of the same analytical type, so the fitting step is unaffected — at
 worst the model is slightly over-segmented.
 
+### Part-level sampling (default)
+
+Many ABC STEP files are `TopAbs_COMPOUND` shapes containing multiple independent
+solid parts (e.g. a row of 10 identical cylinder+plane assemblies).  Sampling all
+faces globally yields 60 clusters instead of ~6, causing numerical instability
+and poor BRep reconstruction.
+
+By default `abc_preprocess.py` decomposes the top-level shape using
+`TopoDS_Iterator` (immediate children only, not recursive), processes each part
+independently with the existing area-weighted sampler, and saves one `.xyzc` file
+per part.  A single analytical surface that spans multiple parts is not possible
+in a well-formed B-Rep, so part-level decomposition is always safe.
+
+**Output layout** (default, `--by_part` active):
+```
+output_dir/
+  abc_{model_id}/
+    part_000.xyzc
+    part_001.xyzc
+    ...
+stats_dir/
+  abc_{model_id}/
+    part_000_stats.json
+    part_001_stats.json
+    ...
+```
+
+**Output layout** (`--no_by_part`, whole-model):
+```
+sample_clouds/
+  abc_{model_id}.xyzc
+sample_clouds_stats/
+  abc_{model_id}_stats.json
+```
+
+**`--num_points`** is applied per part (not divided among parts), so each
+part gets a dense-enough point cloud regardless of its relative size.
+
 ### Running the STEP sampler
 
 ```bash

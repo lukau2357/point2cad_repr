@@ -29,12 +29,12 @@ try:
     from OCC.Core.Geom2dAPI      import Geom2dAPI_PointsToBSpline
     from OCC.Core.GeomAPI        import GeomAPI_ProjectPointOnCurve, GeomAPI_ProjectPointOnSurf
     from OCC.Core.GeomLProp      import GeomLProp_SLProps
-    from OCC.Core.gp             import gp_Pnt, gp_Pnt2d
+    from OCC.Core.gp             import gp_Pnt, gp_Pnt2d, gp_GTrsf
     from OCC.Core.TColgp         import TColgp_Array1OfPnt2d
     from OCC.Core.BRep           import BRep_Builder, BRep_Tool
     from OCC.Core.TopExp         import TopExp_Explorer
     from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_SHELL, TopAbs_SOLID
-    from OCC.Core.TopoDS         import topods
+    from OCC.Core.TopoDS         import topods, TopoDS_Wire, TopoDS_Compound
     from OCC.Core.BRepBuilderAPI import (
         BRepBuilderAPI_MakeVertex,
         BRepBuilderAPI_MakeEdge,
@@ -42,10 +42,12 @@ try:
         BRepBuilderAPI_MakeFace,
         BRepBuilderAPI_MakeSolid,
         BRepBuilderAPI_Sewing,
+        BRepBuilderAPI_GTransform,
     )
     from OCC.Core.ShapeFix       import ShapeFix_Wire, ShapeFix_Shape
     from OCC.Core.BRepLib        import breplib
-    from OCC.Core.STEPControl    import STEPControl_Writer, STEPControl_AsIs
+    from OCC.Core.STEPControl    import (STEPControl_Writer, STEPControl_AsIs,
+                                          STEPControl_Reader)
     from OCC.Core.IFSelect       import IFSelect_RetDone
     from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume
     from OCC.Core.BRepCheck      import BRepCheck_Analyzer
@@ -396,7 +398,7 @@ def filter_curves_by_proximity(intersections, cluster_trees, cluster_thresholds,
 
 
 def filter_arcs_by_proximity(edge_arcs, cluster_trees, cluster_thresholds,
-                              n_samples=20, min_close_fraction=0.6):
+                              n_samples=20, min_close_fraction=0.7):
     """
     Discard arcs not physically present on both adjacent surfaces.
 
@@ -892,19 +894,17 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
             ).Vertex()
         )
 
-    # 2. One TopoDS_Edge per unique arc.
-    #    Open arcs with vertex endpoints pass explicit TopoDS_Vertex objects
-    #    so adjacent edges share the same instance and are topologically connected.
-    #    Closed arcs and open arcs with no vertex endpoints (k=0, v_start=None)
-    #    are built from the curve alone.
+    # 2. One TopoDS_Edge per unique arc (1-arg form: floating edge from
+    #    the trimmed curve alone).  Topological gaps are closed later by
+    #    ShapeFix_Wire.FixConnected, so shared TopoDS_Vertex instances are
+    #    not required here.
     arc_to_edge = {}   # id(arc) -> TopoDS_Edge
     for arcs in face_arcs.values():
         for arc in arcs:
             if id(arc) in arc_to_edge:
                 continue
             try:
-                edge = BRepBuilderAPI_MakeEdge(arc["curve"]).Edge()
-                arc_to_edge[id(arc)] = edge
+                arc_to_edge[id(arc)] = BRepBuilderAPI_MakeEdge(arc["curve"]).Edge()
             except Exception as exc:
                 print(f"[brep] MakeEdge failed for arc on {arc.get('edge_key')}: {exc}")
 
@@ -919,20 +919,31 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
         occ_wires = []
 
         for wire_arcs in face_wires.get(face_idx, []):
-            wm = BRepBuilderAPI_MakeWire()
+            # Build the wire with BRep_Builder (no topology-connectivity
+            # checks) so that floating edges are accepted regardless of
+            # gap size, then heal sub-millimetre gaps with ShapeFix_Wire.
+            wire = TopoDS_Wire()
+            bb = BRep_Builder()
+            bb.MakeWire(wire)
+            n_added = 0
             for arc, forward in wire_arcs:
                 if id(arc) not in arc_to_edge:
                     continue
                 edge = arc_to_edge[id(arc)]
-                wm.Add(edge if forward else edge.Reversed())
-            if not wm.IsDone():
-                print(f"[brep] face {face_idx}: wire maker failed")
+                bb.Add(wire, edge if forward else edge.Reversed())
+                n_added += 1
+            if n_added == 0:
+                print(f"[brep] face {face_idx}: no edges added to wire — skipping")
                 continue
             fix = ShapeFix_Wire()
-            fix.Load(wm.Wire())
+            fix.Load(wire)
             fix.SetPrecision(tolerance)
             fix.FixConnected()
-            occ_wires.append(fix.Wire())
+            healed = fix.Wire()
+            if healed.IsNull():
+                print(f"[brep] face {face_idx}: ShapeFix_Wire produced null wire — skipping")
+                continue
+            occ_wires.append(healed)
 
         is_inr = (surface_ids is not None and
                   face_idx < len(surface_ids) and
@@ -1181,6 +1192,9 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
 
 def export_step(shape, path):
     """Export a TopoDS_Shape to a STEP file."""
+    if shape is None or shape.IsNull():
+        print(f"[step] export skipped — shape is null")
+        return False
     writer = STEPControl_Writer()
     writer.Transfer(shape, STEPControl_AsIs, True, Message_ProgressRange())
     ok = writer.Write(path) == IFSelect_RetDone
@@ -1189,6 +1203,73 @@ def export_step(shape, path):
     else:
         print(f"STEP export failed")
     return ok
+
+
+def merge_step_files(step_paths, output_path):
+    """
+    Load each STEP file in step_paths and combine their shapes into a single
+    Compound, then export to output_path.  Files that fail to load or produce
+    a null shape are silently skipped.  Returns the count of shapes added.
+    """
+    builder  = BRep_Builder()
+    compound = TopoDS_Compound()
+    builder.MakeCompound(compound)
+    n_added = 0
+    for path in step_paths:
+        reader = STEPControl_Reader()
+        if reader.ReadFile(path) != 1:
+            print(f"[merge] read error: {path}")
+            continue
+        reader.TransferRoots()
+        sub = reader.OneShape()
+        if sub is None or sub.IsNull():
+            print(f"[merge] null shape: {path}")
+            continue
+        builder.Add(compound, sub)
+        n_added += 1
+    if n_added == 0:
+        print("[merge] no valid shapes — export skipped")
+        return 0
+    writer = STEPControl_Writer()
+    writer.Transfer(compound, STEPControl_AsIs, True, Message_ProgressRange())
+    writer.Write(output_path)
+    print(f"[merge] {n_added} part(s) → {output_path}")
+    return n_added
+
+
+def apply_inverse_normalization(shape, mean, R, scale):
+    """
+    Undo the per-part normalize_points transform on an OCC shape.
+
+    Forward normalization (brep_pipeline.py):
+        pts_norm = (R @ (pts_orig - mean)) / scale
+
+    Inverse:
+        pts_orig = scale * R^T @ pts_norm + mean
+
+    The linear part of the affine map is (scale * R^T), a rotation times a
+    uniform scalar — so all analytical surfaces (planes, cylinders, …) remain
+    analytical after the transform.  Uses gp_GTrsf + BRepBuilderAPI_GTransform.
+
+    Returns the original shape unchanged if it is None or null.
+    """
+    if shape is None or shape.IsNull():
+        return shape
+
+    mat = float(scale) * np.asarray(R, dtype=np.float64).T  # 3x3: scale * R^T
+    mean = np.asarray(mean, dtype=np.float64)
+
+    trsf = gp_GTrsf()
+    for i in range(3):
+        for j in range(3):
+            trsf.SetValue(i + 1, j + 1, mat[i, j])
+        trsf.SetValue(i + 1, 4, mean[i])
+
+    result = BRepBuilderAPI_GTransform(shape, trsf, True)
+    if not result.IsDone():
+        print("[brep] apply_inverse_normalization: transform failed, returning shape as-is")
+        return shape
+    return result.Shape()
 
 
 # ---------------------------------------------------------------------------
