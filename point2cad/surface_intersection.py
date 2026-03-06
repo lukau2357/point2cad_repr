@@ -14,7 +14,7 @@ import numpy as np
 from scipy.spatial import KDTree
 
 try:
-    from .surface_fitter import (
+    from .surface_types import (
         SURFACE_PLANE, SURFACE_SPHERE, SURFACE_CYLINDER, SURFACE_CONE, SURFACE_INR,
         SURFACE_NAMES,
     )
@@ -22,7 +22,7 @@ try:
 except ImportError:
     import os as _os, sys as _sys
     _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
-    from point2cad.surface_fitter import (
+    from point2cad.surface_types import (
         SURFACE_PLANE, SURFACE_SPHERE, SURFACE_CYLINDER, SURFACE_CONE, SURFACE_INR,
         SURFACE_NAMES,
     )
@@ -294,12 +294,12 @@ def _intersect_occ(occ_surf_i, occ_surf_j, tol, label=""):
 
 def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
                        surface_id_j, result_j, occ_surf_j,
-                       tol = 1e-6, label = ""):
+                       tol=1e-6, label=""):
     """
     Compute the intersection between two adjacent surfaces.
 
-    Uses analytical formulas for plane/plane, plane/sphere, sphere/sphere, and
-    the plane/cylinder tangent degenerate case.
+    Uses analytical formulas for plane/plane, plane/sphere, sphere/sphere,
+    and the plane/cylinder tangent degenerate case.
     All other pairs call GeomAPI_IntSS.
 
     Returns a dict:
@@ -310,9 +310,9 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
                                      "empty" | "failed"
         method  : str             -- "analytical" | "occ"
     """
-    si, sj   = surface_id_i, surface_id_j
-    pi, pj   = result_i["params"], result_j["params"]
-    oi, oj   = occ_surf_i, occ_surf_j
+    si, sj = surface_id_i, surface_id_j
+    pi, pj = result_i["params"], result_j["params"]
+    oi, oj = occ_surf_i, occ_surf_j
 
     # Normalise so that si <= sj (surfaces are type-indexed 0..4)
     if si > sj:
@@ -320,9 +320,9 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
         pi, pj = pj, pi
         oi, oj = oj, oi
 
-    if si == SURFACE_PLANE  and sj == SURFACE_PLANE:
+    if si == SURFACE_PLANE and sj == SURFACE_PLANE:
         return _intersect_plane_plane(pi, pj)
-    if si == SURFACE_PLANE  and sj == SURFACE_SPHERE:
+    if si == SURFACE_PLANE and sj == SURFACE_SPHERE:
         return _intersect_plane_sphere(pi, pj)
     if si == SURFACE_SPHERE and sj == SURFACE_SPHERE:
         return _intersect_sphere_sphere(pi, pj)
@@ -331,6 +331,12 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
     # fall back to analytical tangent-line if OCC returns empty.
     # TODO: add plane ∩ cone tangent fallback when needed.
     if si == SURFACE_PLANE and sj == SURFACE_CYLINDER:
+        # Always check the analytical tangent condition first.
+        # OCC sometimes returns a degenerate ellipse for near-tangent cases
+        # (plane barely secant to cylinder, δ ≈ r) instead of returning empty.
+        tangent = _intersect_plane_cylinder_tangent(pi, pj)
+        if tangent["type"] != "empty":
+            return tangent
         occ = _intersect_occ(oi, oj, tol, label=label)
         if occ["type"] == "empty":
             return _intersect_plane_cylinder_tangent(pi, pj)
@@ -339,7 +345,7 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
     return _intersect_occ(oi, oj, tol, label=label)
 
 
-def compute_all_intersections(adj, surface_ids, results, occ_surfaces, tol = 1e-6):
+def compute_all_intersections(adj, surface_ids, results, occ_surfaces, tol=1e-6):
     """
     Compute intersections for every adjacent pair in adj.
 
@@ -574,7 +580,8 @@ def trim_by_vertices(raw_intersections, vertices, vertex_edges,
     return trimmed
 
 
-def compute_vertices(adj, intersections, threshold = 1e-4):
+def compute_vertices(adj, intersections, threshold = 1e-4,
+                     surface_ids=None, occ_surfaces=None):
     """
     Find B-Rep vertices: points where three or more surfaces simultaneously meet.
 
@@ -584,16 +591,21 @@ def compute_vertices(adj, intersections, threshold = 1e-4):
     share a common surface: C_ij & C_ik share surface i, C_ij & C_jk share
     surface j, and C_ik & C_jk share surface k.
 
-    All (ca, cb) combinations whose closest-approach distance is below
-    `threshold` contribute a vertex candidate (midpoint of the closest points).
+    Uses GeomAPI_ExtremaCurveCurve to find the global minimum of
+    ||C_ea(s) - C_eb(t)||.  Every extremum at that minimum distance
+    contributes a candidate (midpoint of the closest points).  Candidates
+    are attributed to {ea, eb}.
+
     Candidates within `threshold` of each other are merged by averaging.
 
     Parameters
     ----------
     adj           : (n, n) bool adjacency matrix
     intersections : dict (i, j) i<j -> result dict with "curves" list
-    threshold     : distance threshold for both acceptance and deduplication
-                    (use the adjacency threshold from compute_adjacency_matrix)
+    threshold     : deduplication radius — candidates closer than this are
+                    merged into a single vertex
+    surface_ids   : unused, kept for backwards compatibility
+    occ_surfaces  : unused, kept for backwards compatibility
 
     Returns
     -------
@@ -615,13 +627,24 @@ def compute_vertices(adj, intersections, threshold = 1e-4):
         for idx_b in range(idx_a + 1, len(edges)):
             eb = edges[idx_b]
             # Only consider pairs that share exactly one surface index
-            if len(set(ea) & set(eb)) != 1:
+            shared = set(ea) & set(eb)
+            if len(shared) != 1:
                 continue
 
             curves_b = intersections[eb].get("curves", [])
             if not curves_b:
                 continue
 
+            shared_k = next(iter(shared))
+
+            # ------------------------------------------------------------------
+            # GeomAPI_ExtremaCurveCurve — 3D closest-approach between
+            # C_ea and C_eb.  Works when the curves are not coplanar (e.g. an
+            # ellipse and a cap circle sharing a cylinder).  May be degenerate
+            # when curves lie on a common plane (D=0 along the entire locus);
+            # in that case OCC typically returns NbExtrema()==0 gracefully.
+            # Candidates are attributed to {ea, eb} only.
+            # ------------------------------------------------------------------
             for ca in curves_a:
                 for cb in curves_b:
                     try:
@@ -631,33 +654,32 @@ def compute_vertices(adj, intersections, threshold = 1e-4):
                     except Exception as err:
                         print(f"[compute_vertices] ExtremaCurveCurve exception ({ea},{eb}): {err}")
                         continue
-                    # First pass: find the global minimum distance.
+                    if ext.NbExtrema() == 0:
+                        continue
+                    # Find the global minimum distance across all extrema.
                     best_dist = float("inf")
                     for m in range(1, ext.NbExtrema() + 1):
                         d = ext.Distance(m)
                         if d < best_dist:
                             best_dist = d
-                    # Second pass: accept every extremum within a small
-                    # absolute tolerance of the global minimum.  This
-                    # rejects spurious vertices from phantom curves (where
-                    # best_dist >> threshold) while correctly recovering all
-                    # genuine intersection points (each at distance ≈ 0).
-                    if best_dist < threshold:
-                        for m in range(1, ext.NbExtrema() + 1):
-                            if ext.Distance(m) <= best_dist + 1e-10:
-                                try:
-                                    t1, t2 = ext.Parameters(m)
-                                except Exception:
-                                    continue
-                                p1 = ca.Value(t1)
-                                p2 = cb.Value(t2)
-                                midpoint = np.array([
-                                    (p1.X() + p2.X()) / 2.0,
-                                    (p1.Y() + p2.Y()) / 2.0,
-                                    (p1.Z() + p2.Z()) / 2.0,
-                                ])
-                                candidates.append(midpoint)
-                                candidate_edges.append({ea, eb})
+                    # Accept every extremum at the global minimum distance.
+                    # Geometrically invalid candidates are removed downstream
+                    # by filter_vertices_by_proximity.
+                    for m in range(1, ext.NbExtrema() + 1):
+                        if ext.Distance(m) <= best_dist + 1e-10:
+                            try:
+                                t1, t2 = ext.Parameters(m)
+                            except Exception:
+                                continue
+                            p1 = ca.Value(t1)
+                            p2 = cb.Value(t2)
+                            midpoint = np.array([
+                                (p1.X() + p2.X()) / 2.0,
+                                (p1.Y() + p2.Y()) / 2.0,
+                                (p1.Z() + p2.Z()) / 2.0,
+                            ])
+                            candidates.append(midpoint)
+                            candidate_edges.append({ea, eb})
 
     if not candidates:
         return np.empty((0, 3), dtype=np.float64), []

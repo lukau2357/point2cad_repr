@@ -234,4 +234,7 @@ python main.py --visualize --visualize_id 00949
 
 # ABC dataset inspection and generating point clouds from it
 python abc_preprocess.py --abc_dir ../../abc_dataset --model_id 00000077 --output_dir ../sample_clouds --num_points 30000 --min_points_per_surface 1500 --visualize
+
+# Most useful command
+docker run --rm -it --gpus all -v $(pwd):/work -e DISPLAY=$DISPLAY -v -v /tmp/.X11-unix:/tmp/.X11-unix point2cad_occt bash 
 ```

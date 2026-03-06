@@ -21,3 +21,4 @@ of the input point cloud - both properties are not desired in practice./
 
 Idea: Extend Point2CAD primitive surface fitting to facilitate a full BRep model, rather than a discrete mesh approximation.
 ---------------------------------------------------------
+- Ask Velibor if we can train a surface segmentor - training data can be easily generated from the ABC dataset.

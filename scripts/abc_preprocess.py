@@ -16,9 +16,12 @@ try:
     from OCC.Core.TopExp      import TopExp_Explorer
     from OCC.Core.TopAbs      import (TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX,
                                        TopAbs_SOLID, TopAbs_SHELL,
-                                       TopAbs_COMPOUND, TopAbs_COMPSOLID)
+                                       TopAbs_COMPOUND, TopAbs_COMPSOLID,
+                                       TopAbs_IN, TopAbs_ON)
     from OCC.Core.TopoDS      import topods, TopoDS_Iterator, TopoDS_Compound
     from OCC.Core.BRep        import BRep_Tool, BRep_Builder
+    from OCC.Core.BRepClass   import BRepClass_FaceClassifier
+    from OCC.Core.gp          import gp_Pnt2d
     from OCC.Core.Message     import Message_ProgressRange
     from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
     from OCC.Core.GeomAbs     import (
@@ -399,14 +402,12 @@ def print_step_stats(stats):
 # STEP-based sampling (exact parametric surface via OCC)
 # ---------------------------------------------------------------------------
 
-def _evaluate_face_grid(geom_surf, u0, u1, v0, v1, grid_res):
+def _evaluate_face_grid(geom_surf, us, vs):
     """
-    Evaluate geom_surf on a regular (grid_res+1) × (grid_res+1) UV grid.
-    Returns an array of shape (grid_res+1, grid_res+1, 3).
+    Evaluate geom_surf on the grid defined by 1-D arrays us and vs.
+    Returns an array of shape (len(us), len(vs), 3).
     """
-    us  = np.linspace(u0, u1, grid_res + 1)
-    vs  = np.linspace(v0, v1, grid_res + 1)
-    pts = np.zeros((grid_res + 1, grid_res + 1, 3))
+    pts = np.zeros((len(us), len(vs), 3))
     for i, u in enumerate(us):
         for j, v in enumerate(vs):
             p         = geom_surf.Value(u, v)
@@ -486,15 +487,116 @@ def _sample_from_grid(pts3d, area1, area2, n_pts, rng):
     return w0[:, None] * vert0 + w1[:, None] * vert1 + w2[:, None] * vert2
 
 
-def _sample_faces(face_list, num_points, min_points_per_surface, rng, grid_res=50):
+def _make_cell_mask(face, us, vs, tol=1e-7):
     """
-    Sample num_points from a pre-loaded list of TopoDS_Face objects.
+    Return a bool array of shape (len(us)-1, len(vs)-1).
+    Cell (i, j) is True when its UV centroid lies inside or on the face wire,
+    as determined by BRepClass_FaceClassifier (2D ray-casting in UV space).
+    """
+    clf  = BRepClass_FaceClassifier()
+    mask = np.zeros((len(us) - 1, len(vs) - 1), dtype=bool)
+    for i in range(len(us) - 1):
+        u_mid = 0.5 * (us[i] + us[i + 1])
+        for j in range(len(vs) - 1):
+            v_mid = 0.5 * (vs[j] + vs[j + 1])
+            clf.Perform(face, gp_Pnt2d(u_mid, v_mid), tol)
+            mask[i, j] = clf.State() in (TopAbs_IN, TopAbs_ON)
+    return mask
+
+
+def _sample_from_grid_with_uv(pts3d, us, vs, area1, area2, n_pts, rng):
+    """
+    Like _sample_from_grid but also returns the (u, v) coordinates of each
+    sampled point (computed via the same barycentric weights applied to the
+    UV grid, so no surface inversion is needed).
+
+    Returns (pts3d_out, uv_out) where uv_out is (n_pts, 2).
+    Returns empty arrays for degenerate faces.
+    """
+    if n_pts == 0:
+        return np.zeros((0, 3)), np.zeros((0, 2))
+
+    all_areas = np.concatenate([area1.ravel(), area2.ravel()])
+    total     = all_areas.sum()
+    if total < 1e-12:
+        return np.zeros((0, 3)), np.zeros((0, 2))
+
+    probs    = all_areas / total
+    n_cells  = area1.size
+    tri_ids  = rng.choice(len(all_areas), size=n_pts, p=probs)
+    is_type1 = tri_ids < n_cells
+    cell_ids = np.where(is_type1, tri_ids, tri_ids - n_cells)
+    ci       = cell_ids // area1.shape[1]
+    cj       = cell_ids %  area1.shape[1]
+
+    r1      = rng.random(n_pts)
+    sqrt_r1 = np.sqrt(r1)
+    r2      = rng.random(n_pts)
+    w0      = 1.0 - sqrt_r1
+    w1      = sqrt_r1 * (1.0 - r2)
+    w2      = sqrt_r1 * r2
+
+    # 3D vertices of each triangle
+    vA = pts3d[ci,     cj    ]
+    vB = pts3d[ci + 1, cj    ]
+    vC = pts3d[ci,     cj + 1]
+    vD = pts3d[ci + 1, cj + 1]
+    mask3  = is_type1[:, None]
+    vert0  = np.where(mask3, vA, vB)
+    vert1  = np.where(mask3, vB, vD)
+    pts_out = w0[:, None] * vert0 + w1[:, None] * vert1 + w2[:, None] * vC
+
+    # UV coordinates via the same barycentric weights
+    uA = us[ci];     vA_uv = vs[cj]
+    uB = us[ci + 1]; vB_uv = vs[cj]
+    uC = us[ci];     vC_uv = vs[cj + 1]
+    uD = us[ci + 1]; vD_uv = vs[cj + 1]
+
+    u0_tri = np.where(is_type1, uA, uB)
+    u1_tri = np.where(is_type1, uB, uD)
+    v0_tri = np.where(is_type1, vA_uv, vB_uv)
+    v1_tri = np.where(is_type1, vB_uv, vD_uv)
+
+    u_out = w0 * u0_tri + w1 * u1_tri + w2 * uC
+    v_out = w0 * v0_tri + w1 * v1_tri + w2 * vC_uv
+
+    return pts_out, np.column_stack([u_out, v_out])
+
+
+def _classify_points(face, uv_pts, tol=1e-7):
+    """
+    Return a bool mask of length len(uv_pts).
+    True when the corresponding (u, v) lies inside or on the face wire.
+    Uses BRepClass_FaceClassifier (2D ray-casting in UV parameter space).
+    """
+    clf  = BRepClass_FaceClassifier()
+    keep = np.zeros(len(uv_pts), dtype=bool)
+    for i, (u, v) in enumerate(uv_pts):
+        clf.Perform(face, gp_Pnt2d(float(u), float(v)), tol)
+        keep[i] = clf.State() in (TopAbs_IN, TopAbs_ON)
+    return keep
+
+
+def _sample_faces(face_list, min_points_per_surface, rng, grid_res=50, area_budget=None):
+    """
+    Sample points from a pre-loaded list of TopoDS_Face objects.
     Each face is one cluster (cluster ID = face index in face_list).
+
+    Per-face target = min_points_per_surface + proportional share of area_budget.
+    area_budget (total extra points distributed proportionally to face area)
+    defaults to len(face_list) * min_points_per_surface when None, so the
+    average target per face is 2 * min_points_per_surface.
+
+    Sampling respects the trimmed face boundary:
+      1. A cell mask zeros out UV cells whose centroid lies outside the face wire.
+      2. Every sampled point is individually tested; outside points are rejected.
+      3. Each iteration draws exactly the remaining deficit (no oversampling
+         multiplier). Repeats up to 20 times until the quota is met.
     """
     if not face_list:
         return np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.int32)
 
-    face_grids, face_area1s, face_area2s, face_totals = [], [], [], []
+    face_data = []   # (pts3d, us, vs, a1_masked, a2_masked, total_masked, face)
 
     for face in face_list:
         adaptor   = BRepAdaptor_Surface(face)
@@ -502,39 +604,61 @@ def _sample_faces(face_list, num_points, min_points_per_surface, rng, grid_res=5
         v0, v1    = adaptor.FirstVParameter(), adaptor.LastVParameter()
         geom_surf = BRep_Tool.Surface(face)
 
-        pts3d  = _evaluate_face_grid(geom_surf, u0, u1, v0, v1, grid_res)
+        us    = np.linspace(u0, u1, grid_res + 1)
+        vs    = np.linspace(v0, v1, grid_res + 1)
+        pts3d = _evaluate_face_grid(geom_surf, us, vs)
         a1, a2 = _face_triangles(pts3d)
 
-        face_grids.append(pts3d)
-        face_area1s.append(a1)
-        face_area2s.append(a2)
-        face_totals.append(a1.sum() + a2.sum())
+        # Zero out cells outside the face boundary
+        cell_mask = _make_cell_mask(face, us, vs)
+        a1_m = a1 * cell_mask
+        a2_m = a2 * cell_mask
+        total = a1_m.sum() + a2_m.sum()
 
-    face_totals = np.array(face_totals)
-    total_area  = face_totals.sum()
-    if total_area < 1e-12:
+        # Degenerate fallback: if masking eliminates everything, use unmasked
+        if total < 1e-12:
+            a1_m, a2_m = a1, a2
+            total = a1.sum() + a2.sum()
+
+        face_data.append((pts3d, us, vs, a1_m, a2_m, total, face))
+
+    face_totals = np.array([fd[5] for fd in face_data])
+    A_total = face_totals.sum()
+    if A_total < 1e-12:
         return np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.int32)
 
-    face_probs  = face_totals / total_area
-    face_counts = rng.multinomial(num_points, face_probs)
+    if area_budget is None:
+        area_budget = min_points_per_surface * len(face_data)
 
     all_points, all_labels = [], []
-    for fid, (pts3d, a1, a2, n) in enumerate(
-            zip(face_grids, face_area1s, face_area2s, face_counts)):
-        pts = _sample_from_grid(pts3d, a1, a2, int(n), rng)
-        if len(pts):
+    for fid, (pts3d, us, vs, a1, a2, total, face) in enumerate(face_data):
+        n_target = min_points_per_surface + int(round(
+            area_budget * face_totals[fid] / A_total
+        ))
+
+        if total < 1e-12:
+            continue
+
+        collected   = []
+        n_collected = 0
+
+        for _attempt in range(20):
+            n_draw   = n_target - n_collected
+            pts, uvs = _sample_from_grid_with_uv(pts3d, us, vs, a1, a2, n_draw, rng)
+            if len(pts) == 0:
+                break
+            keep = _classify_points(face, uvs)
+            pts  = pts[keep]
+            if len(pts):
+                collected.append(pts)
+                n_collected += len(pts)
+            if n_collected >= n_target:
+                break
+
+        if collected:
+            pts = np.concatenate(collected)[:n_target]
             all_points.append(pts)
             all_labels.append(np.full(len(pts), fid, dtype=np.int32))
-
-    for fid in range(len(face_list)):
-        face_min = max(min_points_per_surface, int(face_probs[fid] * num_points))
-        if face_counts[fid] < face_min:
-            deficit = face_min - face_counts[fid]
-            pts = _sample_from_grid(face_grids[fid], face_area1s[fid],
-                                    face_area2s[fid], int(deficit), rng)
-            if len(pts):
-                all_points.append(pts)
-                all_labels.append(np.full(len(pts), fid, dtype=np.int32))
 
     if not all_points:
         return np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.int32)
@@ -618,6 +742,66 @@ def visualize_step_model(points, labels, face_types):
         vis.update_renderer()
         time.sleep(0.01)
     vis.destroy_window()
+
+
+def _visualize_step_from_disk(model_id, xyzc_dir, stats_dir, by_part):
+    """Load saved .xyzc / _stats.json files and display without re-sampling."""
+    import glob as _glob
+
+    vis_points, vis_labels, vis_face_types = [], [], []
+    label_offset = 0
+
+    if by_part:
+        xyzc_files = sorted(
+            f for f in _glob.glob(os.path.join(xyzc_dir, "*.xyzc"))
+            if os.path.basename(f).split(".")[0].isdigit()
+        )
+        if not xyzc_files:
+            print(f"[visualize] No .xyzc files found in {xyzc_dir}")
+            return
+        for xyzc_path in xyzc_files:
+            part_idx = int(os.path.basename(xyzc_path).split(".")[0])
+            data = np.loadtxt(xyzc_path)
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            pts = data[:, :3].astype(np.float32)
+            lbl = data[:, 3].astype(np.int32)
+            stats_path = os.path.join(stats_dir, f"{part_idx}_stats.json")
+            if os.path.exists(stats_path):
+                with open(stats_path) as f:
+                    face_types = json.load(f).get("face_types", [])
+            else:
+                face_types = ["Other"] * (int(lbl.max()) + 1)
+            vis_points.append(pts)
+            vis_labels.append(lbl + label_offset)
+            vis_face_types.extend(face_types)
+            label_offset += len(face_types)
+    else:
+        xyzc_path = os.path.join(xyzc_dir, f"abc_{model_id}.xyzc")
+        if not os.path.exists(xyzc_path):
+            print(f"[visualize] File not found: {xyzc_path}")
+            return
+        data = np.loadtxt(xyzc_path)
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        pts = data[:, :3].astype(np.float32)
+        lbl = data[:, 3].astype(np.int32)
+        stats_path = os.path.join(stats_dir, f"abc_{model_id}_stats.json")
+        if os.path.exists(stats_path):
+            with open(stats_path) as f:
+                face_types = json.load(f).get("face_types", [])
+        else:
+            face_types = ["Other"] * (int(lbl.max()) + 1)
+        vis_points.append(pts)
+        vis_labels.append(lbl)
+        vis_face_types.extend(face_types)
+
+    if vis_points:
+        visualize_step_model(
+            np.concatenate(vis_points),
+            np.concatenate(vis_labels),
+            vis_face_types,
+        )
 
 
 def analyze_model(abc_dir, model_id):
@@ -777,10 +961,11 @@ if __name__ == "__main__":
                         help="Output directory for .xyzc point cloud files")
     parser.add_argument("--stats_dir",  type=str, default="../sample_clouds_stats",
                         help="Output directory for _stats.json files.")
-    parser.add_argument("--num_points", type=int, default=10000,
-                        help="Total number of points to sample (area-weighted)")
     parser.add_argument("--min_points_per_surface", type=int, default=300,
-                        help="Minimum points per surface; undersized clusters are upsampled")
+                        help="Guaranteed minimum points per surface")
+    parser.add_argument("--area_budget", type=int, default=None,
+                        help="Total extra points distributed proportionally to surface area "
+                             "(default: min_points_per_surface × n_surfaces per part)")
     parser.add_argument("--sampler", type=str, default="step",
                         choices=["step", "obj"],
                         help="'step': exact OCC parametric surfaces, all 10k models; "
@@ -819,6 +1004,12 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     elif args.model_id:
         if args.sampler == "step":
+            if args.visualize:
+                xyzc_dir  = os.path.join(args.output_dir, f"abc_{args.model_id}")
+                stats_dir = os.path.join(args.stats_dir,  f"abc_{args.model_id}")
+                _visualize_step_from_disk(args.model_id, xyzc_dir, stats_dir, by_part)
+                sys.exit(0)
+
             _require_occ()
             step_path = find_step_file(args.abc_dir, args.model_id)
             if step_path is None:
@@ -834,13 +1025,11 @@ if __name__ == "__main__":
                 parts = extract_top_level_parts(shape)
                 print(f"  Found {len(parts)} top-level part(s)")
                 xyzc_dir  = os.path.join(args.output_dir, f"abc_{args.model_id}") if args.output_dir else None
-                stats_dir = os.path.join(args.stats_dir, f"abc_{args.model_id}") if args.stats_dir else None
+                stats_dir = os.path.join(args.stats_dir,  f"abc_{args.model_id}") if args.stats_dir  else None
                 if xyzc_dir:
                     os.makedirs(xyzc_dir, exist_ok=True)
                 if stats_dir:
                     os.makedirs(stats_dir, exist_ok=True)
-                vis_points, vis_labels, vis_face_types = [], [], []
-                label_offset = 0
                 for part_idx, part in enumerate(parts):
                     part_faces = faces_of_shape(part)
                     if not part_faces:
@@ -851,33 +1040,22 @@ if __name__ == "__main__":
                     stats = extract_step_stats(part_id, step_path, part, part_faces)
                     print_step_stats(stats)
                     points, labels = _sample_faces(
-                        part_faces, args.num_points, args.min_points_per_surface,
-                        rng, grid_res=args.grid_res,
+                        part_faces, args.min_points_per_surface,
+                        rng, grid_res=args.grid_res, area_budget=args.area_budget,
                     )
                     if not len(points):
                         continue
                     stats["n_sampled_points"] = int(len(points))
                     stats["n_clusters"]       = int(len(np.unique(labels)))
-                    if args.visualize:
-                        vis_points.append(points)
-                        vis_labels.append(labels + label_offset)
-                        vis_face_types.extend(stats["face_types"])
-                        label_offset += len(part_faces)
                     if xyzc_dir:
                         export_xyzc(points, labels,
                                     os.path.join(xyzc_dir, f"{part_idx}.xyzc"))
                     if stats_dir:
                         export_stats_json(
                             stats, os.path.join(stats_dir, f"{part_idx}_stats.json"))
-                if args.visualize and vis_points:
-                    visualize_step_model(
-                        np.concatenate(vis_points),
-                        np.concatenate(vis_labels),
-                        vis_face_types,
-                    )
             else:
                 xyzc_dir  = os.path.join(args.output_dir, f"abc_{args.model_id}") if args.output_dir else None
-                stats_dir = os.path.join(args.stats_dir, f"abc_{args.model_id}") if args.stats_dir else None
+                stats_dir = os.path.join(args.stats_dir,  f"abc_{args.model_id}") if args.stats_dir  else None
                 if xyzc_dir:
                     os.makedirs(xyzc_dir, exist_ok=True)
                 if stats_dir:
@@ -885,14 +1063,12 @@ if __name__ == "__main__":
                 stats = extract_step_stats(args.model_id, step_path, shape, face_list)
                 print_step_stats(stats)
                 points, labels = _sample_faces(
-                    face_list, args.num_points, args.min_points_per_surface,
-                    rng, grid_res=args.grid_res,
+                    face_list, args.min_points_per_surface,
+                    rng, grid_res=args.grid_res, area_budget=args.area_budget,
                 )
                 if len(points):
                     stats["n_sampled_points"] = int(len(points))
                     stats["n_clusters"]       = int(len(np.unique(labels)))
-                    if args.visualize:
-                        visualize_step_model(points, labels, stats["face_types"])
                     stem = f"abc_{args.model_id}"
                     if xyzc_dir:
                         export_xyzc(points, labels,
@@ -906,9 +1082,11 @@ if __name__ == "__main__":
             if result is None:
                 sys.exit(1)
             vertices, faces, surfaces, curves, face_labels = result
+            n_pts = (args.area_budget if args.area_budget is not None
+                     else len(surfaces) * args.min_points_per_surface)
             points, labels = sample_points_from_mesh(
                 vertices, faces, face_labels,
-                args.num_points, args.min_points_per_surface, rng,
+                n_pts, args.min_points_per_surface, rng,
             )
 
             if args.visualize and len(points):
@@ -958,8 +1136,8 @@ if __name__ == "__main__":
                         stats          = extract_step_stats(part_id, step_path,
                                                             part, part_faces)
                         points, labels = _sample_faces(
-                            part_faces, args.num_points, args.min_points_per_surface,
-                            rng, grid_res=args.grid_res,
+                            part_faces, args.min_points_per_surface,
+                            rng, grid_res=args.grid_res, area_budget=args.area_budget,
                         )
                         if not len(points):
                             continue
@@ -979,8 +1157,8 @@ if __name__ == "__main__":
                         os.makedirs(stats_dir, exist_ok=True)
                     stats          = extract_step_stats(mid, step_path, shape, face_list)
                     points, labels = _sample_faces(
-                        face_list, args.num_points, args.min_points_per_surface,
-                        rng, grid_res=args.grid_res,
+                        face_list, args.min_points_per_surface,
+                        rng, grid_res=args.grid_res, area_budget=args.area_budget,
                     )
                     if len(points):
                         stats["n_sampled_points"] = int(len(points))
@@ -996,9 +1174,11 @@ if __name__ == "__main__":
                 vertices, faces     = load_obj(obj_path)
                 surfaces, _         = load_features(feat_path)
                 face_labels         = build_face_to_surface(surfaces, len(faces))
+                n_pts = (args.area_budget if args.area_budget is not None
+                         else len(surfaces) * args.min_points_per_surface)
                 points, labels      = sample_points_from_mesh(
                     vertices, faces, face_labels,
-                    args.num_points, args.min_points_per_surface, rng,
+                    n_pts, args.min_points_per_surface, rng,
                 )
                 if len(points) == 0:
                     print(f"  [{i+1}/{len(model_ids)}] {mid}: skipped (no valid geometry)")

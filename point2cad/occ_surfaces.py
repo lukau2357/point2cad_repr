@@ -2,7 +2,7 @@ import time
 import numpy as np
 import torch
 
-from .surface_fitter import SURFACE_PLANE, SURFACE_SPHERE, SURFACE_CYLINDER, SURFACE_CONE, SURFACE_INR
+from .surface_types import SURFACE_PLANE, SURFACE_SPHERE, SURFACE_CYLINDER, SURFACE_CONE, SURFACE_INR
 from OCC.Core.gp      import gp_Ax3, gp_Pnt, gp_Dir, gp_Pln, gp_Sphere, gp_Cylinder, gp_Cone
 from OCC.Core.Geom    import Geom_Plane, Geom_SphericalSurface, Geom_CylindricalSurface, Geom_ConicalSurface
 from OCC.Core.GeomAbs import GeomAbs_C0, GeomAbs_C1, GeomAbs_C2, GeomAbs_C3

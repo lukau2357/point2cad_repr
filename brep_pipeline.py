@@ -17,10 +17,16 @@ import shutil
 import sys
 import time
 import glob as _glob
+from collections import defaultdict
 
 import numpy as np
 import open3d as o3d
 from scipy.spatial import Delaunay, ConvexHull
+
+from point2cad.surface_types import (
+    SURFACE_PLANE, SURFACE_SPHERE, SURFACE_CYLINDER, SURFACE_CONE, SURFACE_INR,
+    SURFACE_NAMES,
+)
 
 # Curve-type → RGB colour used by the visualizer
 CURVE_TYPE_COLORS = {
@@ -119,16 +125,17 @@ def _merge_part_dirs(part_dirs, unified_dir):
              surface_names = np.array(all_snames),
              cluster_colors= np.array(all_colors))
 
-    # 2. Merge vertices (concatenate)
-    all_verts = []
-    for dir_path, offset, n in part_dirs:
-        vpath = os.path.join(dir_path, "vertices.npz")
-        if os.path.exists(vpath):
-            v = np.load(vpath)["vertices"]
-            if len(v):
-                all_verts.append(v)
-    np.savez(os.path.join(unified_dir, "vertices.npz"),
-             vertices=np.concatenate(all_verts) if all_verts else np.zeros((0, 3)))
+    # 2. Merge vertices (concatenate) — both post-Euler and pre-Euler
+    for vfile in ("vertices.npz", "vertices_pre_euler.npz"):
+        all_verts = []
+        for dir_path, offset, n in part_dirs:
+            vpath = os.path.join(dir_path, vfile)
+            if os.path.exists(vpath):
+                v = np.load(vpath)["vertices"]
+                if len(v):
+                    all_verts.append(v)
+        np.savez(os.path.join(unified_dir, vfile),
+                 vertices=np.concatenate(all_verts) if all_verts else np.zeros((0, 3)))
 
     # 3. Per-cluster files — copy with offset applied to filename
     for dir_path, offset, n in part_dirs:
@@ -156,8 +163,11 @@ def _merge_part_dirs(part_dirs, unified_dir):
                 ei, ej = int(d["edge_i"]), int(d["edge_j"])
                 d["edge_i"] = ei + offset
                 d["edge_j"] = ej + offset
-                np.savez(os.path.join(unified_dir,
-                                      f"arcs_{ei+offset}_{ej+offset}.npz"), **d)
+                if fname.startswith("arcs_pre_euler_"):
+                    dst = f"arcs_pre_euler_{ei+offset}_{ej+offset}.npz"
+                else:
+                    dst = f"arcs_{ei+offset}_{ej+offset}.npz"
+                np.savez(os.path.join(unified_dir, dst), **d)
 
 
 # ---------------------------------------------------------------------------
@@ -189,15 +199,27 @@ def run_visualize(args):
         ls.colors = o3d.utility.Vector3dVector([color] * len(lines))
         return ls
 
-    # Per-arc linesets (arc[0]=green, arc[1]=red, … — saved by compute mode)
+    # Per-arc linesets (post-Euler: arcs_I_J.npz)
     arc_linesets = []
     for arc_path in sorted(_glob.glob(os.path.join(out_dir, "arcs_*.npz"))):
+        if "pre_euler" in os.path.basename(arc_path):
+            continue
         d      = np.load(arc_path, allow_pickle=True)
         n_arcs = int(d["n_arcs"])
         for k in range(n_arcs):
             pts   = d[f"arc_points_{k}"]
             color = d[f"arc_color_{k}"].tolist()
             arc_linesets.append(_lineset(pts, color))
+
+    # Pre-Euler arc linesets (arcs_pre_euler_I_J.npz)
+    pre_euler_arc_linesets = []
+    for arc_path in sorted(_glob.glob(os.path.join(out_dir, "arcs_pre_euler_*.npz"))):
+        d      = np.load(arc_path, allow_pickle=True)
+        n_arcs = int(d["n_arcs"])
+        for k in range(n_arcs):
+            pts   = d[f"arc_points_{k}"]
+            color = d[f"arc_color_{k}"].tolist()
+            pre_euler_arc_linesets.append(_lineset(pts, color))
 
     trimmed_linesets   = []
     untrimmed_linesets = []
@@ -240,7 +262,7 @@ def run_visualize(args):
         mesh.paint_uniform_color(clust_colors[ci].tolist())
         surface_meshes.append(mesh)
 
-    # Vertices
+    # Vertices (post-Euler)
     vertex_pcd  = None
     vertex_path = os.path.join(out_dir, "vertices.npz")
     if os.path.exists(vertex_path):
@@ -249,10 +271,21 @@ def run_visualize(args):
             vertex_pcd = o3d.geometry.PointCloud()
             vertex_pcd.points = o3d.utility.Vector3dVector(verts)
             vertex_pcd.paint_uniform_color([1.0, 1.0, 0.0])
-            print(f"Loaded {len(verts)} vertices")
+            print(f"Loaded {len(verts)} vertices (post-Euler)")
 
-    # 2×2 window layout (fits 1920×1080)
-    W, H = 960, 490
+    # Vertices (pre-Euler)
+    pre_euler_vertex_pcd = None
+    pre_euler_vertex_path = os.path.join(out_dir, "vertices_pre_euler.npz")
+    if os.path.exists(pre_euler_vertex_path):
+        verts_pre = np.load(pre_euler_vertex_path)["vertices"]
+        if len(verts_pre) > 0:
+            pre_euler_vertex_pcd = o3d.geometry.PointCloud()
+            pre_euler_vertex_pcd.points = o3d.utility.Vector3dVector(verts_pre)
+            pre_euler_vertex_pcd.paint_uniform_color([1.0, 0.5, 0.0])  # orange
+            print(f"Loaded {len(verts_pre)} vertices (pre-Euler)")
+
+    # 3×2 window layout (fits 1920×1080)
+    W, H = 640, 490
 
     vis1 = o3d.visualization.Visualizer()
     vis1.create_window("Untrimmed curves", width=W, height=H, left=0, top=50)
@@ -260,33 +293,51 @@ def run_visualize(args):
         vis1.add_geometry(ls)
 
     vis2 = o3d.visualization.Visualizer()
-    vis2.create_window("Trimmed arcs + vertices", width=W, height=H, left=W, top=50)
-    for ls in (arc_linesets if arc_linesets else trimmed_linesets):
+    vis2.create_window("Pre-Euler arcs + vertices", width=W, height=H, left=W, top=50)
+    for ls in (pre_euler_arc_linesets if pre_euler_arc_linesets else trimmed_linesets):
         vis2.add_geometry(ls)
-    if vertex_pcd is not None:
-        vis2.add_geometry(vertex_pcd)
+    if pre_euler_vertex_pcd is not None:
+        vis2.add_geometry(pre_euler_vertex_pcd)
     vis2.get_render_option().point_size = 8.0
 
     vis3 = o3d.visualization.Visualizer()
-
-    vis3.create_window("Point clouds + trimmed arcs + boundary strips",
-                       width=W, height=H, left=0, top=50 + H + 40)
-    for pcd in cluster_pcds:
-        vis3.add_geometry(pcd)
+    vis3.create_window("Post-Euler arcs + vertices", width=W, height=H, left=2*W, top=50)
     for ls in (arc_linesets if arc_linesets else trimmed_linesets):
         vis3.add_geometry(ls)
-    for bpcd in boundary_pcds:
-        vis3.add_geometry(bpcd)
-    vis3.get_render_option().point_size = 2.0
+    if vertex_pcd is not None:
+        vis3.add_geometry(vertex_pcd)
+    vis3.get_render_option().point_size = 8.0
 
     vis4 = o3d.visualization.Visualizer()
-    vis4.create_window("Fitted surfaces", width=W, height=H, left=W, top=50 + H + 40)
-    for mesh in surface_meshes:
-        vis4.add_geometry(mesh)
+    vis4.create_window("Point clouds + arcs + boundary strips",
+                       width=W, height=H, left=0, top=50 + H + 40)
+    for pcd in cluster_pcds:
+        vis4.add_geometry(pcd)
+    for ls in (arc_linesets if arc_linesets else trimmed_linesets):
+        vis4.add_geometry(ls)
+    for bpcd in boundary_pcds:
+        vis4.add_geometry(bpcd)
+    vis4.get_render_option().point_size = 2.0
 
-    vis3.get_render_option().mesh_show_back_face = True
+    vis5 = o3d.visualization.Visualizer()
+    vis5.create_window("Fitted surfaces", width=W, height=H, left=W, top=50 + H + 40)
+    for mesh in surface_meshes:
+        vis5.add_geometry(mesh)
+
+    vis6 = o3d.visualization.Visualizer()
+    vis6.create_window("Point clouds + pre-Euler arcs",
+                       width=W, height=H, left=2*W, top=50 + H + 40)
+    for pcd in cluster_pcds:
+        vis6.add_geometry(pcd)
+    for ls in (pre_euler_arc_linesets if pre_euler_arc_linesets else trimmed_linesets):
+        vis6.add_geometry(ls)
+    if pre_euler_vertex_pcd is not None:
+        vis6.add_geometry(pre_euler_vertex_pcd)
+    vis6.get_render_option().point_size = 6.0
+
     vis4.get_render_option().mesh_show_back_face = True
-    visualizers = [vis1, vis2, vis3, vis4]
+    vis5.get_render_option().mesh_show_back_face = True
+    visualizers = [vis1, vis2, vis3, vis4, vis5, vis6]
     running     = [True] * len(visualizers)
     while all(running):
         for i, vis in enumerate(visualizers):
@@ -299,16 +350,155 @@ def run_visualize(args):
 
 
 # ---------------------------------------------------------------------------
+# Coincident-surface merging
+# ---------------------------------------------------------------------------
+
+def _unit_vec(v):
+    v = np.asarray(v, dtype=np.float64)
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else v
+
+
+def merge_coincident_surfaces(clusters, surface_ids, fit_results, fit_meshes, occ_surfs,
+                               tol_angle_deg=3.0, tol_dist=1e-2, tol_radius=1e-2,
+                               tol_cone_angle_deg=1.0):
+    """
+    Detect clusters fitted to identical (coincident) surfaces and merge them.
+
+    Two clusters are merged when their surface type matches AND all geometric
+    parameters agree within tolerance:
+      Plane    : parallel normals AND same signed offset d
+      Cylinder : parallel axes AND axis lines coincide AND equal radii
+      Cone     : coincident apex AND parallel axes AND equal half-angles
+      Sphere   : coincident centres AND equal radii
+
+    Returns updated (clusters, surface_ids, fit_results, fit_meshes, occ_surfs).
+    The representative of each merged group is the member with the most points.
+    """
+    cos_tol = math.cos(math.radians(tol_angle_deg))
+    n = len(clusters)
+
+    # Union-Find
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        parent[find(x)] = find(y)
+
+    def planes_coincide(pi, pj):
+        ni = _unit_vec(pi["a"])
+        nj = _unit_vec(pj["a"])
+        cos_a = float(np.dot(ni, nj))
+        if abs(cos_a) < cos_tol:
+            return False
+        di = float(pi["d"])
+        dj = float(pj["d"]) * (1.0 if cos_a > 0 else -1.0)
+        return abs(di - dj) < tol_dist
+
+    def cylinders_coincide(pi, pj):
+        ai = _unit_vec(pi["a"])
+        aj = _unit_vec(pj["a"])
+        if abs(float(np.dot(ai, aj))) < cos_tol:
+            return False
+        if abs(float(pi["radius"]) - float(pj["radius"])) > tol_radius:
+            return False
+        ci = np.asarray(pi["center"], dtype=np.float64)
+        cj = np.asarray(pj["center"], dtype=np.float64)
+        diff = cj - ci
+        perp = diff - float(np.dot(diff, ai)) * ai
+        return float(np.linalg.norm(perp)) < tol_dist
+
+    def cones_coincide(pi, pj):
+        ai = _unit_vec(pi["a"])
+        aj = _unit_vec(pj["a"])
+        if abs(float(np.dot(ai, aj))) < cos_tol:
+            return False
+        if abs(float(pi["theta"]) - float(pj["theta"])) > math.radians(tol_cone_angle_deg):
+            return False
+        vi = np.asarray(pi["v"], dtype=np.float64)
+        vj = np.asarray(pj["v"], dtype=np.float64)
+        return float(np.linalg.norm(vi - vj)) < tol_dist
+
+    def spheres_coincide(pi, pj):
+        if abs(float(pi["radius"]) - float(pj["radius"])) > tol_radius:
+            return False
+        ci = np.asarray(pi["center"], dtype=np.float64)
+        cj = np.asarray(pj["center"], dtype=np.float64)
+        return float(np.linalg.norm(ci - cj)) < tol_dist
+
+    checkers = {
+        SURFACE_PLANE:    planes_coincide,
+        SURFACE_CYLINDER: cylinders_coincide,
+        SURFACE_CONE:     cones_coincide,
+        SURFACE_SPHERE:   spheres_coincide,
+    }
+
+    for i in range(n):
+        checker = checkers.get(surface_ids[i])
+        if checker is None:
+            continue
+        pi = fit_results[i]["params"]
+        for j in range(i + 1, n):
+            if surface_ids[j] != surface_ids[i] or find(i) == find(j):
+                continue
+            if checker(pi, fit_results[j]["params"]):
+                sname = SURFACE_NAMES.get(surface_ids[i], str(surface_ids[i]))
+                print(f"[merge] surfaces {i} and {j} are coincident {sname}s → merging into {i}")
+                union(i, j)
+
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    if all(len(g) == 1 for g in groups.values()):
+        return clusters, surface_ids, fit_results, fit_meshes, occ_surfs
+
+    new_clusters, new_surface_ids, new_fit_results, new_fit_meshes, new_occ_surfs = [], [], [], [], []
+    visited = set()
+    for i in range(n):
+        root = find(i)
+        if root in visited:
+            continue
+        visited.add(root)
+        members = groups[root]
+        if len(members) == 1:
+            new_clusters.append(clusters[i])
+            new_surface_ids.append(surface_ids[i])
+            new_fit_results.append(fit_results[i])
+            new_fit_meshes.append(fit_meshes[i])
+            new_occ_surfs.append(occ_surfs[i])
+        else:
+            rep = max(members, key=lambda k: len(clusters[k]))
+            merged_pts = np.concatenate([clusters[k] for k in members], axis=0)
+            sname = SURFACE_NAMES.get(surface_ids[rep], str(surface_ids[rep]))
+            print(f"[merge] group {members}: representative={rep} ({sname}), "
+                  f"total {sum(len(clusters[k]) for k in members)} pts "
+                  f"from {len(members)} clusters")
+            new_clusters.append(merged_pts)
+            new_surface_ids.append(surface_ids[rep])
+            new_fit_results.append(fit_results[rep])
+            new_fit_meshes.append(fit_meshes[rep])
+            new_occ_surfs.append(occ_surfs[rep])
+
+    return new_clusters, new_surface_ids, new_fit_results, new_fit_meshes, new_occ_surfs
+
+
+# ---------------------------------------------------------------------------
 # Compute mode  (Docker, OCC available)
 # ---------------------------------------------------------------------------
 
 def run_compute(args):
     import torch
 
-    from point2cad.surface_fitter       import fit_surface, SURFACE_NAMES, SURFACE_INR
+    from point2cad.surface_fitter       import fit_surface
     from point2cad.occ_surfaces         import to_occ_surface
     from point2cad.cluster_adjacency    import (
-        compute_adjacency_matrix, adjacency_pairs, build_cluster_proximity
+        compute_adjacency_matrix, adjacency_pairs, build_cluster_proximity,
     )
     from point2cad.color_config         import get_surface_color
     from point2cad.surface_intersection import (
@@ -320,6 +510,8 @@ def run_compute(args):
     from point2cad.topology import (
         filter_vertices_by_proximity,
         build_edge_arcs, filter_curves_by_proximity, filter_arcs_by_proximity,
+        progressive_euler_filter, greedy_oracle_filter,
+        _score_vertex,
         print_edge_arcs_summary,
         face_arc_incidence, print_face_arcs_summary,
         assemble_wires, print_face_wires_summary,
@@ -408,22 +600,29 @@ def run_compute(args):
             )
             print(f"[surface fitter] Cluster {cid} number of points: {c_count}")
             print(f"[surface fitter] Fitted surface: {SURFACE_NAMES[sid]}")
+            p = res["result"]["params"]
+            # if sid == 0:  # plane
+            #     print(f"  normal={np.array(p['a'])}, d={p['d']:.6f}")
+            # elif sid == 2:  # cylinder
+            #     print(f"  axis={np.array(p['a'])}, center={np.array(p['center'])}, r={p['radius']:.6f}")
 
         # Per-cluster KDTrees and NN-distance thresholds — needed by both paths.
-        cluster_trees, cluster_thresholds = build_cluster_proximity(
+        cluster_trees, cluster_nn_percentiles = build_cluster_proximity(
             clusters, percentile=args.proximity_percentile
         )
 
-        for i in range(len(cluster_thresholds)):
-            cluster_thresholds[i] *= args.proximity_factor
-    
+        # cluster_thresholds = [p * args.proximity_factor for p in cluster_nn_percentiles]
+
         if args.full_adjacency:
             n_surf    = len(clusters)
             inter_adj = np.ones((n_surf, n_surf), dtype=bool)
             np.fill_diagonal(inter_adj, False)
+            boundary_strips = {}
+            per_pair_thresholds = {}
+            boundary_strip_trees = {}
             print(f"[full_adjacency] intersecting all {n_surf * (n_surf - 1) // 2} pairs\n")
         else:
-            adj, _, spacing, boundary_strips, _ = compute_adjacency_matrix(
+            adj, _, spacing, boundary_strips, per_pair_thresholds, boundary_strip_trees = compute_adjacency_matrix(
                 clusters, threshold_factor=args.spacing_factor,
                 spacing_percentile=args.spacing_percentile,
             )
@@ -477,21 +676,56 @@ def run_compute(args):
         #      (spurious intersections outside the physical model).
         #   3. Trim open curves using the surviving vertex parameters.
         vertices, vertex_edges = compute_vertices(
-            inter_adj, raw_intersections, threshold=threshold_vertex
+            inter_adj, raw_intersections, threshold=threshold_vertex,
+            surface_ids=surface_ids, occ_surfaces=occ_surfs,
         )
         print(f"Found {len(vertices)} raw vertices")
 
-        vertices, vertex_edges = filter_vertices_by_proximity(
-            vertices, vertex_edges, cluster_trees, cluster_thresholds
-        )
-        print(f"After proximity filter: {len(vertices)} vertices")
+        # Score-cap vertex pre-filter: remove vertices whose fitness score
+        # exceeds a threshold.  The score d/p is already scale-invariant
+        # (NN distance normalised by intra-cluster spacing), so the cap
+        # has a physical meaning: score <= N means "within Nx the cluster's
+        # own point spacing".
+        cluster_bboxes = None
+        vertex_scores = []
+        for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
+            involved = set()
+            for edge in edges:
+                involved.update(edge)
+            score = _score_vertex(vpos, involved, cluster_trees,
+                                  cluster_nn_percentiles)
+            vertex_scores.append(score)
+
+        score_cap = args.score_cap
+        scores_arr = np.array(vertex_scores)
+
+        # Log all vertex scores sorted for analysis
+        sorted_indices = np.argsort(scores_arr)
+        print(f"[vertex scores] {len(scores_arr)} vertices, "
+              f"range [{scores_arr.min():.4f}, {scores_arr.max():.4f}]")
+        for rank, idx in enumerate(sorted_indices):
+            edges_str = " ".join(
+                f"({min(e)},{max(e)})" for e in vertex_edges[idx])
+            print(f"  v{idx:3d}  score={scores_arr[idx]:10.4f}  "
+                  f"edges=[{edges_str}]")
+
+        keep_v = scores_arr <= score_cap
+        n_drop = int(np.sum(~keep_v))
+        n_keep = int(np.sum(keep_v))
+        if n_drop > 0 and n_keep >= 2:
+            print(f"[score-cap filter] threshold: {score_cap:.2f}  "
+                  f"keeping {n_keep}, dropping {n_drop}/{len(scores_arr)} vertices")
+            vertices = vertices[keep_v]
+            vertex_edges = [vertex_edges[i]
+                            for i in range(len(keep_v)) if keep_v[i]]
+        else:
+            print(f"[score-cap filter] threshold {score_cap:.2f} "
+                  f"would keep {n_keep} / drop {n_drop} — skipping")
+        print(f"After score-cap filter: {len(vertices)} vertices")
 
         trim_intersections_ = trim_by_vertices(
             raw_intersections, vertices, vertex_edges,
             extension_factor=0.05,
-        )
-        trim_intersections_ = filter_curves_by_proximity(
-            trim_intersections_, cluster_trees, cluster_thresholds
         )
 
         # Sample curves to numpy for the visualizer (no OCC on host).
@@ -513,7 +747,9 @@ def run_compute(args):
                 n_curves           = len(inter_trim["curves"]),
                 n_untrimmed_curves = len(inter_raw["curves"]),
             )
-            boundary_pts = inter_trim.get("boundary_pts", np.empty((0, 3)))
+            # Use boundary strips from adjacency computation (not the
+            # empty placeholder in trim_intersections_).
+            boundary_pts = boundary_strips.get((i, j), np.empty((0, 3)))
             kw["n_boundary_pts"] = len(boundary_pts)
             if len(boundary_pts) > 0:
                 kw["boundary_pts"] = _denorm(boundary_pts, part_mean, part_R, part_scale)
@@ -542,25 +778,48 @@ def run_compute(args):
             np.savez(os.path.join(out_dir, f"inter_{i}_{j}.npz"), **kw)
 
         # ------------------------------------------------------------------
-        # Save vertices (computed above, before or after trimming depending on mode)
-        # ------------------------------------------------------------------
-        np.savez(os.path.join(out_dir, "vertices.npz"),
-                 vertices=_denorm(vertices, part_mean, part_R, part_scale))
-
-        # ------------------------------------------------------------------
         # Step 1: vertex–edge attribution and arc splitting
         # ------------------------------------------------------------------
         trim_curves_dict              = {k: v["curves"] for k, v in trim_intersections_.items()}
         edge_arcs, vertices, vertex_edges = build_edge_arcs(
             trim_curves_dict, vertices, vertex_edges, threshold=1e-3
         )
-        edge_arcs = filter_arcs_by_proximity(
-            edge_arcs, cluster_trees, cluster_thresholds
+        print_edge_arcs_summary(edge_arcs)
+
+        # Save pre-Euler vertices and arcs for visualization
+        np.savez(os.path.join(out_dir, "vertices_pre_euler.npz"),
+                 vertices=_denorm(vertices, part_mean, part_R, part_scale))
+        for (ei, ej), arcs in edge_arcs.items():
+            kw_pre = {"n_arcs": len(arcs), "edge_i": ei, "edge_j": ej}
+            for k, arc in enumerate(arcs):
+                kw_pre[f"arc_points_{k}"] = _denorm(
+                    sample_curve(arc["curve"], n_points=100), part_mean, part_R, part_scale)
+                kw_pre[f"arc_color_{k}"] = [0.2, 0.85, 0.2]
+            np.savez(os.path.join(out_dir, f"arcs_pre_euler_{ei}_{ej}.npz"), **kw_pre)
+
+        # Greedy oracle-guided filter: remove worst-scoring objects one at
+        # a time until BRepCheck_Analyzer returns True.
+        edge_arcs, vertices, vertex_edges, shape, brep_info = greedy_oracle_filter(
+            edge_arcs, vertices, vertex_edges,
+            clusters, cluster_trees, cluster_nn_percentiles,
+            occ_surfaces=occ_surfs, surface_ids=surface_ids,
+            bspline_method=args.bspline_method, tolerance=1e-3,
+            cluster_bboxes=cluster_bboxes,
         )
         print_edge_arcs_summary(edge_arcs)
 
+        # Final face_arcs / wire assembly for summary printing
+        face_arcs = face_arc_incidence(edge_arcs)
+        print_face_arcs_summary(face_arcs)
+        face_wires = assemble_wires(face_arcs, occ_surfs, vertices,
+                                     surface_ids=surface_ids)
+        print_face_wires_summary(face_wires)
+
+        # Save vertices AFTER filtering so --visualize shows only final vertices
+        np.savez(os.path.join(out_dir, "vertices.npz"),
+                 vertices=_denorm(vertices, part_mean, part_R, part_scale))
+
         # Save arc samples for visualization (one file per edge).
-        # Arc index encodes color: arc[0]=green, arc[1]=red, arc[2]=blue, arc[3]=purple
         _ARC_COLORS = [[0.2, 0.85, 0.2], [1.0, 0.2, 0.2],
                        [0.2, 0.4,  1.0], [0.8, 0.2,  0.8]]
         for (ei, ej), arcs in edge_arcs.items():
@@ -568,44 +827,35 @@ def run_compute(args):
             for k, arc in enumerate(arcs):
                 kw_arcs[f"arc_points_{k}"] = _denorm(
                     sample_curve(arc["curve"], n_points=100), part_mean, part_R, part_scale)
-                kw_arcs[f"arc_color_{k}"]  = _ARC_COLORS[k % len(_ARC_COLORS)]
+                kw_arcs[f"arc_color_{k}"]  = _ARC_COLORS[0]
             np.savez(os.path.join(out_dir, f"arcs_{ei}_{ej}.npz"), **kw_arcs)
 
         # ------------------------------------------------------------------
-        # Step 2: face–arc incidence
-        # ------------------------------------------------------------------
-        face_arcs = face_arc_incidence(edge_arcs)
-        print_face_arcs_summary(face_arcs)
-
-        # ------------------------------------------------------------------
-        # Step 3: wire assembly with angular ordering at high-degree vertices
-        # ------------------------------------------------------------------
-        face_wires = assemble_wires(face_arcs, occ_surfs, vertices, surface_ids=surface_ids)
-        print_face_wires_summary(face_wires)
-
-        # ------------------------------------------------------------------
-        # Step 4a: BRep assembly — manual arc/wire approach
+        # Step 4a: BRep export (shape already built by oracle filter)
         # ------------------------------------------------------------------
         step_path = os.path.join(out_dir, f"{step_stem}.step")
-        shape = build_brep_shape(face_arcs, occ_surfs, vertices,
-                                 surface_ids=surface_ids,
-                                 face_wires=face_wires, tolerance=1e-3,
-                                 bspline_method=args.bspline_method)
-        export_step(apply_inverse_normalization(shape, part_mean, part_R, part_scale),
-                    step_path)
+        if shape is None or shape.IsNull():
+            print(f"[brep] build failed — 0 faces produced, skipping STEP export")
+        else:
+            try:
+                shape_world = apply_inverse_normalization(shape, part_mean, part_R, part_scale)
+            except Exception as e:
+                print(f"[brep] apply_inverse_normalization failed: {e} — exporting normalized shape")
+                shape_world = shape
+            export_step(shape_world, step_path)
 
         # ------------------------------------------------------------------
         # Step 4b: BRep assembly — BOPAlgo_MakerVolume with cluster UV bounds
         # ------------------------------------------------------------------
         step_path_bop = os.path.join(out_dir, f"{step_stem}_bop.step")
-        shape_bop = build_brep_shape_bop(
-            occ_surfs, vertices, vertex_edges, face_arcs,
-            surface_ids=surface_ids,
-            tolerance=1e-3, rel_margin=0.5,
-        )
-        if shape_bop is not None:
-            export_step(apply_inverse_normalization(shape_bop, part_mean, part_R, part_scale),
-                        step_path_bop)
+        #shape_bop = build_brep_shape_bop(
+        #    occ_surfs, vertices, vertex_edges, face_arcs,
+        #    surface_ids=surface_ids,
+        #    tolerance=1e-3, rel_margin=0.5,
+        #)
+        #if shape_bop is not None:
+        #    export_step(apply_inverse_normalization(shape_bop, part_mean, part_R, part_scale),
+        #                step_path_bop)
         print(f"\nAll results saved to {out_dir}/")
 
         if args.model_id:
@@ -628,11 +878,11 @@ def run_compute(args):
             [p for p in manual_paths if os.path.exists(p)],
             os.path.join(unified_dir, "unified.step"),
         )
-        merge_step_files(
-            [p for p in bop_paths if os.path.exists(p)],
-            os.path.join(unified_dir, "unified_bop.step"),
-        )
-        print(f"\nUnified results saved to {unified_dir}/")
+        #merge_step_files(
+        #    [p for p in bop_paths if os.path.exists(p)],
+        #    os.path.join(unified_dir, "unified_bop.step"),
+        #)
+        #print(f"\nUnified results saved to {unified_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -660,15 +910,20 @@ if __name__ == "__main__":
                     help="Percentile of intra-cluster NN distance distribution "
                             "used for local spacing in adjacency computation "
                             "(default 100.0 = max NN distance).")
-    parser.add_argument("--spacing_factor", type=float, default=2,
+    parser.add_argument("--spacing_factor", type=float, default=1.5,
                         help="Adjacency detection threshold = spacing factor * "
                              "per-pair local spacing")
     parser.add_argument("--proximity_percentile", type=float, default=100,
                         help="Percentile of intra-cluster NN distance distribution "
                              "used as proximity threshold per cluster. Higher = more "
                              "generous (default 100).")
-    parser.add_argument("--proximity_factor", type=float, 
-                        help="Proximity detection threshold = proximity_factor * chosen intra-cluster NN percentile.", default = 3)
+    parser.add_argument("--bbox_margin", type=float, default=0.2,
+                        help="Fractional expansion of per-cluster bounding boxes "
+                             "for the progressive Euler filter (default 0.05 = 5%%).")
+    parser.add_argument("--score_cap", type=float, default=6,
+                        help="Max vertex fitness score (d/p) to keep in pre-filter. "
+                             "Score is scale-invariant: 1.0 = cluster boundary. "
+                             "(default 3.0)")
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
                              "instead of point clouds (visualize mode only)", default = True)

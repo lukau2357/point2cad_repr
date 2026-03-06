@@ -1,0 +1,77 @@
+{
+  "model_id": "00000100_part_2",
+  "step_file": "00000100_5ed74bccca6f4e89829bcb5e_step_000.step",
+  "shape_type": "Solid",
+  "n_faces": 34,
+  "n_edges": 198,
+  "n_vertices": 396,
+  "surface_types": {
+    "Cylinder": 31,
+    "Plane": 1,
+    "BSpline": 1,
+    "Cone": 1
+  },
+  "surface_areas_by_type": {
+    "Cylinder": 934.2403859394402,
+    "Plane": 30.633577516457102,
+    "BSpline": 122.54347345736183,
+    "Cone": 406.96714202186746
+  },
+  "total_surface_area": 1494.3845789351265,
+  "curve_types": {
+    "Line": 60,
+    "Circle": 100,
+    "BSpline": 38
+  },
+  "bounding_box": {
+    "xmin": 10.225890900907903,
+    "xmax": 25.647463956720173,
+    "ymin": -6.348375233582166,
+    "ymax": 6.348375233582169,
+    "zmin": -113.01354892169606,
+    "zmax": -92.69185428921539
+  },
+  "bounding_box_extents": [
+    15.42157305581227,
+    12.696750467164335,
+    20.32169463248067
+  ],
+  "face_types": [
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Plane",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "BSpline",
+    "Cylinder",
+    "Cone",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder"
+  ],
+  "n_sampled_points": 102000,
+  "n_clusters": 34
+}

@@ -325,6 +325,70 @@ other by averaging.
 `GeomAPI_ExtremaCurveCurve` reports all local extrema of $D(t_1, t_2)$ via
 subdivision + Newton–Raphson.
 
+### Coplanar curve pairs: curve-surface intersection via the third edge
+
+#### Why 3D closest-approach fails for coplanar curves
+
+Consider two edges $e_a = (i, k)$ and $e_b = (j, k)$ sharing a **planar**
+surface $F_k$ (plane normal $\mathbf{n}_k$, offset $d_k$).  Their intersection
+curves are:
+
+$$\mathbf{C}_{ik}(t_1) = F_i \cap F_k, \qquad \mathbf{C}_{jk}(t_2) = F_j \cap F_k$$
+
+By construction every point on $\mathbf{C}_{ik}$ satisfies
+$\mathbf{n}_k \cdot \mathbf{C}_{ik}(t_1) = d_k$, and similarly for
+$\mathbf{C}_{jk}$.  Both curves lie *exactly* in the plane $F_k$.
+
+The 3D distance function $D(t_1, t_2) = \|\mathbf{C}_{ik}(t_1) -
+\mathbf{C}_{jk}(t_2)\|_2$ is zero everywhere on the intersection locus,
+making it **rank-deficient**: the common-perpendicular Jacobian has a zero row,
+so `GeomAPI_ExtremaCurveCurve` returns no extrema.
+
+#### Why 2D intersection fails in practice
+
+Projecting both curves to $F_k$'s $(u, v)$ frame and using
+`Geom2dAPI_InterCurveCurve` solves the rank-deficiency, but introduces a new
+problem: a **line × conic in 2D yields up to two solutions**.  In the
+plane∩cone case, $\mathbf{C}_{ik}$ is a line (plane $F_i$ ∩ plane $F_k$) and
+$\mathbf{C}_{jk}$ is an ellipse (cone $F_j$ ∩ plane $F_k$).  Both solutions
+lie on the physical ellipse arc, so proximity-based filtering cannot distinguish
+the real vertex from the spurious one.  The spurious vertex splits the ellipse
+into extra arcs, creating odd-degree nodes in the wire graph and causing wire
+assembly to fail.
+
+#### Correct fix: intersect the third edge's curve with the shared plane
+
+For the triple junction of surfaces $i$, $j$, $k$, three edges exist:
+$(i,k)$, $(j,k)$, and $(i,j)$.  The vertex lies on all three.  Rather than
+intersecting the two coplanar curves $\mathbf{C}_{ik}$ and $\mathbf{C}_{jk}$
+with each other, intersect the **third edge's curve** $\mathbf{C}_{ij}$ with
+the plane $F_k$ using `GeomAPI_IntCS`:
+
+$$\mathbf{V} = \mathbf{C}_{ij}(t^*) \quad \text{where} \quad
+\mathbf{n}_k \cdot \mathbf{C}_{ij}(t^*) = d_k$$
+
+**Why $\mathbf{C}_{ij}$ does not lie on $F_k$:** $\mathbf{C}_{ij}$ is the
+intersection of $F_i$ and $F_j$, neither of which is $F_k$.  Generically
+$\mathbf{C}_{ij}$ crosses $F_k$ transversally, so the problem
+$\mathbf{n}_k \cdot \mathbf{C}_{ij}(t) = d_k$ has a non-zero derivative and
+is well-posed.
+
+**Why this avoids spurious solutions:** For a hyperbola $\mathbf{C}_{ij}$
+(plane∩cone), each branch crosses any non-tangent plane at most once.  The
+non-physical branch's crossing point is on the far side of the cone from the
+physical model and is rejected by `filter_vertices_by_proximity`.  In contrast,
+the 2D approach produces two solutions both on the physical ellipse arc, which
+proximity filtering cannot separate.
+
+#### Vertex attribution
+
+The vertex is attributed to all three edges $\{e_a, e_b, (i,j)\}$ so that
+`trim_by_vertices` correctly trims every edge's curve at the vertex.
+
+If the third edge $(i,j)$ is absent from the intersection dictionary (surfaces
+$i$ and $j$ are not adjacent), the pair is skipped — no vertex candidate is
+generated for that triple.
+
 ### Infinite-domain curves and parameter bounding
 
 `GeomAPI_IntSS` returns `Geom_Curve` objects (the base pythonocc handle type).

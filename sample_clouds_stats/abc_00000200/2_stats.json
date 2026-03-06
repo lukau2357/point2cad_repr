@@ -1,0 +1,77 @@
+{
+  "model_id": "00000200_part_2",
+  "step_file": "00000200_826494e894454504b0971fd1_step_003.step",
+  "shape_type": "Solid",
+  "n_faces": 37,
+  "n_edges": 222,
+  "n_vertices": 444,
+  "surface_types": {
+    "Cylinder": 13,
+    "Plane": 24
+  },
+  "surface_areas_by_type": {
+    "Cylinder": 7347.812671197347,
+    "Plane": 1474.9494134645927
+  },
+  "total_surface_area": 8822.76208466194,
+  "curve_types": {
+    "Line": 144,
+    "Ellipse": 4,
+    "BSpline": 26,
+    "Circle": 48
+  },
+  "bounding_box": {
+    "xmin": -19.707572251201903,
+    "xmax": 19.707572251201903,
+    "ymin": -4.0000001,
+    "ymax": 5.988620538719126,
+    "zmin": 9.9999999,
+    "zmax": 90.0000001
+  },
+  "bounding_box_extents": [
+    39.415144502403805,
+    9.988620638719127,
+    80.00000019999999
+  ],
+  "face_types": [
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Plane",
+    "Plane",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Cylinder",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Cylinder",
+    "Cylinder",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Cylinder",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Cylinder",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane"
+  ],
+  "n_sampled_points": 111000,
+  "n_clusters": 37
+}

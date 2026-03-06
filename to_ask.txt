@@ -1,0 +1,22 @@
+ - Error logs when doing --visualize in abc_preprocess: MESA: error: Failed to query drm device.
+libGL error: glx: failed to create dri3 screen
+libGL error: failed to load driver: iris
+libGL error: failed to open /dev/dri/card1: No such file or directory
+libGL error: failed to load driver: iris
+X Error of failed request:  BadValue (integer parameter out of range for operation)
+  Major opcode of failed request:  130 (MIT-SHM)
+  Minor opcode of failed request:  3 (X_ShmPutImage)
+  Value in failed request:  0x3c0
+  Serial number of failed request:  176
+
+
+- What about same stats for all clusters, regarding resolution distribution, implementation intended, it should be separate for 
+  every part!
+
+- Can we construct arbitrary Euler cycle, without using angular ordering?
+
+- Change visualization logic: green (survived arc), red (trimmed arc)? Maybe only green is enough?
+
+- Repeated lines in --visualize, sampling bug or deeper intersection issues?
+
+- Sensitivity on hard-coded vertex filter constant...

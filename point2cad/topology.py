@@ -21,7 +21,10 @@ Each arc_dict has:
     closed  : bool                True if this arc forms a complete closed loop
 """
 
+import io
 import math
+import contextlib
+from collections import defaultdict
 import numpy as np
 
 try:
@@ -33,7 +36,7 @@ try:
     from OCC.Core.TColgp         import TColgp_Array1OfPnt2d
     from OCC.Core.BRep           import BRep_Builder, BRep_Tool
     from OCC.Core.TopExp         import TopExp_Explorer
-    from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_SHELL, TopAbs_SOLID
+    from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_SHELL, TopAbs_SOLID
     from OCC.Core.TopoDS         import topods, TopoDS_Wire, TopoDS_Compound
     from OCC.Core.BRepBuilderAPI import (
         BRepBuilderAPI_MakeVertex,
@@ -57,7 +60,7 @@ except ImportError:
     OCC_AVAILABLE = False
 
 try:
-    from point2cad.surface_fitter import SURFACE_INR
+    from point2cad.surface_types import SURFACE_INR
 except ImportError:
     SURFACE_INR = None
 
@@ -107,6 +110,12 @@ def _basis_curve(curve):
         return None
 
 
+def _arc_key(arc):
+    """Hashable key for an arc dict: (edge_i, edge_j, v_start, v_end)."""
+    ei, ej = arc["edge_key"]
+    return (ei, ej, arc["v_start"], arc["v_end"])
+
+
 def _make_arc(source_curve, t_start, t_end):
     """Build a Geom_TrimmedCurve for [t_start, t_end] on `source_curve`."""
     return Geom_TrimmedCurve(source_curve, t_start, t_end)
@@ -121,7 +130,8 @@ def _project_vertex_on_curve(vertex_pos, curve, t_min, t_max):
     proj = GeomAPI_ProjectPointOnCurve(pnt, curve, t_min, t_max)
     if proj.NbPoints() == 0:
         return None, None
-    return proj.LowerDistanceParameter(), proj.LowerDistance()
+    t_star = proj.LowerDistanceParameter()
+    return t_star, proj.LowerDistance()
 
 
 def _pnt_to_np(pnt):
@@ -199,6 +209,7 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
                         "t_start": t_min,
                         "t_end":   t_max,
                         "closed":  True,
+                        "edge_key": edge_key,
                     })
                 else:
                     span = t_max - t_min
@@ -214,6 +225,7 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
                             "t_start": t_a,
                             "t_end":   t_b,
                             "closed":  False,
+                            "edge_key": edge_key,
                         })
 
                     # Wrap-around arc: [t_k, t_1 + span] on the periodic basis.
@@ -239,6 +251,7 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
                                 "t_start": t_last,
                                 "t_end":   t_wrap_end,
                                 "closed":  False,
+                                "edge_key": edge_key,
                             })
                             wrap_ok = True
                         except Exception:
@@ -259,6 +272,7 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
                         "t_start": t_min,
                         "t_end":   t_max,
                         "closed":  False,
+                        "edge_key": edge_key,
                     })
                 else:
                     # k-1 interior arcs; boundary tails discarded.
@@ -272,6 +286,7 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
                             "t_start": t_a,
                             "t_end":   t_b,
                             "closed":  False,
+                            "edge_key": edge_key,
                         })
 
         edge_arcs[edge_key] = arcs_for_edge
@@ -285,20 +300,25 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
 # ---------------------------------------------------------------------------
 
 def filter_vertices_by_proximity(vertices, vertex_edges,
-                                  cluster_trees, cluster_thresholds):
+                                  adj, boundary_strip_trees,
+                                  per_pair_thresholds):
     """
-    Remove vertices too far from any constituent cluster's point cloud.
+    Remove vertices that don't lie within the boundary strip of their
+    constituent cluster pairs.
 
-    For each vertex, every cluster involved in its incident edges must have
-    its nearest data point within that cluster's NN-distance threshold
-    (from ``build_cluster_proximity``).
+    For each vertex v and each adjacent pair (i, j) derived from its incident
+    edges, query the NN distance from v to the boundary strip point cloud of
+    (i, j).  The vertex is kept only if that distance is within
+    threshold_ij = spacing_factor * max(local_spacing_i, local_spacing_j)
+    for every such pair.
 
     Parameters
     ----------
-    vertices           : (M, 3) float64 array
-    vertex_edges       : list[set] of length M
-    cluster_trees      : list[KDTree]
-    cluster_thresholds : list[float]
+    vertices              : (M, 3) float64 array
+    vertex_edges          : list[set] of length M
+    adj                   : (n, n) bool array — cluster adjacency matrix
+    boundary_strip_trees  : dict (i, j) i<j -> KDTree of boundary strip points
+    per_pair_thresholds   : dict (i, j) i<j -> float — boundary strip threshold
 
     Returns
     -------
@@ -308,15 +328,37 @@ def filter_vertices_by_proximity(vertices, vertex_edges,
         return vertices, vertex_edges
 
     keep = []
-    for vpos, edges in zip(vertices, vertex_edges):
+    for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
+        # Collect all cluster indices involved in this vertex's edges.
         involved = set()
         for edge in edges:
             involved.update(edge)
 
+        # Build all adjacent pairs from the involved clusters.
+        involved_sorted = sorted(involved)
+        pairs = []
+        for ii in range(len(involved_sorted)):
+            for jj in range(ii + 1, len(involved_sorted)):
+                ci, cj = involved_sorted[ii], involved_sorted[jj]
+                if adj[ci, cj]:
+                    pairs.append((ci, cj))
+
         ok = True
-        for cidx in involved:
-            d, _ = cluster_trees[cidx].query(vpos, k=1)
-            if d > cluster_thresholds[cidx]:
+        for (ci, cj) in pairs:
+            key = (min(ci, cj), max(ci, cj))
+            threshold = per_pair_thresholds.get(key)
+            strip_tree = boundary_strip_trees.get(key)
+            if threshold is None or strip_tree is None:
+                continue
+
+            d_strip, _ = strip_tree.query(vpos, k=1)
+
+            if d_strip > threshold:
+                print(f"[vertex filter] dropping vertex {v_idx} "
+                      f"pos=[{vpos[0]:.6f},{vpos[1]:.6f},{vpos[2]:.6f}]  "
+                      f"pair=({ci},{cj})  d_strip={d_strip:.6f}  "
+                      f"threshold={threshold:.6f}  "
+                      f"edges={edges}")
                 ok = False
                 break
         keep.append(ok)
@@ -326,24 +368,38 @@ def filter_vertices_by_proximity(vertices, vertex_edges,
 
 
 def _passes_nn(curve, t0, t1, tree_i, tree_j, threshold_i, threshold_j,
-               n_samples, min_close_fraction):
+               n_samples, min_close_fraction, sample_fraction=0.5):
     """
-    Return True if at least min_close_fraction of n_samples points sampled
-    uniformly on curve over [t0, t1] are within NN-distance threshold of
-    both cluster i and cluster j.
+    Return True if the arc passes a proximity check against both clusters.
+
+    Samples interior points and checks NN distance to both clusters against
+    max(threshold_i, threshold_j).  Using the max avoids rejecting arcs where
+    one cluster has a tight threshold but the arc legitimately extends slightly
+    beyond that cluster's sampled coverage.
+
     Returns True when no point can be evaluated (safe default).
+
+    sample_fraction: fraction of the parameter range to sample, centered
+        around the midpoint.  E.g. 0.5 means sample the middle 50% of the
+        arc, avoiding vertex-adjacent regions where physical and non-physical
+        arcs are indistinguishable (shared endpoints).  1.0 uses the full range.
     """
+    thr = max(threshold_i, threshold_j)
     n_close = 0
     n_total = 0
+    t_mid = (t0 + t1) / 2
+    half_span = (t1 - t0) * sample_fraction / 2
+    t_start = t_mid - half_span
+    t_end = t_mid + half_span
     for k in range(n_samples):
-        t = t0 + (t1 - t0) * k / max(n_samples - 1, 1)
+        t = t_start + (t_end - t_start) * k / max(n_samples - 1, 1)
         try:
             p = curve.Value(t)
             pt = np.array([p.X(), p.Y(), p.Z()])
             n_total += 1
             d_i, _ = tree_i.query(pt, k=1)
             d_j, _ = tree_j.query(pt, k=1)
-            if d_i <= threshold_i and d_j <= threshold_j:
+            if d_i <= thr and d_j <= thr:
                 n_close += 1
         except Exception:
             pass
@@ -351,14 +407,9 @@ def _passes_nn(curve, t0, t1, tree_i, tree_j, threshold_i, threshold_j,
 
 
 def filter_curves_by_proximity(intersections, cluster_trees, cluster_thresholds,
-                                n_samples=20, min_close_fraction=0.6):
+                                n_samples=50, min_close_fraction=0.5):
     """
     Discard intersection curves not physically present on both adjacent surfaces.
-
-    For each curve on edge (i, j), n_samples points are sampled uniformly
-    and tested for NN-distance proximity to both cluster i and cluster j.
-    Curves where fewer than min_close_fraction of sampled points are within
-    both clusters' thresholds are discarded.
 
     Parameters
     ----------
@@ -379,9 +430,6 @@ def filter_curves_by_proximity(intersections, cluster_trees, cluster_thresholds,
         kept = []
         for curve in inter["curves"]:
             t0, t1 = curve.FirstParameter(), curve.LastParameter()
-            # Closed curves bypass the curve filter — they can't be
-            # evaluated as all-or-nothing.  The arc-level filter handles
-            # removal of spurious closed-curve arcs after vertex splitting.
             if curve_is_closed(curve):
                 kept.append(curve)
                 continue
@@ -398,14 +446,9 @@ def filter_curves_by_proximity(intersections, cluster_trees, cluster_thresholds,
 
 
 def filter_arcs_by_proximity(edge_arcs, cluster_trees, cluster_thresholds,
-                              n_samples=20, min_close_fraction=0.7):
+                              n_samples=50, min_close_fraction=0.5):
     """
     Discard arcs not physically present on both adjacent surfaces.
-
-    For each arc on edge (i, j), sample n_samples points uniformly and
-    check NN-distance proximity to both cluster i and cluster j.  Arcs
-    where fewer than min_close_fraction of sampled points are within both
-    clusters' thresholds are discarded.
 
     Parameters
     ----------
@@ -439,6 +482,799 @@ def filter_arcs_by_proximity(edge_arcs, cluster_trees, cluster_thresholds,
 
 
 # ---------------------------------------------------------------------------
+# Step 1c — Progressive Euler filtering
+# ---------------------------------------------------------------------------
+
+def _score_vertex(vpos, involved_clusters, cluster_trees, cluster_nn_percentiles):
+    """
+    Fitness score for a vertex.
+
+    Computes d_k / p_k for each involved cluster, then takes the max of the
+    3 lowest ratios.  This makes scoring robust to extra cluster associations
+    from deduplication merging: a vertex genuinely at triangle (i,j,k) that
+    picks up a 4th cluster m from a nearby merged candidate won't be penalised
+    by cluster m's high distance.
+    """
+    ratios = []
+    for k in involved_clusters:
+        d, _ = cluster_trees[k].query(vpos, k=1)
+        p = cluster_nn_percentiles[k]
+        if p > 0:
+            ratios.append(d / p)
+        else:
+            ratios.append(float('inf'))
+    if not ratios:
+        return float('inf')
+    ratios.sort()
+    # Use the 3 best (lowest) ratios — the genuine triangle's clusters.
+    # For vertices with ≤3 clusters, this is just max over all.
+    return ratios[min(2, len(ratios) - 1)]
+
+
+def _score_arc(arc, cluster_i, cluster_j, cluster_trees, cluster_nn_percentiles,
+               n_samples=10, sample_fraction=0.5):
+    """
+    Fitness score for an arc: mean over interior samples of max(d_i/p_i, d_j/p_j).
+    Lower = closer to clusters = more likely real.
+    """
+    t0, t1 = arc["t_start"], arc["t_end"]
+    t_mid = (t0 + t1) / 2
+    half_span = (t1 - t0) * sample_fraction / 2
+    t_start = t_mid - half_span
+    t_end = t_mid + half_span
+
+    tree_i = cluster_trees[cluster_i]
+    tree_j = cluster_trees[cluster_j]
+    p_i = cluster_nn_percentiles[cluster_i]
+    p_j = cluster_nn_percentiles[cluster_j]
+
+    ratios = []
+    for k in range(n_samples):
+        t = t_start + (t_end - t_start) * k / max(n_samples - 1, 1)
+        try:
+            p = arc["curve"].Value(t)
+            pt = np.array([p.X(), p.Y(), p.Z()])
+            d_i, _ = tree_i.query(pt, k=1)
+            d_j, _ = tree_j.query(pt, k=1)
+            r_i = d_i / p_i if p_i > 0 else float('inf')
+            r_j = d_j / p_j if p_j > 0 else float('inf')
+            ratios.append(max(r_i, r_j))
+        except Exception:
+            pass
+    return np.mean(ratios) if ratios else float('inf')
+
+
+
+def _arc_inside_bboxes(arc, cluster_i, cluster_j, cluster_bboxes, n_samples=10):
+    """Check if an arc's sampled points lie inside the bboxes of both clusters."""
+    t0, t1 = arc["t_start"], arc["t_end"]
+    lo_i, hi_i = cluster_bboxes[cluster_i]
+    lo_j, hi_j = cluster_bboxes[cluster_j]
+    for k in range(n_samples):
+        t = t0 + (t1 - t0) * k / max(n_samples - 1, 1)
+        try:
+            p = arc["curve"].Value(t)
+            pt = np.array([p.X(), p.Y(), p.Z()])
+            if not (np.all(pt >= lo_i) and np.all(pt <= hi_i)):
+                return False
+            if not (np.all(pt >= lo_j) and np.all(pt <= hi_j)):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def progressive_euler_filter(edge_arcs, vertices, vertex_edges,
+                             clusters, cluster_trees, cluster_nn_percentiles,
+                             cluster_bboxes=None):
+    """
+    Progressive filtering of vertices and arcs until all face wire graphs
+    are Eulerian.
+
+    Pipeline:
+      1. Score all vertices and arcs by cluster proximity ratio.
+      2. Two-pass progressive removal until all face graphs are Eulerian:
+         Pass 1 — remove arcs (worst-scored first).  Arc removal is less
+         destructive than vertex removal (affects exactly 2 faces).
+         Pass 2 — remove vertices (worst-scored first), only if arc removal
+         alone did not achieve the Eulerian condition.
+      3. Remove any 0-degree (isolated) vertices.
+
+    Parameters
+    ----------
+    edge_arcs              : dict (i,j) -> list[arc_dict]
+    vertices               : (M, 3) array
+    vertex_edges           : list[set] of length M
+    clusters               : list[np.ndarray] — per-cluster point clouds
+    cluster_trees          : list[KDTree]
+    cluster_nn_percentiles : list[float] — intra-cluster NN percentile (raw, NOT
+                             multiplied by proximity_factor)
+    cluster_bboxes         : unused, kept for call-site compatibility
+
+    Returns
+    -------
+    filtered edge_arcs, vertices, vertex_edges
+    """
+    n_v = len(vertices)
+    n_a = sum(len(a) for a in edge_arcs.values())
+    print(f"[euler filter] input: {n_v} vertices, {n_a} arcs")
+
+    # ------------------------------------------------------------------
+    # Phase 1: Score all candidates
+    # ------------------------------------------------------------------
+    vertex_scores = []
+    for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
+        involved = set()
+        for edge in edges:
+            involved.update(edge)
+        score = _score_vertex(vpos, involved, cluster_trees, cluster_nn_percentiles)
+        vertex_scores.append(score)
+
+    # Score arcs
+    arc_scores = []  # list of (score, edge_key, arc_idx_within_edge)
+    for edge_key, arcs in edge_arcs.items():
+        i, j = edge_key
+        for arc_idx, arc in enumerate(arcs):
+            if arc["closed"]:
+                arc_scores.append((0.0, edge_key, arc_idx))  # never remove closed arcs
+                continue
+            score = _score_arc(arc, i, j, cluster_trees, cluster_nn_percentiles)
+            arc_scores.append((score, edge_key, arc_idx))
+
+    # ------------------------------------------------------------------
+    # Phase 1b: IQR outlier filter on vertices and arcs
+    # ------------------------------------------------------------------
+    removed_vertices = set()
+
+    # Vertex IQR filter
+    if len(vertex_scores) >= 4:
+        vs_arr = np.array(vertex_scores)
+        q1_v, q3_v = np.percentile(vs_arr, [25, 75])
+        iqr_v = q3_v - q1_v
+        vertex_threshold = q3_v + 1.5 * iqr_v
+        for v_idx, score in enumerate(vertex_scores):
+            if score > vertex_threshold:
+                removed_vertices.add(v_idx)
+                print(f"[IQR filter] removing vertex {v_idx} "
+                      f"score={score:.4f} > threshold={vertex_threshold:.4f}")
+        if removed_vertices:
+            print(f"[IQR filter] vertex quartiles: Q1={q1_v:.4f} Q3={q3_v:.4f} "
+                  f"IQR={iqr_v:.4f} threshold={vertex_threshold:.4f}")
+
+    # Arc IQR filter
+    open_arc_scores = [(s, ek, ai) for s, ek, ai in arc_scores if s > 0]
+    removed_arc_keys = set()  # (edge_key, t_start, t_end)
+    if len(open_arc_scores) >= 4:
+        as_arr = np.array([s for s, _, _ in open_arc_scores])
+        q1_a, q3_a = np.percentile(as_arr, [25, 75])
+        iqr_a = q3_a - q1_a
+        arc_threshold = q3_a + 1.5 * iqr_a
+        for score, edge_key, arc_idx in open_arc_scores:
+            if score > arc_threshold:
+                arc = edge_arcs[edge_key][arc_idx]
+                removed_arc_keys.add((edge_key, arc["t_start"], arc["t_end"]))
+                # If removing this arc isolates a vertex, remove it too
+                for v in [arc.get("v_start"), arc.get("v_end")]:
+                    if v is not None and v not in removed_vertices:
+                        # Check degree after all IQR arc removals (conservative:
+                        # we'll do a proper sweep later)
+                        pass
+                print(f"[IQR filter] removing arc {edge_key}[{arc_idx}] "
+                      f"score={score:.4f} > threshold={arc_threshold:.4f}")
+        if removed_arc_keys:
+            print(f"[IQR filter] arc quartiles: Q1={q1_a:.4f} Q3={q3_a:.4f} "
+                  f"IQR={iqr_a:.4f} threshold={arc_threshold:.4f}")
+
+    # Apply IQR removals to edge_arcs
+    if removed_arc_keys:
+        for edge_key in list(edge_arcs.keys()):
+            edge_arcs[edge_key] = [
+                arc for arc in edge_arcs[edge_key]
+                if (edge_key, arc.get("t_start"), arc.get("t_end")) not in removed_arc_keys
+            ]
+
+    # Re-score arcs after IQR removal (indices may have changed)
+    if removed_arc_keys:
+        arc_scores = []
+        for edge_key, arcs in edge_arcs.items():
+            i, j = edge_key
+            for arc_idx, arc in enumerate(arcs):
+                if arc["closed"]:
+                    arc_scores.append((0.0, edge_key, arc_idx))
+                    continue
+                score = _score_arc(arc, i, j, cluster_trees, cluster_nn_percentiles)
+                arc_scores.append((score, edge_key, arc_idx))
+
+    n_iqr = len(removed_vertices) + len(removed_arc_keys)
+    if n_iqr > 0:
+        print(f"[IQR filter] removed {len(removed_vertices)} vertices, "
+              f"{len(removed_arc_keys)} arcs")
+
+    # ------------------------------------------------------------------
+    # Phase 2: Check Euler, progressively remove worst candidate
+    # ------------------------------------------------------------------
+    # Work on a mutable copy of edge_arcs.
+    work_arcs = {}
+    for edge_key, arcs in edge_arcs.items():
+        work_arcs[edge_key] = [dict(a) for a in arcs]
+
+    # Remove IQR-filtered vertices from work_arcs
+    if removed_vertices:
+        for edge_key in list(work_arcs.keys()):
+            work_arcs[edge_key] = [
+                arc for arc in work_arcs[edge_key]
+                if arc.get("closed") or
+                (arc["v_start"] not in removed_vertices and
+                 arc["v_end"] not in removed_vertices)
+            ]
+
+    bad_faces = _non_eulerian_faces_direct(work_arcs)
+    if not bad_faces:
+        print("[euler filter] all faces already Eulerian — no Euler removals needed")
+    else:
+        print(f"[euler filter] non-Eulerian faces: {sorted(bad_faces)}")
+
+        # Build separate arc and vertex candidate lists
+        arc_candidates = []
+        for score, edge_key, arc_idx in arc_scores:
+            if score > 0:  # skip closed arcs (score=0)
+                arc_candidates.append(("arc", edge_key, arc_idx, score))
+        arc_candidates.sort(key=lambda c: c[3], reverse=True)
+
+        vertex_candidates = []
+        for v_idx, score in enumerate(vertex_scores):
+            vertex_candidates.append(("vertex", v_idx, score))
+        vertex_candidates.sort(key=lambda c: c[2], reverse=True)
+
+        # Pass 1: remove arcs (worst-scored first) — less destructive
+        for candidate in arc_candidates:
+            bad_faces = _non_eulerian_faces_direct(work_arcs)
+            if not bad_faces:
+                break
+            edge_key = candidate[1]
+            orig_arc_idx = candidate[2]
+            orig_arc = edge_arcs[edge_key][orig_arc_idx]
+            arc_found = None
+            for wi, wa in enumerate(work_arcs.get(edge_key, [])):
+                if (wa.get("t_start") == orig_arc["t_start"] and
+                        wa.get("t_end") == orig_arc["t_end"]):
+                    arc_found = wi
+                    break
+            if arc_found is None:
+                continue
+            cand_faces = set(edge_key)
+            if not (cand_faces & bad_faces):
+                continue
+            arc = work_arcs[edge_key][arc_found]
+            work_arcs[edge_key].pop(arc_found)
+            for v in [arc.get("v_start"), arc.get("v_end")]:
+                if v is None or v in removed_vertices:
+                    continue
+                if _vertex_degree(v, work_arcs) == 0:
+                    removed_vertices.add(v)
+            print(f"[euler filter] pass 1: removing arc {edge_key}[{orig_arc_idx}] "
+                  f"score={candidate[3]:.4f} "
+                  f"faces={sorted(cand_faces & bad_faces)}")
+
+        # Pass 2: remove vertices (worst-scored first) — only if arcs didn't suffice
+        for candidate in vertex_candidates:
+            bad_faces = _non_eulerian_faces_direct(work_arcs)
+            if not bad_faces:
+                break
+            v_idx = candidate[1]
+            if v_idx in removed_vertices:
+                continue
+            cand_faces = _vertex_faces(v_idx, work_arcs)
+            if not (cand_faces & bad_faces):
+                continue
+            _merge_arcs_at_vertex(v_idx, work_arcs)
+            removed_vertices.add(v_idx)
+            for edge_key, arcs in work_arcs.items():
+                for arc in arcs:
+                    if arc.get("closed"):
+                        continue
+                    for v in [arc["v_start"], arc["v_end"]]:
+                        if v is not None and v not in removed_vertices:
+                            if _vertex_degree(v, work_arcs) == 0:
+                                removed_vertices.add(v)
+            print(f"[euler filter] pass 2: removing vertex {v_idx} score={candidate[2]:.4f} "
+                  f"faces={sorted(cand_faces & bad_faces)}")
+
+        bad_faces = _non_eulerian_faces_direct(work_arcs)
+        if bad_faces:
+            print(f"[euler filter] WARNING: could not achieve Eulerian condition "
+                  f"for faces {sorted(bad_faces)}")
+
+    # ------------------------------------------------------------------
+    # Phase 3: Rebuild vertices and edge_arcs with removals applied
+    # ------------------------------------------------------------------
+    # Final sweep: remove any remaining 0-degree vertices
+    for v_idx in range(len(vertices)):
+        if v_idx in removed_vertices:
+            continue
+        if _vertex_degree(v_idx, work_arcs) == 0:
+            print(f"[euler filter] removing isolated vertex {v_idx}")
+            removed_vertices.add(v_idx)
+
+    surviving_v = sorted(set(range(len(vertices))) - removed_vertices)
+    v_remap = {old: new for new, old in enumerate(surviving_v)}
+
+    new_vertices = vertices[surviving_v]
+    new_vertex_edges = [vertex_edges[i] for i in surviving_v]
+
+    new_edge_arcs = {}
+    for edge_key, arcs in work_arcs.items():
+        kept = []
+        for arc in arcs:
+            if arc.get("closed"):
+                kept.append(arc)
+                continue
+            vs, ve = arc["v_start"], arc["v_end"]
+            if vs in v_remap and ve in v_remap:
+                arc = dict(arc)
+                arc["v_start"] = v_remap[vs]
+                arc["v_end"] = v_remap[ve]
+                kept.append(arc)
+            # else: dangling arc (vertex was removed without merge), drop it
+        new_edge_arcs[edge_key] = kept
+
+    print(f"[euler filter] removed {len(removed_vertices)} vertices")
+    print(f"[euler filter] final: {len(new_vertices)} vertices, "
+          f"{sum(len(a) for a in new_edge_arcs.values())} arcs")
+
+    return new_edge_arcs, new_vertices, new_vertex_edges
+
+
+def _merge_arcs_at_vertex(v_idx, work_arcs):
+    """
+    Remove vertex v_idx by merging adjacent arcs on the same edge.
+
+    For each edge that has arcs touching v_idx:
+      - Find all arcs on that edge that have v_idx as v_start or v_end.
+      - If there are exactly 2 such arcs, merge them into one arc spanning
+        the combined parameter range, connecting the other two vertices.
+      - If there is 1 such arc, remove it (dangling).
+      - If there are >2, merge pairwise by parameter order: sort by t_start,
+        merge consecutive pairs that share v_idx.
+
+    If merging produces an arc where v_start == v_end, mark it as closed.
+    """
+    for edge_key in list(work_arcs.keys()):
+        arcs = work_arcs[edge_key]
+        touching = []  # (index, arc) pairs that touch v_idx
+        others = []    # arcs that don't touch v_idx
+        for i, arc in enumerate(arcs):
+            if arc.get("closed"):
+                others.append(arc)
+                continue
+            if arc["v_start"] == v_idx or arc["v_end"] == v_idx:
+                touching.append(arc)
+            else:
+                others.append(arc)
+
+        if not touching:
+            continue
+
+        if len(touching) == 1:
+            # Dangling arc — just remove it
+            work_arcs[edge_key] = others
+            continue
+
+        # Sort touching arcs by t_start so we can merge consecutive ones
+        touching.sort(key=lambda a: a["t_start"])
+
+        merged = []
+        i = 0
+        while i < len(touching):
+            arc_a = touching[i]
+            # Look for a partner to merge with: arc_a ends at v_idx and
+            # arc_b starts at v_idx (or vice versa)
+            merged_any = False
+            for j in range(i + 1, len(touching)):
+                arc_b = touching[j]
+                if arc_a["v_end"] == v_idx and arc_b["v_start"] == v_idx:
+                    # Merge: arc_a's start → arc_b's end
+                    new_arc = _make_merged_arc(arc_a, arc_b)
+                    merged.append(new_arc)
+                    touching.pop(j)
+                    merged_any = True
+                    break
+                elif arc_a["v_start"] == v_idx and arc_b["v_end"] == v_idx:
+                    # Merge: arc_b's start → arc_a's end
+                    new_arc = _make_merged_arc(arc_b, arc_a)
+                    merged.append(new_arc)
+                    touching.pop(j)
+                    merged_any = True
+                    break
+            if not merged_any:
+                # No partner found — dangling, drop it
+                pass
+            i += 1
+
+        work_arcs[edge_key] = others + merged
+
+
+def _make_merged_arc(arc_a, arc_b):
+    """
+    Merge two arcs where arc_a's v_end == arc_b's v_start (the removed vertex).
+    Result spans [arc_a.t_start, arc_b.t_end] with endpoints arc_a.v_start, arc_b.v_end.
+    Uses arc_a's curve (they share the same underlying curve on the same edge).
+    """
+    new_vs = arc_a["v_start"]
+    new_ve = arc_b["v_end"]
+    new_t_start = arc_a["t_start"]
+    new_t_end = arc_b["t_end"]
+    is_closed = (new_vs == new_ve) if (new_vs is not None and new_ve is not None) else False
+    new_arc = {
+        "curve": arc_a["curve"],
+        "v_start": None if is_closed else new_vs,
+        "v_end": None if is_closed else new_ve,
+        "t_start": new_t_start,
+        "t_end": new_t_end,
+        "closed": is_closed,
+        "edge_key": arc_a.get("edge_key"),
+    }
+    return new_arc
+
+
+def _vertex_degree(v_idx, work_arcs):
+    """Count how many open arcs in work_arcs touch vertex v_idx."""
+    deg = 0
+    for arcs in work_arcs.values():
+        for arc in arcs:
+            if arc.get("closed"):
+                continue
+            if arc["v_start"] == v_idx or arc["v_end"] == v_idx:
+                deg += 1
+    return deg
+
+
+def _vertex_faces(v_idx, work_arcs):
+    """Return set of face indices that vertex v_idx touches."""
+    faces = set()
+    for (i, j), arcs in work_arcs.items():
+        for arc in arcs:
+            if arc.get("closed"):
+                continue
+            if arc["v_start"] == v_idx or arc["v_end"] == v_idx:
+                faces.add(i)
+                faces.add(j)
+    return faces
+
+
+def _non_eulerian_faces_direct(work_arcs):
+    """Check Euler condition directly on work_arcs (no removed sets)."""
+    face_degree = defaultdict(lambda: defaultdict(int))
+    for (i, j), arcs in work_arcs.items():
+        for arc in arcs:
+            if arc.get("closed"):
+                continue
+            vs, ve = arc["v_start"], arc["v_end"]
+            face_degree[i][vs] += 1
+            face_degree[i][ve] += 1
+            face_degree[j][vs] += 1
+            face_degree[j][ve] += 1
+    bad = set()
+    for face_idx, vdeg in face_degree.items():
+        for v, deg in vdeg.items():
+            if deg % 2 != 0:
+                bad.add(face_idx)
+                break
+    return bad
+
+
+def _non_eulerian_faces(edge_arcs, removed_vertices, removed_arcs):
+    """Return set of face indices whose wire graph is non-Eulerian."""
+    face_degree = defaultdict(lambda: defaultdict(int))  # face -> vertex -> degree
+    for edge_key, arcs in edge_arcs.items():
+        i, j = edge_key
+        for arc_idx, arc in enumerate(arcs):
+            if (edge_key, arc_idx) in removed_arcs:
+                continue
+            if arc["closed"]:
+                continue
+            vs, ve = arc["v_start"], arc["v_end"]
+            if vs in removed_vertices or ve in removed_vertices:
+                continue
+            face_degree[i][vs] += 1
+            face_degree[i][ve] += 1
+            face_degree[j][vs] += 1
+            face_degree[j][ve] += 1
+    bad = set()
+    for face_idx, vdeg in face_degree.items():
+        for v, deg in vdeg.items():
+            if deg % 2 != 0:
+                bad.add(face_idx)
+                break
+    return bad
+
+
+def _candidate_faces(candidate, edge_arcs):
+    """Return the set of face indices a candidate belongs to."""
+    if candidate[0] == "vertex":
+        v_idx = candidate[1]
+        faces = set()
+        for (i, j), arcs in edge_arcs.items():
+            for arc in arcs:
+                if arc.get("closed"):
+                    continue
+                if arc["v_start"] == v_idx or arc["v_end"] == v_idx:
+                    faces.add(i)
+                    faces.add(j)
+        return faces
+    else:
+        edge_key = candidate[1]
+        i, j = edge_key
+        return {i, j}
+
+
+# ---------------------------------------------------------------------------
+# Step 1d — Greedy oracle-guided filter
+# ---------------------------------------------------------------------------
+
+def _apply_removals(edge_arcs, vertices, vertex_edges, removed_vertices,
+                    removed_arc_keys):
+    """
+    Apply a set of vertex and arc removals to edge_arcs/vertices/vertex_edges.
+
+    removed_arc_keys : set of (edge_key, t_start, t_end) tuples
+
+    Returns (new_edge_arcs, new_vertices, new_vertex_edges).
+    """
+    # Build work_arcs with arc removals applied
+    work_arcs = {}
+    for edge_key, arcs in edge_arcs.items():
+        kept = []
+        for arc in arcs:
+            if (edge_key, arc["t_start"], arc["t_end"]) in removed_arc_keys:
+                continue
+            kept.append(dict(arc))
+        work_arcs[edge_key] = kept
+
+    # Remove arcs touching removed vertices
+    for edge_key in list(work_arcs.keys()):
+        work_arcs[edge_key] = [
+            arc for arc in work_arcs[edge_key]
+            if arc.get("closed") or
+            (arc["v_start"] not in removed_vertices and
+             arc["v_end"] not in removed_vertices)
+        ]
+
+    # Sweep for 0-degree vertices
+    all_removed = set(removed_vertices)
+    for v_idx in range(len(vertices)):
+        if v_idx in all_removed:
+            continue
+        if _vertex_degree(v_idx, work_arcs) == 0:
+            all_removed.add(v_idx)
+
+    # Compact
+    surviving_v = sorted(set(range(len(vertices))) - all_removed)
+    v_remap = {old: new for new, old in enumerate(surviving_v)}
+
+    new_vertices = vertices[surviving_v]
+    new_vertex_edges = [vertex_edges[i] for i in surviving_v]
+
+    new_edge_arcs = {}
+    for edge_key, arcs in work_arcs.items():
+        kept = []
+        for arc in arcs:
+            if arc.get("closed"):
+                kept.append(arc)
+                continue
+            vs, ve = arc["v_start"], arc["v_end"]
+            if vs in v_remap and ve in v_remap:
+                arc = dict(arc)
+                arc["v_start"] = v_remap[vs]
+                arc["v_end"] = v_remap[ve]
+                kept.append(arc)
+        new_edge_arcs[edge_key] = kept
+
+    return new_edge_arcs, new_vertices, new_vertex_edges
+
+
+def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
+                         clusters, cluster_trees, cluster_nn_percentiles,
+                         occ_surfaces, surface_ids=None,
+                         bspline_method="uv_bounds", tolerance=1e-3,
+                         cluster_bboxes=None):
+    """
+    Greedy worst-first removal guided by OCC BRepCheck_Analyzer.
+
+    Algorithm:
+      1. Score all vertices and arcs by cluster proximity ratio.
+      2. Try building the full BRep — if BRepCheck_Analyzer returns True, done.
+      3. Remove the single worst-scoring surviving object (arc or vertex).
+      4. Rebuild and re-check. Repeat until valid or no candidates remain.
+
+    The Euler condition is NOT enforced inside the loop — if wire assembly
+    fails on a non-Eulerian graph, that counts as "invalid" and the loop
+    continues removing objects.
+
+    Parameters
+    ----------
+    edge_arcs, vertices, vertex_edges :
+        Same as progressive_euler_filter.
+    clusters, cluster_trees, cluster_nn_percentiles :
+        Per-cluster data for fitness scoring.
+    occ_surfaces : list[Geom_Surface]
+        OCC surfaces for BRep construction.
+    surface_ids : list[int] or None
+    bspline_method : str
+    tolerance : float
+    cluster_bboxes : unused, kept for call-site compatibility
+
+    Returns
+    -------
+    (edge_arcs, vertices, vertex_edges, shape, brep_info)
+        Filtered topology + the final built shape and its info dict.
+    """
+    n_v = len(vertices)
+    n_a = sum(len(a) for a in edge_arcs.values())
+    print(f"[oracle filter] input: {n_v} vertices, {n_a} arcs")
+
+    # ------------------------------------------------------------------
+    # Phase 1: Score all candidates
+    # ------------------------------------------------------------------
+    vertex_scores = []
+    for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
+        involved = set()
+        for edge in edges:
+            involved.update(edge)
+        score = _score_vertex(vpos, involved, cluster_trees,
+                              cluster_nn_percentiles)
+        vertex_scores.append(score)
+
+    arc_scores = []  # (score, edge_key, arc_idx)
+    for edge_key, arcs in edge_arcs.items():
+        i, j = edge_key
+        for arc_idx, arc in enumerate(arcs):
+            if arc["closed"]:
+                arc_scores.append((0.0, edge_key, arc_idx))
+                continue
+            score = _score_arc(arc, i, j, cluster_trees,
+                               cluster_nn_percentiles)
+            arc_scores.append((score, edge_key, arc_idx))
+
+    # Build separate arc and vertex candidate lists, sorted worst-first.
+    # Arcs are always tried before vertices (less destructive).
+    arc_candidates = []
+    for score, edge_key, arc_idx in arc_scores:
+        if score <= 0:
+            continue  # never remove closed arcs
+        arc = edge_arcs[edge_key][arc_idx]
+        arc_candidates.append((score, (edge_key, arc["t_start"], arc["t_end"])))
+    arc_candidates.sort(key=lambda c: c[0], reverse=True)
+
+    vertex_candidates = []
+    for v_idx, score in enumerate(vertex_scores):
+        vertex_candidates.append((score, v_idx))
+    vertex_candidates.sort(key=lambda c: c[0], reverse=True)
+
+    n_cand = len(arc_candidates) + len(vertex_candidates)
+    if n_cand:
+        all_scores = [s for s, _ in arc_candidates] + [s for s, _ in vertex_candidates]
+        print(f"[oracle filter] {len(arc_candidates)} arc + "
+              f"{len(vertex_candidates)} vertex candidates "
+              f"(score range: {min(all_scores):.4f} — {max(all_scores):.4f})")
+    else:
+        print("[oracle filter] no removable candidates (all arcs closed)")
+
+    # ------------------------------------------------------------------
+    # Phase 2: Remove isolated vertices unconditionally
+    # ------------------------------------------------------------------
+    removed_vertices = set()
+    removed_arc_keys = set()  # (edge_key, t_start, t_end)
+
+    for v_idx in range(len(vertices)):
+        if _vertex_degree(v_idx, edge_arcs) == 0:
+            removed_vertices.add(v_idx)
+    if removed_vertices:
+        print(f"[oracle filter] removing {len(removed_vertices)} isolated vertices")
+
+    # ------------------------------------------------------------------
+    # Phase 3: Greedy removal loop (arcs first, then vertices)
+    # ------------------------------------------------------------------
+    def _try_build(removed_v, removed_a):
+        """Build BRep with given removals, return (valid, shape, info, ea, v, ve).
+
+        Validity requires BOTH:
+          - All face wire graphs are Eulerian (necessary for complete wires)
+          - BRepCheck_Analyzer returns True (geometric correctness)
+        """
+        ea, verts, ve = _apply_removals(edge_arcs, vertices, vertex_edges,
+                                        removed_v, removed_a)
+        # Fast Euler pre-check — if any face is non-Eulerian, wire assembly
+        # will skip it, producing an incomplete (thus invalid) model.
+        bad_faces = _non_eulerian_faces_direct(ea)
+        if bad_faces:
+            return False, None, {"valid": False, "n_faces": 0,
+                                 "n_input_faces": 0,
+                                 "non_eulerian": sorted(bad_faces)}, ea, verts, ve
+        fa = face_arc_incidence(ea)
+        fw = assemble_wires(fa, occ_surfaces, verts, surface_ids=surface_ids)
+        shape, info = build_brep_shape(
+            fa, occ_surfaces, verts, surface_ids=surface_ids,
+            face_wires=fw, tolerance=tolerance,
+            bspline_method=bspline_method,
+        )
+        valid = (info.get("valid", False) and
+                 info.get("n_faces", 0) > 0)
+        return valid, shape, info, ea, verts, ve
+
+    # Try with everything first (minus isolated vertices)
+    print("[oracle filter] trying full model ...")
+    with contextlib.redirect_stdout(io.StringIO()):
+        valid, shape, info, final_ea, final_v, final_ve = _try_build(
+            removed_vertices, removed_arc_keys)
+    if valid:
+        print(f"[oracle filter] full model valid — "
+              f"{info['n_faces']} faces, no removals needed")
+        return final_ea, final_v, final_ve, shape, info
+
+    non_euler = info.get("non_eulerian")
+    if non_euler:
+        print(f"[oracle filter] full model invalid — non-Eulerian faces: {non_euler}")
+    else:
+        print(f"[oracle filter] full model invalid — BRepCheck failed "
+              f"({info.get('n_faces', 0)} faces)")
+    print(f"[oracle filter] starting greedy removal")
+
+    best_shape, best_info = shape, info
+    best_ea, best_v, best_ve = final_ea, final_v, final_ve
+
+    # Pass 1: remove arcs worst-first
+    for score, ident in arc_candidates:
+        if ident in removed_arc_keys:
+            continue
+        removed_arc_keys.add(ident)
+        edge_key, t_start, t_end = ident
+        print(f"[oracle filter] pass 1: removing arc {edge_key} "
+              f"t=[{t_start:.4f},{t_end:.4f}] score={score:.4f}")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            valid, shape, info, ea, verts, ve = _try_build(
+                removed_vertices, removed_arc_keys)
+
+        n_faces = info.get("n_faces", 0)
+        if valid:
+            print(f"[oracle filter] valid! {n_faces} faces after "
+                  f"{len(removed_arc_keys)} arc removals")
+            return ea, verts, ve, shape, info
+        if n_faces > best_info.get("n_faces", 0):
+            best_shape, best_info = shape, info
+            best_ea, best_v, best_ve = ea, verts, ve
+
+    # Pass 2: remove vertices worst-first (only if arcs didn't suffice)
+    for score, v_idx in vertex_candidates:
+        if v_idx in removed_vertices:
+            continue
+        removed_vertices.add(v_idx)
+        print(f"[oracle filter] pass 2: removing vertex {v_idx} "
+              f"score={score:.4f}")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            valid, shape, info, ea, verts, ve = _try_build(
+                removed_vertices, removed_arc_keys)
+
+        n_faces = info.get("n_faces", 0)
+        if valid:
+            print(f"[oracle filter] valid! {n_faces} faces after "
+                  f"{len(removed_arc_keys)} arc + "
+                  f"{len(removed_vertices)} vertex removals")
+            return ea, verts, ve, shape, info
+        if n_faces > best_info.get("n_faces", 0):
+            best_shape, best_info = shape, info
+            best_ea, best_v, best_ve = ea, verts, ve
+
+    # Exhausted all candidates without reaching validity
+    print(f"[oracle filter] WARNING: could not achieve valid BRep "
+          f"after removing all candidates. "
+          f"Best: {best_info.get('n_faces', 0)} faces")
+    return best_ea, best_v, best_ve, best_shape, best_info
+
+
+# ---------------------------------------------------------------------------
 # Step 2 — Face–arc incidence
 # ---------------------------------------------------------------------------
 
@@ -466,9 +1302,8 @@ def face_arc_incidence(edge_arcs):
     for edge_key, arcs in edge_arcs.items():
         fi, fj = edge_key
         for arc in arcs:
-            tagged = dict(arc, edge_key=edge_key)
-            face_arcs.setdefault(fi, []).append(tagged)
-            face_arcs.setdefault(fj, []).append(tagged)
+            face_arcs.setdefault(fi, []).append(arc)
+            face_arcs.setdefault(fj, []).append(arc)
 
     return face_arcs
 
@@ -695,7 +1530,7 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
                         f"[topology] face {face_idx}: vertex {v} has odd degree {deg}"
                     )
                 
-            arc_index    = {id(a): idx for idx, a in enumerate(open_arcs)}
+            arc_index    = {_arc_key(a): idx for idx, a in enumerate(open_arcs)}
             visited_arcs = set()
 
             for start_idx, start_arc in enumerate(open_arcs):
@@ -717,7 +1552,7 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
                     candidates = [
                         (a, exit_v, fwd)
                         for (a, exit_v, fwd) in adj.get(v_cur, [])
-                        if arc_index[id(a)] not in visited_arcs
+                        if arc_index[_arc_key(a)] not in visited_arcs
                     ]
                     if not candidates:
                         print(
@@ -742,7 +1577,7 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
                         arc, v_cur, forward = candidates[0]
 
                     wire.append((arc, forward))
-                    visited_arcs.add(arc_index[id(arc)])
+                    visited_arcs.add(arc_index[_arc_key(arc)])
                     prev_arc = arc
 
                 if not broken:
@@ -883,7 +1718,11 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
 
     Returns
     -------
-    TopoDS_Shape
+    (TopoDS_Shape, dict)
+        dict with keys:
+          "valid"      : bool  — BRepCheck_Analyzer result
+          "n_faces"    : int   — number of faces in the output shape
+          "n_input_faces" : int — number of face indices in face_arcs
     """
     # 1. One TopoDS_Vertex per position.
     occ_verts = []
@@ -898,13 +1737,14 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
     #    the trimmed curve alone).  Topological gaps are closed later by
     #    ShapeFix_Wire.FixConnected, so shared TopoDS_Vertex instances are
     #    not required here.
-    arc_to_edge = {}   # id(arc) -> TopoDS_Edge
+    arc_to_edge = {}   # _arc_key(arc) -> TopoDS_Edge
     for arcs in face_arcs.values():
         for arc in arcs:
-            if id(arc) in arc_to_edge:
+            key = _arc_key(arc)
+            if key in arc_to_edge:
                 continue
             try:
-                arc_to_edge[id(arc)] = BRepBuilderAPI_MakeEdge(arc["curve"]).Edge()
+                arc_to_edge[key] = BRepBuilderAPI_MakeEdge(arc["curve"]).Edge()
             except Exception as exc:
                 print(f"[brep] MakeEdge failed for arc on {arc.get('edge_key')}: {exc}")
 
@@ -927,9 +1767,11 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
             bb.MakeWire(wire)
             n_added = 0
             for arc, forward in wire_arcs:
-                if id(arc) not in arc_to_edge:
+                key = _arc_key(arc)
+                if key not in arc_to_edge:
+                    print(f"[brep] face {face_idx}: arc {key} missing from arc_to_edge — skipping")
                     continue
-                edge = arc_to_edge[id(arc)]
+                edge = arc_to_edge[key]
                 bb.Add(wire, edge if forward else edge.Reversed())
                 n_added += 1
             if n_added == 0:
@@ -1132,9 +1974,10 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
     sewing.Perform()
     shape = sewing.SewedShape()
 
+    n_input_faces = len(face_arcs)
     if shape is None or shape.IsNull():
         print("[brep] sewing produced no shape")
-        return shape
+        return shape, {"valid": False, "n_faces": 0, "n_input_faces": n_input_faces}
 
     # 5. Ensure consistent 3D curves, then heal.
     print("[brep] Fixing shape ...")
@@ -1187,8 +2030,23 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
 
     analyzer = BRepCheck_Analyzer(shape)
     eval_results = analyzer.IsValid()
+
+    # Count faces in the output shape
+    n_output_faces = 0
+    face_exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while face_exp.More():
+        n_output_faces += 1
+        face_exp.Next()
+
     print(f"[brep] Results of BRep correctness analyzer: {eval_results}")
-    return shape
+    print(f"[brep] Output faces: {n_output_faces}/{n_input_faces}")
+
+    result_info = {
+        "valid": eval_results,
+        "n_faces": n_output_faces,
+        "n_input_faces": n_input_faces,
+    }
+    return shape, result_info
 
 def export_step(shape, path):
     """Export a TopoDS_Shape to a STEP file."""

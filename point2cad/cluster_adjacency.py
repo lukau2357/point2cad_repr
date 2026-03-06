@@ -62,6 +62,7 @@ def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None,
     adj = np.zeros((n, n), dtype=bool)
     boundary_strips = {}
     per_pair_thresholds = {}
+    boundary_strip_trees = {}
 
     for i in range(n):
         for j in range(i + 1, n):
@@ -79,11 +80,14 @@ def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None,
                 mask = nn_dists <= threshold_ij
                 strip_smaller = smaller[mask]
                 strip_larger = larger[nn_idx[mask]]
-                boundary_strips[(i, j)] = np.vstack(
+                strip_pts = np.vstack(
                     [strip_smaller, strip_larger]
                 ).astype(np.float32)
+                boundary_strips[(i, j)] = strip_pts
+                boundary_strip_trees[(i, j)] = KDTree(strip_pts)
 
-    return adj, global_threshold, spacing, boundary_strips, per_pair_thresholds
+    return (adj, global_threshold, spacing, boundary_strips,
+            per_pair_thresholds, boundary_strip_trees)
 
 def build_cluster_proximity(clusters, percentile=99.0):
     """

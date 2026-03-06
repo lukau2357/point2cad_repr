@@ -1,0 +1,45 @@
+{
+  "model_id": "00000019_part_13",
+  "step_file": "00000019_e8e79d1385fd4c78be414f6c_step_002.step",
+  "shape_type": "Solid",
+  "n_faces": 10,
+  "n_edges": 48,
+  "n_vertices": 96,
+  "surface_types": {
+    "Plane": 10
+  },
+  "surface_areas_by_type": {
+    "Plane": 6411.5780022670115
+  },
+  "total_surface_area": 6411.5780022670115,
+  "curve_types": {
+    "Line": 48
+  },
+  "bounding_box": {
+    "xmin": -76.2000001,
+    "xmax": -50.79999989999996,
+    "ymin": -25.4000001,
+    "ymax": 1e-07,
+    "zmin": -1e-07,
+    "zmax": 50.80000010000003
+  },
+  "bounding_box_extents": [
+    25.400000200000036,
+    25.4000002,
+    50.80000020000003
+  ],
+  "face_types": [
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane",
+    "Plane"
+  ],
+  "n_sampled_points": 35000,
+  "n_clusters": 10
+}

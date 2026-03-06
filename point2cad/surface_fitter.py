@@ -3,14 +3,21 @@ import numpy as np
 from .inr_fitting import fit_inr
 from .primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder_optimized, fit_cone
 from .primitive_fitting_utils import generate_plane_mesh, generate_sphere_mesh, generate_cylinder_mesh, generate_cone_mesh
+from .surface_types import (
+    SURFACE_PLANE, SURFACE_SPHERE, SURFACE_CYLINDER, SURFACE_CONE, SURFACE_INR,
+    SURFACE_NAMES,
+)
 
-SURFACE_PLANE = 0
-SURFACE_SPHERE = 1
-SURFACE_CYLINDER = 2
-SURFACE_CONE = 3
-SURFACE_INR = 4
-
-SURFACE_NAMES = {0: "plane", 1: "sphere", 2: "cylinder", 3: "cone", 4: "inr"}
+# Registry: surface_id → fitter callable.  Keys must match the constants in
+# surface_types.py and be contiguous starting from 0 so that
+# errors[sid] = primitive_results[sid]["error"] is a valid 1-D array.
+# When adding a new primitive, add its fitter here with the correct key.
+PRIMITIVE_FITTERS = {
+    SURFACE_PLANE:    fit_plane_numpy,
+    SURFACE_SPHERE:   fit_sphere_numpy,
+    SURFACE_CYLINDER: fit_cylinder_optimized,
+    SURFACE_CONE:     fit_cone,
+}
 
 def ratio(x, y, eps = 1e-8):
     return (x + eps) / (y + eps)
@@ -146,13 +153,20 @@ def fit_surface(cluster,
     cone_mesh_kwargs = cone_mesh_kwargs or {"dim_theta": 100, "dim_height": 100}
     inr_mesh_kwargs = inr_mesh_kwargs or {"mesh_dim": 100}
 
-    plane_result = fit_plane_numpy(cluster)
-    sphere_result = fit_sphere_numpy(cluster, **sphere_fit_kwargs)
-    cylinder_result = fit_cylinder_optimized(cluster, **cylinder_fit_kwargs)
-    cone_result = fit_cone(cluster, **cone_fit_kwargs)
+    fitter_kwargs = {
+        SURFACE_PLANE:    {},
+        SURFACE_SPHERE:   sphere_fit_kwargs,
+        SURFACE_CYLINDER: cylinder_fit_kwargs,
+        SURFACE_CONE:     cone_fit_kwargs,
+    }
 
-    results = [plane_result, sphere_result, cylinder_result, cone_result]
-    errors = np.array([r["error"] for r in results])
+    # Fit all registered primitives in surface-ID order.
+    # results[sid] holds the fit dict; errors[sid] = reconstruction error.
+    results = {
+        sid: PRIMITIVE_FITTERS[sid](cluster, **fitter_kwargs[sid])
+        for sid in sorted(PRIMITIVE_FITTERS)
+    }
+    errors = np.array([results[sid]["error"] for sid in range(len(PRIMITIVE_FITTERS))])
     # Turn off the cone?
     # errors[SURFACE_CONE] = float("inf")
     simple_min = np.argmin(errors)
@@ -179,9 +193,7 @@ def fit_surface(cluster,
             return {"surface_id": surface_to_use, "result": results[surface_to_use], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
         
     inr_result = fit_inr(cluster, inr_network_parameters, device = device, **inr_fit_kwargs)
-    # print(f"Plane error: {plane_result['error']:.4f} Sphere error: {sphere_result['error']:.4f} Cylinder error: {cylinder_result['error']:.4f} Cone error: {cone_result['error']:.4f} INR error: {inr_result['error']:.4f}")
-
-    results.append(inr_result)
+    results[SURFACE_INR] = inr_result
     errors = np.append(errors, inr_result["error"])
 
     global_min = np.argmin(errors)
