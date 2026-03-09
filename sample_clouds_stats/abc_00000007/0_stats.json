@@ -36,6 +36,6 @@
     "Plane",
     "Cylinder"
   ],
-  "n_sampled_points": 11287,
+  "n_sampled_points": 10001,
   "n_clusters": 3
 }

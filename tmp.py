@@ -1,30 +1,15 @@
-import os, glob
+from OCC.Core.gp import gp_Ax3, gp_Pnt, gp_Dir                                                                                                                                        
+from OCC.Core.Geom import Geom_CylindricalSurface                                                                                                                                     
+from OCC.Core.GeomAPI import GeomAPI_IntSS                                                                                                                                            
+                                                                                                                                                                                    
+# Near-coaxial: axes slightly off
+ax1 = gp_Ax3(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))
+ax2 = gp_Ax3(gp_Pnt(0.001, 0, 0), gp_Dir(0.001, 0, 1))
+cyl1 = Geom_CylindricalSurface(ax1, 1.0)
+cyl2 = Geom_CylindricalSurface(ax2, 2.0)
 
-from OCC.Core.STEPControl import STEPControl_Reader
-from OCC.Core.TopExp      import TopExp_Explorer
-from OCC.Core.TopAbs      import TopAbs_FACE
-from OCC.Core.TopoDS           import topods
-from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
-
-step_id = "00000000"
-step_path = "../abc_dataset/abc_0000_step_v00"
-step_path = os.path.join(step_path, step_id)
-steps = glob.glob(os.path.join(step_path, "*.step"))
-
-if not steps:
-    print("No step file found for given ID")
-    exit(0)
-
-step = steps[0]
-reader = STEPControl_Reader()
-reader.ReadFile(step)
-reader.TransferRoots()
-shape = reader.OneShape()
-
-exp = TopExp_Explorer(shape, TopAbs_FACE)
-while exp.More():
-    face    = topods.Face(exp.Current())
-    adaptor = BRepAdaptor_Surface(face)
-    stype   = adaptor.GetType()   # GeomAbs_Plane, GeomAbs_Cylinder, etc.
-    print(stype)
-    exp.Next()
+try:
+    inter = GeomAPI_IntSS(cyl1, cyl2, 1e-6)
+    print(f"IsDone: {inter.IsDone()}, NbLines: {inter.NbLines()}")
+except Exception as e:
+    print(f"Exception: {type(e).__name__}: {e}")
