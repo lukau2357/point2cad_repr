@@ -125,8 +125,8 @@ def _merge_part_dirs(part_dirs, unified_dir):
              surface_names = np.array(all_snames),
              cluster_colors= np.array(all_colors))
 
-    # 2. Merge vertices (concatenate) — both post-Euler and pre-Euler
-    for vfile in ("vertices.npz", "vertices_pre_euler.npz"):
+    # 2. Merge vertices (concatenate) — both post-filter and pre-filter
+    for vfile in ("vertices.npz", "vertices_pre_filter.npz"):
         all_verts = []
         for dir_path, offset, n in part_dirs:
             vpath = os.path.join(dir_path, vfile)
@@ -163,8 +163,8 @@ def _merge_part_dirs(part_dirs, unified_dir):
                 ei, ej = int(d["edge_i"]), int(d["edge_j"])
                 d["edge_i"] = ei + offset
                 d["edge_j"] = ej + offset
-                if fname.startswith("arcs_pre_euler_"):
-                    dst = f"arcs_pre_euler_{ei+offset}_{ej+offset}.npz"
+                if fname.startswith("arcs_pre_filter_"):
+                    dst = f"arcs_pre_filter_{ei+offset}_{ej+offset}.npz"
                 else:
                     dst = f"arcs_{ei+offset}_{ej+offset}.npz"
                 np.savez(os.path.join(unified_dir, dst), **d)
@@ -199,10 +199,10 @@ def run_visualize(args):
         ls.colors = o3d.utility.Vector3dVector([color] * len(lines))
         return ls
 
-    # Per-arc linesets (post-Euler: arcs_I_J.npz)
+    # Per-arc linesets (post-filter: arcs_I_J.npz)
     arc_linesets = []
     for arc_path in sorted(_glob.glob(os.path.join(out_dir, "arcs_*.npz"))):
-        if "pre_euler" in os.path.basename(arc_path):
+        if "pre_filter" in os.path.basename(arc_path):
             continue
         d      = np.load(arc_path, allow_pickle=True)
         n_arcs = int(d["n_arcs"])
@@ -211,15 +211,15 @@ def run_visualize(args):
             color = d[f"arc_color_{k}"].tolist()
             arc_linesets.append(_lineset(pts, color))
 
-    # Pre-Euler arc linesets (arcs_pre_euler_I_J.npz)
-    pre_euler_arc_linesets = []
-    for arc_path in sorted(_glob.glob(os.path.join(out_dir, "arcs_pre_euler_*.npz"))):
+    # Pre-filter arc linesets (arcs_pre_filter_I_J.npz)
+    pre_filter_arc_linesets = []
+    for arc_path in sorted(_glob.glob(os.path.join(out_dir, "arcs_pre_filter_*.npz"))):
         d      = np.load(arc_path, allow_pickle=True)
         n_arcs = int(d["n_arcs"])
         for k in range(n_arcs):
             pts   = d[f"arc_points_{k}"]
             color = d[f"arc_color_{k}"].tolist()
-            pre_euler_arc_linesets.append(_lineset(pts, color))
+            pre_filter_arc_linesets.append(_lineset(pts, color))
 
     trimmed_linesets   = []
     untrimmed_linesets = []
@@ -262,7 +262,7 @@ def run_visualize(args):
         mesh.paint_uniform_color(clust_colors[ci].tolist())
         surface_meshes.append(mesh)
 
-    # Vertices (post-Euler)
+    # Vertices (post-filter: after greedy oracle filter)
     vertex_pcd  = None
     vertex_path = os.path.join(out_dir, "vertices.npz")
     if os.path.exists(vertex_path):
@@ -271,18 +271,18 @@ def run_visualize(args):
             vertex_pcd = o3d.geometry.PointCloud()
             vertex_pcd.points = o3d.utility.Vector3dVector(verts)
             vertex_pcd.paint_uniform_color([1.0, 1.0, 0.0])
-            print(f"Loaded {len(verts)} vertices (post-Euler)")
+            print(f"Loaded {len(verts)} vertices (post-filter)")
 
-    # Vertices (pre-Euler)
-    pre_euler_vertex_pcd = None
-    pre_euler_vertex_path = os.path.join(out_dir, "vertices_pre_euler.npz")
-    if os.path.exists(pre_euler_vertex_path):
-        verts_pre = np.load(pre_euler_vertex_path)["vertices"]
+    # Vertices (pre-filter: after build_edge_arcs, before greedy oracle filter)
+    pre_filter_vertex_pcd = None
+    pre_filter_vertex_path = os.path.join(out_dir, "vertices_pre_filter.npz")
+    if os.path.exists(pre_filter_vertex_path):
+        verts_pre = np.load(pre_filter_vertex_path)["vertices"]
         if len(verts_pre) > 0:
-            pre_euler_vertex_pcd = o3d.geometry.PointCloud()
-            pre_euler_vertex_pcd.points = o3d.utility.Vector3dVector(verts_pre)
-            pre_euler_vertex_pcd.paint_uniform_color([1.0, 0.5, 0.0])  # orange
-            print(f"Loaded {len(verts_pre)} vertices (pre-Euler)")
+            pre_filter_vertex_pcd = o3d.geometry.PointCloud()
+            pre_filter_vertex_pcd.points = o3d.utility.Vector3dVector(verts_pre)
+            pre_filter_vertex_pcd.paint_uniform_color([1.0, 0.5, 0.0])  # orange
+            print(f"Loaded {len(verts_pre)} vertices (pre-filter)")
 
     # 3×2 window layout (fits 1920×1080)
     W, H = 640, 490
@@ -293,15 +293,15 @@ def run_visualize(args):
         vis1.add_geometry(ls)
 
     vis2 = o3d.visualization.Visualizer()
-    vis2.create_window("Pre-Euler arcs + vertices", width=W, height=H, left=W, top=50)
-    for ls in (pre_euler_arc_linesets if pre_euler_arc_linesets else trimmed_linesets):
+    vis2.create_window("Pre-filter arcs + vertices", width=W, height=H, left=W, top=50)
+    for ls in (pre_filter_arc_linesets if pre_filter_arc_linesets else trimmed_linesets):
         vis2.add_geometry(ls)
-    if pre_euler_vertex_pcd is not None:
-        vis2.add_geometry(pre_euler_vertex_pcd)
+    if pre_filter_vertex_pcd is not None:
+        vis2.add_geometry(pre_filter_vertex_pcd)
     vis2.get_render_option().point_size = 8.0
 
     vis3 = o3d.visualization.Visualizer()
-    vis3.create_window("Post-Euler arcs + vertices", width=W, height=H, left=2*W, top=50)
+    vis3.create_window("Post-filter arcs + vertices", width=W, height=H, left=2*W, top=50)
     for ls in (arc_linesets if arc_linesets else trimmed_linesets):
         vis3.add_geometry(ls)
     if vertex_pcd is not None:
@@ -325,14 +325,14 @@ def run_visualize(args):
         vis5.add_geometry(mesh)
 
     vis6 = o3d.visualization.Visualizer()
-    vis6.create_window("Point clouds + pre-Euler arcs",
+    vis6.create_window("Point clouds + pre-filter arcs",
                        width=W, height=H, left=2*W, top=50 + H + 40)
     for pcd in cluster_pcds:
         vis6.add_geometry(pcd)
-    for ls in (pre_euler_arc_linesets if pre_euler_arc_linesets else trimmed_linesets):
+    for ls in (pre_filter_arc_linesets if pre_filter_arc_linesets else trimmed_linesets):
         vis6.add_geometry(ls)
-    if pre_euler_vertex_pcd is not None:
-        vis6.add_geometry(pre_euler_vertex_pcd)
+    if pre_filter_vertex_pcd is not None:
+        vis6.add_geometry(pre_filter_vertex_pcd)
     vis6.get_render_option().point_size = 6.0
 
     vis4.get_render_option().mesh_show_back_face = True
@@ -503,14 +503,15 @@ def run_compute(args):
     from point2cad.color_config         import get_surface_color
     from point2cad.surface_intersection import (
         compute_all_intersections,
+        # find_equivalent_surfaces,
         trim_by_vertices,
-        compute_vertices,
+        compute_vertices, compute_vertices_intcs,
         sample_curve,
     )
     from point2cad.topology import (
         filter_vertices_by_proximity,
         build_edge_arcs, filter_curves_by_proximity, filter_arcs_by_proximity,
-        progressive_euler_filter, greedy_oracle_filter,
+        greedy_oracle_filter,
         _score_vertex,
         print_edge_arcs_summary,
         face_arc_incidence, print_face_arcs_summary,
@@ -556,6 +557,8 @@ def run_compute(args):
     cluster_offset = 0
 
     for part_idx, sample_path in enumerate(part_files):
+        # if part_idx not in [2, 4, 5]:
+        #      continue
         step_stem = f"part_{part_idx}"
         out_dir   = os.path.join(model_out_dir, f"part_{part_idx}")
 
@@ -666,8 +669,8 @@ def run_compute(args):
         # ------------------------------------------------------------------
         # Surface-surface intersection + trimming
         # ------------------------------------------------------------------
-        raw_intersections   = compute_all_intersections(
-            inter_adj, surface_ids, fit_results, occ_surfs
+        raw_intersections = compute_all_intersections(
+            inter_adj, surface_ids, fit_results, occ_surfs,
         )
         # Vertex-first flow:
         #   1. Find vertices on raw (untrimmed) curves — NMS is built into
@@ -675,9 +678,9 @@ def run_compute(args):
         #   2. Drop vertices too far from their constituent clusters
         #      (spurious intersections outside the physical model).
         #   3. Trim open curves using the surviving vertex parameters.
-        vertices, vertex_edges = compute_vertices(
-            inter_adj, raw_intersections, threshold=threshold_vertex,
-            surface_ids=surface_ids, occ_surfaces=occ_surfs,
+        vertices, vertex_edges = compute_vertices_intcs(
+            inter_adj, raw_intersections, occ_surfaces=occ_surfs,
+            threshold=threshold_vertex,
         )
         print(f"Found {len(vertices)} raw vertices")
 
@@ -702,7 +705,7 @@ def run_compute(args):
         # Log all vertex scores sorted for analysis
         sorted_indices = np.argsort(scores_arr)
         print(f"[vertex scores] {len(scores_arr)} vertices, "
-              f"range [{scores_arr.min():.4f}, {scores_arr.max():.4f}]")
+              f"range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, {0 if scores_arr.size == 0 else scores_arr.max():.4f}]")
         for rank, idx in enumerate(sorted_indices):
             edges_str = " ".join(
                 f"({min(e)},{max(e)})" for e in vertex_edges[idx])
@@ -786,8 +789,8 @@ def run_compute(args):
         )
         print_edge_arcs_summary(edge_arcs)
 
-        # Save pre-Euler vertices and arcs for visualization
-        np.savez(os.path.join(out_dir, "vertices_pre_euler.npz"),
+        # Save pre-filter vertices and arcs for visualization
+        np.savez(os.path.join(out_dir, "vertices_pre_filter.npz"),
                  vertices=_denorm(vertices, part_mean, part_R, part_scale))
         for (ei, ej), arcs in edge_arcs.items():
             kw_pre = {"n_arcs": len(arcs), "edge_i": ei, "edge_j": ej}
@@ -795,7 +798,7 @@ def run_compute(args):
                 kw_pre[f"arc_points_{k}"] = _denorm(
                     sample_curve(arc["curve"], n_points=100), part_mean, part_R, part_scale)
                 kw_pre[f"arc_color_{k}"] = [0.2, 0.85, 0.2]
-            np.savez(os.path.join(out_dir, f"arcs_pre_euler_{ei}_{ej}.npz"), **kw_pre)
+            np.savez(os.path.join(out_dir, f"arcs_pre_filter_{ei}_{ej}.npz"), **kw_pre)
 
         # Greedy oracle-guided filter: remove worst-scoring objects one at
         # a time until BRepCheck_Analyzer returns True.
@@ -806,14 +809,13 @@ def run_compute(args):
             bspline_method=args.bspline_method, tolerance=1e-3,
             cluster_bboxes=cluster_bboxes,
         )
-        print_edge_arcs_summary(edge_arcs)
-
-        # Final face_arcs / wire assembly for summary printing
-        face_arcs = face_arc_incidence(edge_arcs)
-        print_face_arcs_summary(face_arcs)
-        face_wires = assemble_wires(face_arcs, occ_surfs, vertices,
-                                     surface_ids=surface_ids)
-        print_face_wires_summary(face_wires)
+        if shape is not None and not shape.IsNull():
+            print_edge_arcs_summary(edge_arcs)
+            face_arcs = face_arc_incidence(edge_arcs)
+            print_face_arcs_summary(face_arcs)
+            face_wires = assemble_wires(face_arcs, occ_surfs, vertices,
+                                         surface_ids=surface_ids)
+            print_face_wires_summary(face_wires)
 
         # Save vertices AFTER filtering so --visualize shows only final vertices
         np.savez(os.path.join(out_dir, "vertices.npz"),
@@ -867,12 +869,12 @@ def run_compute(args):
         unified_dir = os.path.join(model_out_dir, "unified")
         _merge_part_dirs(part_dirs, unified_dir)
         manual_paths = [
-            os.path.join(d, f"part_{i}.step")
-            for i, (d, _, _) in enumerate(part_dirs)
+            os.path.join(d, f"{os.path.basename(d)}.step")
+            for d, _, _ in part_dirs
         ]
         bop_paths = [
-            os.path.join(d, f"part_{i}_bop.step")
-            for i, (d, _, _) in enumerate(part_dirs)
+            os.path.join(d, f"{os.path.basename(d)}_bop.step")
+            for d, _, _ in part_dirs
         ]
         merge_step_files(
             [p for p in manual_paths if os.path.exists(p)],
@@ -917,13 +919,10 @@ if __name__ == "__main__":
                         help="Percentile of intra-cluster NN distance distribution "
                              "used as proximity threshold per cluster. Higher = more "
                              "generous (default 100).")
-    parser.add_argument("--bbox_margin", type=float, default=0.2,
-                        help="Fractional expansion of per-cluster bounding boxes "
-                             "for the progressive Euler filter (default 0.05 = 5%%).")
-    parser.add_argument("--score_cap", type=float, default=6,
+    parser.add_argument("--score_cap", type=float, default=10,
                         help="Max vertex fitness score (d/p) to keep in pre-filter. "
                              "Score is scale-invariant: 1.0 = cluster boundary. "
-                             "(default 3.0)")
+                             "(default 10.0)")
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
                              "instead of point clouds (visualize mode only)", default = True)

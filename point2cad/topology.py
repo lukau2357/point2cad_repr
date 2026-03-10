@@ -137,12 +137,11 @@ def _project_vertex_on_curve(vertex_pos, curve, t_min, t_max):
 def _pnt_to_np(pnt):
     return np.array([pnt.X(), pnt.Y(), pnt.Z()], dtype=np.float64)
 
-
 # ---------------------------------------------------------------------------
 # Main function
 # ---------------------------------------------------------------------------
 
-def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-3):
+def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-4):
     """
     Step 1 of B-Rep topology: attribute vertices to curves and split each
     curve into B-Rep arcs.
@@ -1245,29 +1244,11 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
             best_shape, best_info = shape, info
             best_ea, best_v, best_ve = ea, verts, ve
 
-    # Pass 2: remove vertices worst-first (only if arcs didn't suffice)
-    for score, v_idx in vertex_candidates:
-        if v_idx in removed_vertices:
-            continue
-        removed_vertices.add(v_idx)
-        print(f"[oracle filter] pass 2: removing vertex {v_idx} "
-              f"score={score:.4f}")
+    # Pass 2 (vertex removal) removed — rely on score_cap for vertex
+    # filtering.  Isolated vertices (degree 0 after arc removal) are still
+    # cleaned up in _apply_removals.
 
-        with contextlib.redirect_stdout(io.StringIO()):
-            valid, shape, info, ea, verts, ve = _try_build(
-                removed_vertices, removed_arc_keys)
-
-        n_faces = info.get("n_faces", 0)
-        if valid:
-            print(f"[oracle filter] valid! {n_faces} faces after "
-                  f"{len(removed_arc_keys)} arc + "
-                  f"{len(removed_vertices)} vertex removals")
-            return ea, verts, ve, shape, info
-        if n_faces > best_info.get("n_faces", 0):
-            best_shape, best_info = shape, info
-            best_ea, best_v, best_ve = ea, verts, ve
-
-    # Exhausted all candidates without reaching validity
+    # Exhausted all arc candidates without reaching validity
     print(f"[oracle filter] WARNING: could not achieve valid BRep "
           f"after removing all candidates. "
           f"Best: {best_info.get('n_faces', 0)} faces")

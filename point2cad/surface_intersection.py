@@ -2,9 +2,11 @@
 Surface-surface intersection for the Point2CAD B-Rep pipeline.
 
 Analytical formulas are used for:
-    plane  ∩ plane  -> Geom_Line
-    plane  ∩ sphere -> Geom_Circle  (or isolated gp_Pnt for tangency)
-    sphere ∩ sphere -> Geom_Circle  (via the radical plane)
+    plane    ∩ plane    -> Geom_Line
+    plane    ∩ sphere   -> Geom_Circle  (or isolated gp_Pnt for tangency)
+    sphere   ∩ sphere   -> Geom_Circle  (via the radical plane)
+    plane    ∩ cylinder -> Geom_Line    (tangent to axis, OCC returns empty)
+    cylinder ∩ cylinder -> Geom_Line(s) (parallel axes, OCC returns IsDone=False)
 
 All other surface-type pairs fall back to GeomAPI_IntSS.
 """
@@ -31,7 +33,10 @@ except ImportError:
 try:
     from OCC.Core.gp          import gp_Pnt, gp_Dir, gp_Lin, gp_Circ, gp_Ax2
     from OCC.Core.Geom        import Geom_Line, Geom_Circle, Geom_TrimmedCurve
-    from OCC.Core.GeomAPI     import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve, GeomAPI_ExtremaCurveCurve
+    from OCC.Core.GeomAPI     import (GeomAPI_IntSS, GeomAPI_IntCS,
+                                      GeomAPI_ProjectPointOnCurve,
+                                      GeomAPI_ProjectPointOnSurf,
+                                      GeomAPI_ExtremaCurveCurve)
     from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
     from OCC.Core.GeomAbs     import (GeomAbs_Line, GeomAbs_Circle, GeomAbs_Ellipse,
                                        GeomAbs_Hyperbola, GeomAbs_Parabola,
@@ -256,6 +261,92 @@ def _intersect_plane_cylinder_tangent(pi_plane, pi_cyl,
     return _result([line], [], "line", "analytical")
 
 
+def _intersect_cylinder_cylinder_parallel(pi, pj,
+                                           tol_parallel=0.001, tol_tangent=1e-3):
+    """
+    Analytical fallback for cylinder ∩ cylinder when axes are parallel.
+
+    Two infinite cylinders with parallel axes intersect in 0, 1, or 2
+    generator lines.  Project both axes onto the plane perpendicular to
+    the common direction **a**: the problem reduces to intersecting two
+    circles (radii r₁, r₂, centres q₁, q₂) in 2D.
+
+    Let d = |q₂ − q₁|.  Then:
+        d > r₁ + r₂         → no intersection
+        d = r₁ + r₂         → 1 line (external tangent)
+        |r₁ − r₂| < d < r₁ + r₂  → 2 lines (secant)
+        d = |r₁ − r₂|       → 1 line (internal tangent)
+        d < |r₁ − r₂|       → no intersection (one inside the other)
+
+    Each 2D intersection point p₂d lifts to Geom_Line(c₁ + proj + p₂d, a).
+    """
+    a1 = _unit(pi["a"])
+    a2 = _unit(pj["a"])
+    c1 = np.asarray(pi["center"], dtype=np.float64)
+    c2 = np.asarray(pj["center"], dtype=np.float64)
+    r1 = float(pi["radius"])
+    r2 = float(pj["radius"])
+
+    # Check axes are parallel
+    dot = abs(float(np.dot(a1, a2)))
+    if dot < 1.0 - tol_parallel:
+        return None   # not parallel — caller should use OCC
+
+    # Use a1 as the common axis direction
+    a = a1
+
+    # Project centres onto plane perpendicular to a
+    # q_i = c_i − (c_i · a) a   (perpendicular component)
+    q1 = c1 - float(np.dot(c1, a)) * a
+    q2 = c2 - float(np.dot(c2, a)) * a
+
+    diff = q2 - q1
+    d = float(np.linalg.norm(diff))
+
+    if d < 1e-12:
+        # Coaxial cylinders — intersection is empty (different r) or
+        # degenerate (same r, handled by equiv).
+        return _result([], [], "empty", "analytical")
+
+    e = diff / d   # unit vector from q1 to q2 in the perp plane
+
+    # Circle–circle intersection:
+    #   x = (d² + r₁² − r₂²) / (2d)     (distance from q1 along e)
+    #   h² = r₁² − x²                     (perpendicular offset²)
+    x = (d * d + r1 * r1 - r2 * r2) / (2.0 * d)
+    h_sq = r1 * r1 - x * x
+
+    if h_sq < -tol_tangent * max(r1, r2):
+        return _result([], [], "empty", "analytical")
+
+    # Build the perpendicular direction in the plane ⊥ a
+    # e is in the perp plane; need a vector ⊥ both a and e
+    f = np.cross(a, e)
+    f = f / np.linalg.norm(f)
+
+    # Base point in the perp plane (relative to c1)
+    base = q1 + x * e
+
+    if h_sq <= tol_tangent * max(r1, r2):
+        # Tangent case — single generator line
+        # Reconstruct 3D point: base is already in perp plane,
+        # add the a-component from c1
+        p3d = base + float(np.dot(c1, a)) * a
+        line = Geom_Line(gp_Lin(_gp_pnt(p3d), _gp_dir(a)))
+        return _result([line], [], "line", "analytical")
+
+    # Secant case — two generator lines
+    h = math.sqrt(h_sq)
+    a_comp = float(np.dot(c1, a)) * a
+
+    p1_3d = base + h * f + a_comp
+    p2_3d = base - h * f + a_comp
+
+    line1 = Geom_Line(gp_Lin(_gp_pnt(p1_3d), _gp_dir(a)))
+    line2 = Geom_Line(gp_Lin(_gp_pnt(p2_3d), _gp_dir(a)))
+    return _result([line1, line2], [], "line", "analytical")
+
+
 # ---------------------------------------------------------------------------
 # OCC generic fallback
 # ---------------------------------------------------------------------------
@@ -265,9 +356,13 @@ def _intersect_occ(occ_surf_i, occ_surf_j, tol, label=""):
     try:
         inter = GeomAPI_IntSS(occ_surf_i, occ_surf_j, tol)
     except Exception as e:
+        if label:
+            print(f"  [intersect] {label}: FAILED (exception: {e})")
         return _result([], [], "failed", "occ")
 
     if not inter.IsDone():
+        if label:
+            print(f"  [intersect] {label}: FAILED (IsDone=False)")
         return _result([], [], "failed", "occ")
 
     curves = [inter.Line(k) for k in range(1, inter.NbLines() + 1)]
@@ -276,6 +371,8 @@ def _intersect_occ(occ_surf_i, occ_surf_j, tol, label=""):
         # GeomAPI_IntSS exposes no point query; NbLines()==0 after IsDone()
         # means either no intersection or point tangency (indistinguishable
         # at this API level).
+        if label:
+            print(f"  [intersect] {label}: empty (NbLines=0)")
         return _result([], [], "empty", "occ")
 
     prefix = f"[intersect] {label}: " if label else "[intersect] "
@@ -299,7 +396,8 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
     Compute the intersection between two adjacent surfaces.
 
     Uses analytical formulas for plane/plane, plane/sphere, sphere/sphere,
-    and the plane/cylinder tangent degenerate case.
+    the plane/cylinder tangent degenerate case, and cylinder/cylinder with
+    parallel axes (where OCC often fails with IsDone=False).
     All other pairs call GeomAPI_IntSS.
 
     Returns a dict:
@@ -342,31 +440,147 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
             return _intersect_plane_cylinder_tangent(pi, pj)
         return occ
 
+    # Cylinder ∩ Cylinder: try OCC first; fall back to analytical parallel-
+    # axis formula if OCC fails (IsDone=False) or returns empty.
+    if si == SURFACE_CYLINDER and sj == SURFACE_CYLINDER:
+        occ = _intersect_occ(oi, oj, tol, label=label)
+        if occ["type"] in ("failed", "empty"):
+            analytical = _intersect_cylinder_cylinder_parallel(pi, pj)
+            if analytical is not None and analytical["type"] != "empty":
+                if label:
+                    for c in analytical["curves"]:
+                        t0, t1 = c.FirstParameter(), c.LastParameter()
+                        t0s = f"{t0:.4g}" if abs(t0) < _OCC_INF else "-inf"
+                        t1s = f"{t1:.4g}" if abs(t1) < _OCC_INF else "+inf"
+                        print(f"  [intersect] {label}: Line (analytical)  t=[{t0s}, {t1s}]")
+                return analytical
+        return occ
+
     return _intersect_occ(oi, oj, tol, label=label)
 
 
-def compute_all_intersections(adj, surface_ids, results, occ_surfaces, tol=1e-6):
+def find_equivalent_surfaces(adj, surface_ids, results,
+                             angle_tol=1e-2, dist_tol=1e-2, radius_tol=1e-2,
+                             theta_tol=1e-2):
+    """
+    Find adjacent clusters that share the same underlying surface.
+
+    Two adjacent clusters are considered equivalent if they have the same
+    surface type and their fitted parameters are close enough:
+      - Plane:    normals nearly parallel AND offsets close
+      - Cylinder: axes nearly parallel, radii close, AND axis lines close
+      - Sphere:   centres close AND radii close
+      - Cone:     axes nearly parallel, apexes close, AND half-angles close
+
+    Returns a canonical-index map: canon[i] = j means cluster i is equivalent
+    to cluster j (j <= i).  Non-equivalent clusters map to themselves.
+    """
+    n = adj.shape[0]
+    canon = list(range(n))
+
+    def _find(x):
+        while canon[x] != x:
+            canon[x] = canon[canon[x]]
+            x = canon[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            canon[hi] = lo
+
+    for i, j in adjacency_pairs(adj):
+        if surface_ids[i] != surface_ids[j]:
+            continue
+        sid = surface_ids[i]
+        pi, pj = results[i]["params"], results[j]["params"]
+
+        # Planes are non-periodic — never seam-split by OCC, so no
+        # face merging needed.  Skip to avoid false-positive merges.
+        if sid == SURFACE_PLANE:
+            continue
+
+        elif sid == SURFACE_CYLINDER:
+            ai, aj = _unit(pi["a"]), _unit(pj["a"])
+            dot = abs(float(np.dot(ai, aj)))
+            ri, rj = float(pi["radius"]), float(pj["radius"])
+            ci = np.asarray(pi["center"], dtype=np.float64)
+            cj = np.asarray(pj["center"], dtype=np.float64)
+            diff = cj - ci
+            perp = diff - float(np.dot(diff, ai)) * ai
+            d_angle = 1.0 - dot
+            d_radius = abs(ri - rj)
+            d_axis = float(np.linalg.norm(perp))
+            print(f"[surface equiv] ({i},{j}) cylinder: "
+                  f"1-|dot|={d_angle:.6e}  Δr={d_radius:.6e}  "
+                  f"Δaxis={d_axis:.6e}")
+            if d_angle >= angle_tol or d_radius > radius_tol or d_axis > dist_tol:
+                continue
+            _union(i, j)
+
+        elif sid == SURFACE_SPHERE:
+            ci = np.asarray(pi["center"], dtype=np.float64)
+            cj = np.asarray(pj["center"], dtype=np.float64)
+            d_center = float(np.linalg.norm(ci - cj))
+            ri, rj = float(pi["radius"]), float(pj["radius"])
+            d_radius = abs(ri - rj)
+            print(f"[surface equiv] ({i},{j}) sphere: "
+                  f"Δcenter={d_center:.6e}  Δr={d_radius:.6e}")
+            if d_center > dist_tol or d_radius > radius_tol:
+                continue
+            _union(i, j)
+
+        elif sid == SURFACE_CONE:
+            ai, aj = _unit(pi["a"]), _unit(pj["a"])
+            dot = abs(float(np.dot(ai, aj)))
+            vi = np.asarray(pi["v"], dtype=np.float64)
+            vj = np.asarray(pj["v"], dtype=np.float64)
+            ti, tj = float(pi["theta"]), float(pj["theta"])
+            d_angle = 1.0 - dot
+            d_apex = float(np.linalg.norm(vi - vj))
+            d_theta = abs(ti - tj)
+            print(f"[surface equiv] ({i},{j}) cone: "
+                  f"1-|dot|={d_angle:.6e}  Δapex={d_apex:.6e}  "
+                  f"Δθ={d_theta:.6e}")
+            if d_angle >= angle_tol or d_apex > dist_tol or d_theta > theta_tol:
+                continue
+            _union(i, j)
+
+    # Flatten
+    for i in range(n):
+        canon[i] = _find(i)
+
+    # Report
+    groups = {}
+    for i in range(n):
+        groups.setdefault(canon[i], []).append(i)
+    for rep, members in groups.items():
+        if len(members) > 1:
+            print(f"[surface equiv] clusters {members} share the same "
+                  f"{SURFACE_NAMES[surface_ids[rep]]} surface "
+                  f"(canonical={rep})")
+
+    return canon
+
+
+def compute_all_intersections(adj, surface_ids, results, occ_surfaces,
+                              tol=1e-6):
     """
     Compute intersections for every adjacent pair in adj.
-
-    Args:
-        adj          : (n, n) bool adjacency matrix
-        surface_ids  : list[int]              -- SURFACE_* constant per cluster
-        results      : list[dict]             -- fit result dict per cluster
-        occ_surfaces : list[Geom_Surface]     -- OCC surface per cluster
 
     Returns:
         dict mapping (i, j) with i < j to an intersection result dict.
     """
-    return {
-        (i, j): intersect_surfaces(
+    out = {}
+    for i, j in adjacency_pairs(adj):
+        out[(i, j)] = intersect_surfaces(
             surface_ids[i], results[i], occ_surfaces[i],
             surface_ids[j], results[j], occ_surfaces[j],
             tol   = tol,
             label = f"({i},{j}) {SURFACE_NAMES[surface_ids[i]]}∩{SURFACE_NAMES[surface_ids[j]]}",
         )
-        for i, j in adjacency_pairs(adj)
-    }
+    return out
 
 
 def sample_curve(curve, boundary_pts=None, threshold=None,
@@ -703,3 +917,266 @@ def compute_vertices(adj, intersections, threshold = 1e-4,
         used[close] = True
 
     return np.array(merged_positions, dtype=np.float64), merged_edge_sets
+
+
+def compute_vertices_intcs(adj, intersections, occ_surfaces, threshold=1e-3):
+    """
+    Find B-Rep vertices using curve–surface intersection (GeomAPI_IntCS).
+
+    For each face f, every pair of incident edges (C_fg, C_fh) defines a
+    potential vertex where surfaces f, g, h meet.  Instead of curve–curve
+    closest-approach, we intersect curve C_fg with surface S_h (and vice
+    versa).  This finds actual intersection points — no phantom candidates.
+
+    Each IntCS result is attributed to the edge whose curve was intersected.
+    After deduplication (merging candidates within `threshold`), each merged
+    vertex inherits the union of edge attributions from all its constituents,
+    giving complete vertex–edge attribution without a projection step.
+
+    Parameters
+    ----------
+    adj           : (n, n) bool adjacency matrix
+    intersections : dict (i, j) i<j -> result dict with "curves" list
+    occ_surfaces  : list of OCC Geom_Surface, indexed by cluster id
+    threshold     : deduplication radius for merging nearby candidates
+
+    Returns
+    -------
+    vertices     : (M, 3) float64 array of vertex positions, or (0, 3) if none
+    vertex_edges : list[set] of length M; vertex_edges[v] is the set of edge
+                   tuples (i, j) that vertex v is incident to
+    """
+    n = adj.shape[0]
+
+    # Build per-face incidence: face f -> list of edge keys (i, j) with i < j
+    face_edges = {f: [] for f in range(n)}
+    for (i, j), inter in intersections.items():
+        if not inter.get("curves"):
+            continue
+        face_edges[i].append((i, j))
+        face_edges[j].append((i, j))
+
+    candidates       = []   # list of (3,) positions
+    candidate_triples = []  # list of frozenset({f, g, h}), parallel to candidates
+
+    all_edge_keys = set(k for k, v in intersections.items() if v.get("curves"))
+
+    for f in range(n):
+        edges_on_f = face_edges[f]
+        if len(edges_on_f) < 2:
+            continue
+
+        for idx_a in range(len(edges_on_f)):
+            edge_a = edges_on_f[idx_a]
+            g = edge_a[0] if edge_a[1] == f else edge_a[1]
+            curves_a = intersections[edge_a].get("curves", [])
+            if not curves_a:
+                continue
+
+            for idx_b in range(idx_a + 1, len(edges_on_f)):
+                edge_b = edges_on_f[idx_b]
+                h = edge_b[0] if edge_b[1] == f else edge_b[1]
+
+                if g == h:
+                    continue
+
+                curves_b = intersections[edge_b].get("curves", [])
+                if not curves_b:
+                    continue
+
+                triple = frozenset({f, g, h})
+                surf_h = occ_surfaces[h]
+                surf_g = occ_surfaces[g]
+
+                # IntCS(C_fg, S_h): point lies on surfaces f, g, h
+                # NOTE: do NOT wrap with _as_safe_curve — IntCS is an
+                # analytical solver that handles infinite curves natively.
+                # Trimming would restrict the parameter domain and miss
+                # intersections (e.g. line∩cylinder outside [-2,+2]).
+                for ca in curves_a:
+                    try:
+                        intcs = GeomAPI_IntCS(ca, surf_h)
+                    except Exception as err:
+                        print(f"[compute_vertices_intcs] IntCS({edge_a}, S_{h}) "
+                              f"exception: {err}")
+                        continue
+                    for k in range(1, intcs.NbPoints() + 1):
+                        p = intcs.Point(k)
+                        candidates.append(np.array([p.X(), p.Y(), p.Z()]))
+                        candidate_triples.append(triple)
+
+                # IntCS(C_fh, S_g): point lies on surfaces f, h, g
+                for cb in curves_b:
+                    try:
+                        intcs = GeomAPI_IntCS(cb, surf_g)
+                    except Exception as err:
+                        print(f"[compute_vertices_intcs] IntCS({edge_b}, S_{g}) "
+                              f"exception: {err}")
+                        continue
+                    for k in range(1, intcs.NbPoints() + 1):
+                        p = intcs.Point(k)
+                        candidates.append(np.array([p.X(), p.Y(), p.Z()]))
+                        candidate_triples.append(triple)
+
+    print(f"[compute_vertices_intcs] {len(candidates)} raw candidates "
+          f"before dedup (threshold={threshold})")
+    for i, (pos, tri) in enumerate(zip(candidates, candidate_triples)):
+        print(f"  cand {i}: ({pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f})  "
+              f"triple={sorted(tri)}")
+
+    if not candidates:
+        return np.empty((0, 3), dtype=np.float64), []
+
+    # Greedy deduplication: merge candidates within threshold of each other.
+    # Each candidate carries a surface triple; merging collects all triples.
+    candidates = np.array(candidates, dtype=np.float64)
+    used = np.zeros(len(candidates), dtype=bool)
+    merged_positions = []
+    merged_triple_sets = []  # list of set-of-frozensets
+    for idx in range(len(candidates)):
+        if used[idx]:
+            continue
+        dists = np.linalg.norm(candidates - candidates[idx], axis=1)
+        close = (dists < threshold) & ~used
+        merged_pos = candidates[close].mean(axis=0)
+        triple_set = set()
+        merged_indices = np.where(close)[0]
+        for ci in merged_indices:
+            triple_set.add(candidate_triples[ci])
+        v_idx = len(merged_positions)
+        n_merged = int(close.sum())
+        print(f"  v{v_idx}: merged {n_merged} candidates "
+              f"[{', '.join(str(int(i)) for i in merged_indices)}] → "
+              f"({merged_pos[0]:.6f}, {merged_pos[1]:.6f}, {merged_pos[2]:.6f})  "
+              f"triples={[sorted(t) for t in triple_set]}")
+        merged_positions.append(merged_pos)
+        merged_triple_sets.append(triple_set)
+        used[close] = True
+
+    print(f"[compute_vertices_intcs] {len(merged_positions)} vertices "
+          f"after dedup")
+
+    # ------------------------------------------------------------------
+    # Triple-based attribution: for each vertex, derive edge set from its
+    # surface triples.  A triple (a, b, c) contributes edges {(a,b),
+    # (a,c), (b,c)} ONLY IF all three edges exist in the adjacency graph.
+    # This filters spurious points (where infinite surfaces meet outside
+    # the model boundary) without any distance-based tolerances.
+    # ------------------------------------------------------------------
+    merged_edge_sets = []
+    for v_idx, (pos, triple_set) in enumerate(
+            zip(merged_positions, merged_triple_sets)):
+        edge_set = set()
+        for triple in triple_set:
+            surfs = sorted(triple)
+            a, b, c = surfs[0], surfs[1], surfs[2]
+            e_ab = (min(a, b), max(a, b))
+            e_ac = (min(a, c), max(a, c))
+            e_bc = (min(b, c), max(b, c))
+            if (e_ab in all_edge_keys and e_ac in all_edge_keys
+                    and e_bc in all_edge_keys):
+                edge_set.update({e_ab, e_ac, e_bc})
+            else:
+                missing = []
+                if e_ab not in all_edge_keys:
+                    missing.append(str(e_ab))
+                if e_ac not in all_edge_keys:
+                    missing.append(str(e_ac))
+                if e_bc not in all_edge_keys:
+                    missing.append(str(e_bc))
+                print(f"  v{v_idx}: triple {surfs} rejected — "
+                      f"missing edges: {', '.join(missing)}")
+        if edge_set:
+            print(f"  v{v_idx}: edges={sorted(edge_set)}  "
+                  f"(from {len(triple_set)} triple(s))")
+        else:
+            print(f"  v{v_idx}: NO valid triples — vertex will be dropped")
+        merged_edge_sets.append(edge_set)
+
+    # Drop vertices with no valid edges
+    keep = [i for i, es in enumerate(merged_edge_sets) if es]
+    if len(keep) < len(merged_positions):
+        n_drop = len(merged_positions) - len(keep)
+        print(f"[compute_vertices_intcs] dropping {n_drop} vertices "
+              f"with no valid triples")
+        merged_positions = [merged_positions[i] for i in keep]
+        merged_edge_sets = [merged_edge_sets[i] for i in keep]
+
+    # # ------------------------------------------------------------------
+    # # Two-stage attribution (DISABLED — replaced by triple attribution above)
+    # # (1) surface proximity — vertex must lie on both surfaces of the edge,
+    # # (2) curve proximity — vertex must be near the actual intersection curve.
+    # # ------------------------------------------------------------------
+    # surf_tol  = 1e-3
+    # curve_tol = 1e-1
+    # all_edges_list = list(intersections.keys())
+    # n_surfs = len(occ_surfaces)
+    # for v_idx, (pos, edge_set) in enumerate(zip(merged_positions, merged_edge_sets)):
+    #     pt = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
+    #     # Stage 1: find which surfaces this vertex lies on
+    #     on_surfaces = set()
+    #     surf_dists = {}
+    #     for s_idx in range(n_surfs):
+    #         try:
+    #             proj = GeomAPI_ProjectPointOnSurf(pt, occ_surfaces[s_idx])
+    #         except Exception as e:
+    #             print(f"  [DEBUG] v{v_idx}: ProjectPointOnSurf S_{s_idx} "
+    #                   f"exception: {type(e).__name__}: {e}")
+    #             continue
+    #         if proj.NbPoints() > 0:
+    #             d = proj.LowerDistance()
+    #             surf_dists[s_idx] = d
+    #             if d < surf_tol:
+    #                 on_surfaces.add(s_idx)
+    #     # Stage 2: for candidate edges (both surfaces pass), verify
+    #     # against the actual intersection curve
+    #     added = []
+    #     for edge_key in all_edges_list:
+    #         if edge_key in edge_set:
+    #             continue
+    #         curves = intersections[edge_key].get("curves", [])
+    #         if not curves:
+    #             continue
+    #         ei, ej = edge_key
+    #         if ei not in on_surfaces or ej not in on_surfaces:
+    #             continue
+    #         # Check curve proximity.
+    #         # NOTE: do NOT use _as_safe_curve here — it trims infinite
+    #         # curves to [-2,+2] but the line origin may be far from the
+    #         # model, placing the relevant parameter far outside that range.
+    #         # ProjectPointOnCurve handles infinite curves natively.
+    #         best_curve_dist = float("inf")
+    #         curve_exception = False
+    #         for c in curves:
+    #             try:
+    #                 proj = GeomAPI_ProjectPointOnCurve(pt, c)
+    #             except Exception as e:
+    #                 print(f"  [DEBUG] v{v_idx}: ProjectPointOnCurve "
+    #                       f"{edge_key} exception: {type(e).__name__}: {e}")
+    #                 curve_exception = True
+    #                 continue
+    #             if proj.NbPoints() > 0:
+    #                 d = proj.LowerDistance()
+    #                 best_curve_dist = min(best_curve_dist, d)
+    #                 if d < curve_tol:
+    #                     edge_set.add(edge_key)
+    #                     added.append(edge_key)
+    #                     break
+    #         if edge_key not in edge_set:
+    #             reason = ""
+    #             if curve_exception and best_curve_dist == float("inf"):
+    #                 reason = " (all curves raised exceptions)"
+    #             elif best_curve_dist < float("inf"):
+    #                 reason = f" (best_curve_dist={best_curve_dist:.4e})"
+    #             print(f"  v{v_idx}: edge {edge_key} surf OK "
+    #                   f"(d_i={surf_dists.get(ei, '?'):.4e}, "
+    #                   f"d_j={surf_dists.get(ej, '?'):.4e}) "
+    #                   f"but curve REJECTED{reason}")
+    #     if added:
+    #         print(f"  v{v_idx}: attributed {added}  "
+    #               f"(on surfaces: {sorted(on_surfaces)})")
+
+    print(f"[compute_vertices_intcs] {len(merged_positions)} vertices "
+          f"after triple attribution")
+    return (np.array(merged_positions, dtype=np.float64) if merged_positions
+            else np.empty((0, 3), dtype=np.float64)), merged_edge_sets

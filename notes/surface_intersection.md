@@ -13,6 +13,7 @@ solver `GeomAPI_IntSS`.
 | Plane ∩ Sphere | Analytical | `Geom_Circle` or tangent `gp_Pnt` |
 | Sphere ∩ Sphere | Analytical (radical plane) | `Geom_Circle` or tangent `gp_Pnt` |
 | Plane ∩ Cylinder (axis-parallel, tangent) | Analytical fallback after OCC empty | `Geom_Line` (generator line) |
+| Cylinder ∩ Cylinder (parallel axes) | Analytical fallback after OCC `IsDone=False` | `Geom_Line`(s) (0, 1, or 2 generator lines) |
 | All other pairs | OCC `GeomAPI_IntSS` | `Geom_Curve` (concrete subtype is an OCC implementation detail, not specified in the public API; inspect with `isinstance` at runtime) |
 
 `GeomAPI_IntSS` does not expose a point query method.  When `IsDone()` is
@@ -385,6 +386,95 @@ OCC likely has the same limitation there, but the derivation is more involved
 (variable generator direction) and the case is less common in mechanical CAD.
 Left as a future TODO.
 
+### Cylinder ∩ Cylinder → Generator Lines (parallel-axis fallback)
+
+`GeomAPI_IntSS` returns `IsDone() = False` for certain cylinder–cylinder configurations,
+most notably when the axes are parallel.  In this case the intersection reduces to a
+2D circle–circle problem and produces 0, 1, or 2 **generator lines** parallel to the
+common axis.
+
+**Setup.**
+
+$$\text{Cylinder 1}: \text{axis direction } \mathbf{a}_1 \text{ (unit)}, \text{ point on axis } \mathbf{c}_1, \text{ radius } r_1$$
+$$\text{Cylinder 2}: \text{axis direction } \mathbf{a}_2 \text{ (unit)}, \text{ point on axis } \mathbf{c}_2, \text{ radius } r_2$$
+
+**Parallelism check.**  The axes are parallel when $|\mathbf{a}_1 \cdot \mathbf{a}_2| \approx 1$.
+If not parallel, this fallback does not apply (the general case is a degree-4 space curve).
+
+**Reduction to 2D.**  Let $\mathbf{a} = \mathbf{a}_1$ be the common axis direction.
+Project the axis base points onto the plane perpendicular to $\mathbf{a}$:
+
+$$\mathbf{q}_i = \mathbf{c}_i - (\mathbf{c}_i \cdot \mathbf{a})\,\mathbf{a}, \qquad i = 1, 2$$
+
+A point $\mathbf{x}$ lies on cylinder $i$ iff its perpendicular distance to the axis
+equals $r_i$:
+
+$$|\mathbf{x}_\perp - \mathbf{q}_i| = r_i$$
+
+where $\mathbf{x}_\perp$ is the projection of $\mathbf{x}$ onto the same perpendicular
+plane.  The 3D intersection thus reduces to two circles in the perpendicular plane:
+
+$$\text{Circle 1}: |\mathbf{p} - \mathbf{q}_1| = r_1, \qquad \text{Circle 2}: |\mathbf{p} - \mathbf{q}_2| = r_2$$
+
+Each 2D intersection point lifts to a full 3D line parallel to $\mathbf{a}$ through
+$(p_x, p_y, p_z)$, where the $\mathbf{a}$-component is restored from $\mathbf{c}_1$.
+
+**Circle–circle intersection.**  Let $d = |\mathbf{q}_2 - \mathbf{q}_1|$ and
+$\mathbf{e} = (\mathbf{q}_2 - \mathbf{q}_1)/d$ (unit vector between centres).
+
+The intersection points lie at distance $x$ from $\mathbf{q}_1$ along $\mathbf{e}$
+and distance $h$ perpendicular to $\mathbf{e}$, where:
+
+$$x = \frac{d^2 + r_1^2 - r_2^2}{2d}, \qquad h^2 = r_1^2 - x^2$$
+
+*Derivation.*  Any point on the intersection satisfies both circle equations:
+
+$$|\mathbf{p} - \mathbf{q}_1|^2 = r_1^2, \qquad |\mathbf{p} - \mathbf{q}_2|^2 = r_2^2$$
+
+Subtracting:
+
+$$|\mathbf{p} - \mathbf{q}_1|^2 - |\mathbf{p} - \mathbf{q}_2|^2 = r_1^2 - r_2^2$$
+
+Expanding and using $\mathbf{q}_2 - \mathbf{q}_1 = d\mathbf{e}$:
+
+$$2d\,(\mathbf{e} \cdot (\mathbf{p} - \mathbf{q}_1)) = d^2 + r_1^2 - r_2^2$$
+
+So the component of $\mathbf{p} - \mathbf{q}_1$ along $\mathbf{e}$ is $x = (d^2 + r_1^2 - r_2^2)/(2d)$.
+The perpendicular component squared follows from Pythagoras on circle 1:
+$h^2 = r_1^2 - x^2$.
+
+**Case analysis.**
+
+| Condition | $h^2$ | Intersection |
+|-----------|-------|-------------|
+| $d > r_1 + r_2$ | $h^2 < 0$ | empty (too far apart) |
+| $d = r_1 + r_2$ | $h^2 = 0$ | 1 generator line (external tangent) |
+| $|r_1 - r_2| < d < r_1 + r_2$ | $h^2 > 0$ | **2 generator lines** (secant) |
+| $d = |r_1 - r_2|$ | $h^2 = 0$ | 1 generator line (internal tangent) |
+| $d < |r_1 - r_2|$ | $h^2 < 0$ | empty (one inside the other) |
+
+**Coaxial case $d = 0$.**  If $r_1 \neq r_2$ the cylinders are nested concentrically
+(no intersection).  If $r_1 = r_2$ the cylinders are identical — this is the same-surface
+seam case, handled separately by surface equivalence or not at all (no finite intersection
+curve exists).
+
+**Constructing the 3D lines.**  Let $\mathbf{f} = \mathbf{a} \times \mathbf{e}$ (unit
+vector perpendicular to both $\mathbf{a}$ and $\mathbf{e}$, lying in the perpendicular
+plane).  The base point in the perpendicular plane is $\mathbf{b} = \mathbf{q}_1 + x\mathbf{e}$.
+The intersection point(s) in 2D are $\mathbf{b} \pm h\mathbf{f}$.  Restoring the
+$\mathbf{a}$-component:
+
+$$\mathbf{p}_{3D} = \mathbf{b} \pm h\mathbf{f} + (\mathbf{c}_1 \cdot \mathbf{a})\,\mathbf{a}$$
+
+Each point defines a `Geom_Line` in direction $\mathbf{a}$, subsequently trimmed by
+`trim_by_vertices`.
+
+**Why OCC fails.**  `GeomAPI_IntSS` internally calls `IntPatch_ImpImpIntersection` for
+quadric–quadric pairs.  For two cylinders with nearly parallel axes, the algorithm
+encounters near-degenerate conditions in its Walking/Marching scheme and returns
+`IsDone() = False` rather than attempting a degenerate-case analysis.  The analytical
+fallback above handles exactly this gap.
+
 ---
 
 ## Why OCC for cylinder, cone and mixed pairs
@@ -409,3 +499,9 @@ plane ∩ cylinder analytically: when OCC returns empty for this pair, a fallbac
 checks whether the plane is axis-parallel and tangent ($\delta \approx r$) and, if
 so, returns the single generator line analytically (see section above).  The general
 non-degenerate plane ∩ cylinder case (circle or ellipse) still uses OCC.
+
+**Exception — cylinder ∩ cylinder parallel-axis case.**  When OCC returns
+`IsDone() = False` for a cylinder–cylinder pair, the pipeline checks whether the axes
+are parallel and, if so, reduces to a 2D circle–circle intersection to produce 0, 1,
+or 2 generator lines analytically (see section above).  The general non-parallel
+cylinder ∩ cylinder case (degree-4 space curve) still relies on OCC.
