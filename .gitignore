@@ -6,3 +6,7 @@ output_bspline/
 **/output_surfaceinter
 output_brep/
 logs.txt
+logs/*
+scripts/abc_filtered.json
+sample_clouds
+sample_clouds_stats

@@ -309,12 +309,10 @@ def run_visualize(args):
     vis3.get_render_option().point_size = 8.0
 
     vis4 = o3d.visualization.Visualizer()
-    vis4.create_window("Point clouds + arcs + boundary strips",
+    vis4.create_window("Point clouds + boundary meshes",
                        width=W, height=H, left=0, top=50 + H + 40)
     for pcd in cluster_pcds:
         vis4.add_geometry(pcd)
-    for ls in (arc_linesets if arc_linesets else trimmed_linesets):
-        vis4.add_geometry(ls)
     for bpcd in boundary_pcds:
         vis4.add_geometry(bpcd)
     vis4.get_render_option().point_size = 2.0
@@ -324,20 +322,9 @@ def run_visualize(args):
     for mesh in surface_meshes:
         vis5.add_geometry(mesh)
 
-    vis6 = o3d.visualization.Visualizer()
-    vis6.create_window("Point clouds + pre-filter arcs",
-                       width=W, height=H, left=2*W, top=50 + H + 40)
-    for pcd in cluster_pcds:
-        vis6.add_geometry(pcd)
-    for ls in (pre_filter_arc_linesets if pre_filter_arc_linesets else trimmed_linesets):
-        vis6.add_geometry(ls)
-    if pre_filter_vertex_pcd is not None:
-        vis6.add_geometry(pre_filter_vertex_pcd)
-    vis6.get_render_option().point_size = 6.0
-
     vis4.get_render_option().mesh_show_back_face = True
     vis5.get_render_option().mesh_show_back_face = True
-    visualizers = [vis1, vis2, vis3, vis4, vis5, vis6]
+    visualizers = [vis1, vis2, vis3, vis4, vis5]
     running     = [True] * len(visualizers)
     while all(running):
         for i, vis in enumerate(visualizers):
@@ -601,13 +588,14 @@ def run_compute(args):
             occ_surfs.append(
                 to_occ_surface(sid, res["result"], cluster=cluster, uv_margin=0.05)
             )
-            print(f"[surface fitter] Cluster {cid} number of points: {c_count}")
-            print(f"[surface fitter] Fitted surface: {SURFACE_NAMES[sid]}")
-            p = res["result"]["params"]
-            # if sid == 0:  # plane
-            #     print(f"  normal={np.array(p['a'])}, d={p['d']:.6f}")
-            # elif sid == 2:  # cylinder
-            #     print(f"  axis={np.array(p['a'])}, center={np.array(p['center'])}, r={p['radius']:.6f}")
+            # Log surface fitting result with all residual errors
+            chosen_err = res["result"]["error"]
+            all_errors = res.get("all_errors", {})
+            errors_str = "  ".join(f"{name}={err:.6f}" for name, err in all_errors.items())
+            print(f"[surface fitter] Cluster {cid} ({c_count} pts) → "
+                  f"{SURFACE_NAMES[sid]}  residual={chosen_err:.6f}")
+            if errors_str:
+                print(f"  all errors: {errors_str}")
 
         # Per-cluster KDTrees and NN-distance thresholds — needed by both paths.
         cluster_trees, cluster_nn_percentiles = build_cluster_proximity(
@@ -623,18 +611,17 @@ def run_compute(args):
             boundary_strips = {}
             per_pair_thresholds = {}
             boundary_strip_trees = {}
-            print(f"[full_adjacency] intersecting all {n_surf * (n_surf - 1) // 2} pairs\n")
+            print(f"[adjacency] full adjacency: intersecting all {n_surf * (n_surf - 1) // 2} pairs")
         else:
             adj, _, spacing, boundary_strips, per_pair_thresholds, boundary_strip_trees = compute_adjacency_matrix(
                 clusters, threshold_factor=args.spacing_factor,
                 spacing_percentile=args.spacing_percentile,
             )
             inter_adj = adj
-            print(f"\nSpacing={spacing:.5f}  threshold={args.spacing_factor * spacing:.5f}")
-            print(f"Adjacent pairs: {adjacency_pairs(adj)}")
+            print(f"[adjacency] spacing={spacing:.5f}  threshold={args.spacing_factor * spacing:.5f}")
+            print(f"[adjacency] adjacent pairs: {adjacency_pairs(adj)}")
             for (i, j), bpts in sorted(boundary_strips.items()):
                 print(f"  boundary ({i},{j}): {len(bpts)} points")
-            print()
 
         threshold_vertex = 1e-4
 
@@ -664,7 +651,7 @@ def run_compute(args):
                 vertices  = _denorm(np.asarray(mesh.vertices), part_mean, part_R, part_scale),
                 triangles = np.asarray(mesh.triangles),
             )
-        print(f"Cluster files saved to {out_dir}/")
+        print(f"[surface fitter] cluster files saved to {out_dir}/")
 
         # ------------------------------------------------------------------
         # Surface-surface intersection + trimming
@@ -682,7 +669,7 @@ def run_compute(args):
             inter_adj, raw_intersections, occ_surfaces=occ_surfs,
             threshold=threshold_vertex,
         )
-        print(f"Found {len(vertices)} raw vertices")
+        print(f"[vertices] found {len(vertices)} raw vertices")
 
         # Score-cap vertex pre-filter: remove vertices whose fitness score
         # exceeds a threshold.  The score d/p is already scale-invariant
@@ -724,7 +711,7 @@ def run_compute(args):
         else:
             print(f"[score-cap filter] threshold {score_cap:.2f} "
                   f"would keep {n_keep} / drop {n_drop} — skipping")
-        print(f"After score-cap filter: {len(vertices)} vertices")
+        print(f"[score-cap filter] after filter: {len(vertices)} vertices")
 
         trim_intersections_ = trim_by_vertices(
             raw_intersections, vertices, vertex_edges,
@@ -737,7 +724,7 @@ def run_compute(args):
             inter_trim = trim_intersections_[(i, j)]
             si = SURFACE_NAMES[surface_ids[i]]
             sj = SURFACE_NAMES[surface_ids[j]]
-            print(f"({i},{j})  {si} ∩ {sj}  type={inter_raw['type']}"
+            print(f"[intersect] ({i},{j})  {si} ∩ {sj}  type={inter_raw['type']}"
                   f"  method={inter_raw['method']}"
                   f"  raw={len(inter_raw['curves'])}  trimmed={len(inter_trim['curves'])}")
             kw = dict(
@@ -858,7 +845,7 @@ def run_compute(args):
         #if shape_bop is not None:
         #    export_step(apply_inverse_normalization(shape_bop, part_mean, part_R, part_scale),
         #                step_path_bop)
-        print(f"\nAll results saved to {out_dir}/")
+        print(f"\n[part] all results saved to {out_dir}/")
 
         if args.model_id:
             part_dirs.append((out_dir, cluster_offset, len(clusters)))
@@ -921,8 +908,7 @@ if __name__ == "__main__":
                              "generous (default 100).")
     parser.add_argument("--score_cap", type=float, default=10,
                         help="Max vertex fitness score (d/p) to keep in pre-filter. "
-                             "Score is scale-invariant: 1.0 = cluster boundary. "
-                             "(default 10.0)")
+                             "Score is scale-invariant: 1.0 = cluster boundary.")
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
                              "instead of point clouds (visualize mode only)", default = True)

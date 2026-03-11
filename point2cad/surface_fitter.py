@@ -167,6 +167,9 @@ def fit_surface(cluster,
         for sid in sorted(PRIMITIVE_FITTERS)
     }
     errors = np.array([results[sid]["error"] for sid in range(len(PRIMITIVE_FITTERS))])
+    # Collect all primitive errors for diagnostics (INR added later if fitted)
+    _all_errors = {SURFACE_NAMES[sid]: float(results[sid]["error"])
+                   for sid in sorted(PRIMITIVE_FITTERS)}
     # Turn off the cone?
     # errors[SURFACE_CONE] = float("inf")
     simple_min = np.argmin(errors)
@@ -182,7 +185,7 @@ def fit_surface(cluster,
                 mesh = resolve_mesh(cone_results, results[cone_results], cluster, np_rng, device,
                             plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
 
-                return {"surface_id": cone_results, "result": results[cone_results], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
+                return {"surface_id": cone_results, "result": results[cone_results], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
 
         else:
             surface_to_use = simple_min
@@ -190,11 +193,17 @@ def fit_surface(cluster,
                 surface_to_use = plane_special_handling(results, errors, plane_sphere_ratio_threshold)
             mesh = resolve_mesh(surface_to_use, results[surface_to_use], cluster, np_rng, device,
             plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
-            return {"surface_id": surface_to_use, "result": results[surface_to_use], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
+            return {"surface_id": surface_to_use, "result": results[surface_to_use], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
         
+    errors_str = "  ".join(f"{SURFACE_NAMES[sid]}={errors[sid]:.6f}" for sid in range(len(PRIMITIVE_FITTERS)))
+    print(f"  [surface fitter] no primitive below threshold ({simple_error_threshold:.4f}), "
+          f"best={SURFACE_NAMES[simple_min]} ({errors[simple_min]:.6f})")
+    print(f"  [surface fitter] primitive errors: {errors_str}")
+    print(f"  [surface fitter] fitting INR ...")
     inr_result = fit_inr(cluster, inr_network_parameters, device = device, **inr_fit_kwargs)
     results[SURFACE_INR] = inr_result
     errors = np.append(errors, inr_result["error"])
+    _all_errors[SURFACE_NAMES[SURFACE_INR]] = float(inr_result["error"])
 
     global_min = np.argmin(errors)
     resulting_min = global_min
@@ -213,7 +222,4 @@ def fit_surface(cluster,
     mesh = resolve_mesh(resulting_min, results[resulting_min], cluster, np_rng, device,
                         plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
 
-    if resulting_min == SURFACE_INR:
-        return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
-
-    return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh[0], "trimesh_mesh": mesh[1]}
+    return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}

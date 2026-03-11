@@ -1081,10 +1081,11 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     Greedy worst-first removal guided by OCC BRepCheck_Analyzer.
 
     Algorithm:
-      1. Score all vertices and arcs by cluster proximity ratio.
+      1. Score all arcs by cluster proximity ratio.
       2. Try building the full BRep — if BRepCheck_Analyzer returns True, done.
-      3. Remove the single worst-scoring surviving object (arc or vertex).
-      4. Rebuild and re-check. Repeat until valid or no candidates remain.
+      3. Remove arcs worst-first.  After each removal, rebuild and check.
+         Stop when valid or no arc candidates remain.
+      Vertex filtering is handled upstream (score_cap in the caller).
 
     The Euler condition is NOT enforced inside the loop — if wire assembly
     fails on a non-Eulerian graph, that counts as "invalid" and the loop
@@ -1113,16 +1114,17 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     print(f"[oracle filter] input: {n_v} vertices, {n_a} arcs")
 
     # ------------------------------------------------------------------
-    # Phase 1: Score all candidates
+    # Phase 1: Score candidates
     # ------------------------------------------------------------------
-    vertex_scores = []
+    # Vertex scores (logged only — vertex filtering is upstream via score_cap)
     for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
         involved = set()
         for edge in edges:
             involved.update(edge)
         score = _score_vertex(vpos, involved, cluster_trees,
                               cluster_nn_percentiles)
-        vertex_scores.append(score)
+        print(f"  v{v_idx:>3d}  score={score:>10.4f}  "
+              f"edges={sorted(edges)}")
 
     arc_scores = []  # (score, edge_key, arc_idx)
     for edge_key, arcs in edge_arcs.items():
@@ -1135,8 +1137,7 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
                                cluster_nn_percentiles)
             arc_scores.append((score, edge_key, arc_idx))
 
-    # Build separate arc and vertex candidate lists, sorted worst-first.
-    # Arcs are always tried before vertices (less destructive).
+    # Build arc candidate list, sorted worst-first.
     arc_candidates = []
     for score, edge_key, arc_idx in arc_scores:
         if score <= 0:
@@ -1145,17 +1146,10 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
         arc_candidates.append((score, (edge_key, arc["t_start"], arc["t_end"])))
     arc_candidates.sort(key=lambda c: c[0], reverse=True)
 
-    vertex_candidates = []
-    for v_idx, score in enumerate(vertex_scores):
-        vertex_candidates.append((score, v_idx))
-    vertex_candidates.sort(key=lambda c: c[0], reverse=True)
-
-    n_cand = len(arc_candidates) + len(vertex_candidates)
-    if n_cand:
-        all_scores = [s for s, _ in arc_candidates] + [s for s, _ in vertex_candidates]
-        print(f"[oracle filter] {len(arc_candidates)} arc + "
-              f"{len(vertex_candidates)} vertex candidates "
-              f"(score range: {min(all_scores):.4f} — {max(all_scores):.4f})")
+    if arc_candidates:
+        print(f"[oracle filter] {len(arc_candidates)} arc candidates "
+              f"(score range: {arc_candidates[-1][0]:.4f} — "
+              f"{arc_candidates[0][0]:.4f})")
     else:
         print("[oracle filter] no removable candidates (all arcs closed)")
 
@@ -1222,13 +1216,13 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     best_shape, best_info = shape, info
     best_ea, best_v, best_ve = final_ea, final_v, final_ve
 
-    # Pass 1: remove arcs worst-first
+    # Arc-only greedy removal, worst-first.
     for score, ident in arc_candidates:
         if ident in removed_arc_keys:
             continue
         removed_arc_keys.add(ident)
         edge_key, t_start, t_end = ident
-        print(f"[oracle filter] pass 1: removing arc {edge_key} "
+        print(f"[oracle filter] removing arc {edge_key} "
               f"t=[{t_start:.4f},{t_end:.4f}] score={score:.4f}")
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1243,10 +1237,6 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
         if n_faces > best_info.get("n_faces", 0):
             best_shape, best_info = shape, info
             best_ea, best_v, best_ve = ea, verts, ve
-
-    # Pass 2 (vertex removal) removed — rely on score_cap for vertex
-    # filtering.  Isolated vertices (degree 0 after arc removal) are still
-    # cleaned up in _apply_removals.
 
     # Exhausted all arc candidates without reaching validity
     print(f"[oracle filter] WARNING: could not achieve valid BRep "
@@ -1291,7 +1281,7 @@ def face_arc_incidence(edge_arcs):
 
 def print_face_arcs_summary(face_arcs):
     """Print a concise summary of the face–arc incidence."""
-    print(f"Face arcs summary: {len(face_arcs)} faces")
+    print(f"[face arcs] {len(face_arcs)} faces")
     for face_idx in sorted(face_arcs):
         arcs   = face_arcs[face_idx]
         closed = sum(1 for a in arcs if a["closed"])
@@ -1571,7 +1561,7 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
 
 def print_face_wires_summary(face_wires):
     """Print a concise summary of the wire assembly result."""
-    print(f"Wire assembly summary: {len(face_wires)} faces")
+    print(f"[wire assembly] {len(face_wires)} faces")
     for face_idx in sorted(face_wires):
         wires = face_wires[face_idx]
         print(f"  face {face_idx:2d}  wires={len(wires)}")
@@ -2330,7 +2320,7 @@ def build_brep_shape_bop(occ_surfaces, vertices, vertex_edges, face_arcs,
 def print_edge_arcs_summary(edge_arcs):
     """Print a concise summary of the arc splitting result."""
     total_arcs = sum(len(v) for v in edge_arcs.values())
-    print(f"Edge arcs summary: {len(edge_arcs)} edges → {total_arcs} arcs total")
+    print(f"[edge arcs] {len(edge_arcs)} edges → {total_arcs} arcs total")
     for edge_key, arcs in sorted(edge_arcs.items()):
         for idx, arc in enumerate(arcs):
             vs = arc["v_start"]

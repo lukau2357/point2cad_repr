@@ -350,7 +350,7 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
 
     N = cluster.shape[0]
     batch_size = automatic_batch_size(N, max_memory_mb = max_memory_mb)
-    print(f"Using batch size of: {batch_size}")
+    print(f"  [inr] batch_size={batch_size}")
 
     cluster_mean = cluster.mean(axis = 0)
     cluster_std = cluster.std(axis = 0)
@@ -385,7 +385,7 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
                                            initial_lr = initial_lr,
                                            noise_magnitude_3d = noise_magnitude_3d,
                                            noise_magnitude_uv = noise_magnitude_uv)
-            print(f"{u} {v} {current_model['error']}")
+            print(f"  [inr] u_closed={u}  v_closed={v}  error={current_model['error']:.6f}")
             if best_model is None or best_model["error"] > current_model["error"]:
                 best_model = current_model  
     # best_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,

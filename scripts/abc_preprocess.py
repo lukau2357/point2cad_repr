@@ -92,6 +92,24 @@ _STEP_SURF_TO_COLOR_KEY = {
     "Other":      "inr",
 }
 
+# OCC surface type → pipeline surface type.
+# Primitives keep their identity; all non-primitive types are mapped to
+# "BSpline" following the ParSeNet convention (a BSpline can approximate
+# Torus, Bezier, Revolution, Extrusion, Offset, and Other surfaces).
+_MAPPED_SURF_TYPE = {
+    "Plane":      "Plane",
+    "Cylinder":   "Cylinder",
+    "Cone":       "Cone",
+    "Sphere":     "Sphere",
+    "Torus":      "BSpline",
+    "Bezier":     "BSpline",
+    "BSpline":    "BSpline",
+    "Revolution": "BSpline",
+    "Extrusion":  "BSpline",
+    "Offset":     "BSpline",
+    "Other":      "BSpline",
+}
+
 
 def _require_occ():
     if not _OCC_AVAILABLE:
@@ -314,19 +332,27 @@ def extract_step_stats(model_id, step_path, shape, face_list):
     so the caller can colour-code visualisations without re-querying OCC.
     """
     # --- Surface types and per-face areas ---
-    surface_type_counts   = Counter()
-    surface_areas_by_type = Counter()
-    face_types            = []
-    props                 = GProp_GProps()
+    surface_type_counts        = Counter()   # original OCC types
+    surface_areas_by_type      = Counter()
+    mapped_type_counts         = Counter()   # pipeline types (primitives + BSpline)
+    mapped_areas_by_type       = Counter()
+    face_types                 = []          # per-face original OCC type
+    face_types_mapped          = []          # per-face pipeline type
+    props                      = GProp_GProps()
 
     for face in face_list:
-        adaptor   = BRepAdaptor_Surface(face)
-        type_name = _GEOMABS_SURF_NAMES.get(adaptor.GetType(), "Other")
+        adaptor     = BRepAdaptor_Surface(face)
+        type_name   = _GEOMABS_SURF_NAMES.get(adaptor.GetType(), "Other")
+        mapped_name = _MAPPED_SURF_TYPE.get(type_name, "BSpline")
         surface_type_counts[type_name] += 1
+        mapped_type_counts[mapped_name] += 1
         face_types.append(type_name)
+        face_types_mapped.append(mapped_name)
 
         brepgprop.SurfaceProperties(face, props)
-        surface_areas_by_type[type_name] += props.Mass()
+        area = props.Mass()
+        surface_areas_by_type[type_name] += area
+        mapped_areas_by_type[mapped_name] += area
 
     total_surface_area = sum(surface_areas_by_type.values())
 
@@ -367,6 +393,8 @@ def extract_step_stats(model_id, step_path, shape, face_list):
         "n_vertices":             n_vertices,
         "surface_types":          dict(surface_type_counts),
         "surface_areas_by_type":  {k: float(v) for k, v in surface_areas_by_type.items()},
+        "mapped_surface_types":       dict(mapped_type_counts),
+        "mapped_areas_by_type":       {k: float(v) for k, v in mapped_areas_by_type.items()},
         "total_surface_area":     float(total_surface_area),
         "curve_types":            dict(curve_type_counts),
         "bounding_box": {
@@ -376,6 +404,7 @@ def extract_step_stats(model_id, step_path, shape, face_list):
         },
         "bounding_box_extents":   [float(xmax-xmin), float(ymax-ymin), float(zmax-zmin)],
         "face_types":             face_types,
+        "face_types_mapped":      face_types_mapped,
         # filled in by caller after sampling:
         "n_sampled_points":       0,
         "n_clusters":             0,
@@ -388,10 +417,18 @@ def print_step_stats(stats):
           f"Edges: {stats['n_edges']}   Vertices: {stats['n_vertices']}")
     ext = stats["bounding_box_extents"]
     print(f"  BBox extents: [{ext[0]:.4f}, {ext[1]:.4f}, {ext[2]:.4f}]")
-    print(f"  Surface types (count / area):")
+    print(f"  Surface types (original OCC → pipeline mapped):")
     for stype, count in sorted(stats["surface_types"].items(), key=lambda x: -x[1]):
-        area = stats["surface_areas_by_type"].get(stype, 0.0)
-        print(f"    {stype:<12} {count:>4}   area={area:.6f}")
+        area   = stats["surface_areas_by_type"].get(stype, 0.0)
+        mapped = _MAPPED_SURF_TYPE.get(stype, "BSpline")
+        suffix = f"  → {mapped}" if mapped != stype else ""
+        print(f"    {stype:<12} {count:>4}   area={area:.6f}{suffix}")
+    mapped_types = stats.get("mapped_surface_types", {})
+    if mapped_types:
+        print(f"  Pipeline surface types:")
+        for mtype, count in sorted(mapped_types.items(), key=lambda x: -x[1]):
+            area = stats.get("mapped_areas_by_type", {}).get(mtype, 0.0)
+            print(f"    {mtype:<12} {count:>4}   area={area:.6f}")
     print(f"  Total surface area: {stats['total_surface_area']:.6f}")
     print(f"  Curve types:")
     for ctype, count in sorted(stats["curve_types"].items(), key=lambda x: -x[1]):
@@ -953,8 +990,8 @@ if __name__ == "__main__":
         description="ABC dataset preprocessing for Point2CAD",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--abc_dir",    type=str, required=True,
-                        help="Path to ABC dataset root")
+    parser.add_argument("--abc_dir",    type=str, default=None,
+                        help="Path to ABC dataset root (not required for --visualize)")
     parser.add_argument("--model_id",   type=str, default=None,
                         help="Analyse / export a single model")
     parser.add_argument("--output_dir", type=str, default="../sample_clouds",
@@ -988,6 +1025,11 @@ if __name__ == "__main__":
                              "abc_{id}_part_{idx:03d}.xyzc + _stats.json file.")
     args   = parser.parse_args()
     by_part = not args.no_by_part
+
+    # --visualize with --model_id doesn't need abc_dir (loads from disk)
+    is_visualize_only = args.visualize and args.model_id and args.sampler == "step"
+    if not is_visualize_only and args.abc_dir is None:
+        parser.error("--abc_dir is required (unless using --visualize with --model_id)")
 
     rng = np.random.default_rng(args.seed)
     if args.stats_dir is None:

@@ -1,24 +1,23 @@
- - Error logs when doing --visualize in abc_preprocess: MESA: error: Failed to query drm device.
-libGL error: glx: failed to create dri3 screen
-libGL error: failed to load driver: iris
-libGL error: failed to open /dev/dri/card1: No such file or directory
-libGL error: failed to load driver: iris
-X Error of failed request:  BadValue (integer parameter out of range for operation)
-  Major opcode of failed request:  130 (MIT-SHM)
-  Minor opcode of failed request:  3 (X_ShmPutImage)
-  Value in failed request:  0x3c0
-  Serial number of failed request:  176
-
-
-- What about same stats for all clusters, regarding resolution distribution, implementation intended, it should be separate for 
-  every part!
-
 - Can we construct arbitrary Euler cycle, without using angular ordering?
 
 - Change visualization logic: green (survived arc), red (trimmed arc)? Maybe only green is enough?
 
 - Repeated lines in --visualize, sampling bug or deeper intersection issues?
 
-- Sensitivity on hard-coded vertex filter constant...
-
 - If greedy removal fails, try augmenting?
+
+- Do upsampling of the input, upsampling should preserve the underyling surface shape!
+
+- Parameter choices (spacing_factor = 1.5, score_cap = 10)
+  - 00949 (default, default)
+  - 00000949 (default, default)
+  - 00470 (default, default)
+  - 00000005 (default, default)
+  - 00000006 (defualt, default)
+  - 00000008 (0.7, default)
+  - 00000061 (default, default)
+  - 00000007 (default, default)
+  - 00000019 (default, default)
+  - 00000009 (default, default). Fitted 2 INRs instead of 2 cones, but the result was geometrically correct, and it visually matched 
+    the input reasonably well.
+  - 00000017 (default, default)
