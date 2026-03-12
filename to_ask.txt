@@ -10,14 +10,18 @@
 
 - Parameter choices (spacing_factor = 1.5, score_cap = 10)
   - 00949 (default, default)
-  - 00000949 (default, default)
   - 00470 (default, default)
+  - 00000949 (default, default)
   - 00000005 (default, default)
   - 00000006 (defualt, default)
   - 00000008 (0.7, default)
   - 00000061 (default, default)
   - 00000007 (default, default)
   - 00000019 (default, default)
-  - 00000009 (default, default). Fitted 2 INRs instead of 2 cones, but the result was geometrically correct, and it visually matched 
-    the input reasonably well.
+  - 00000009 (default, default). Fitted 2 INRs instead of 2 cones, but the result was geometrically correct, and it visually matched the input reasonabl well.  
   - 00000017 (default, default)
+  - 00009998 - Does not work, BSpline INR produced error seems to be causing the main problems.
+  - 00000073 - Does not work, cylinder/plane issues...
+  - 00000077 (default, default)
+  - 00000104 - Does not work, 0 vertices, simple model in that regard...
+  - 00000121 (default, default). Good showcase of the algorithm for tomorrow's presentation.

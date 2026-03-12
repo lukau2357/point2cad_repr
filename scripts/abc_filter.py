@@ -225,7 +225,8 @@ def filter_models(abc_dir, allowed_types, max_bspline, max_faces,
             if n_models % 200 == 0:
                 pbar.write(f"  hits={len(batch_results)}  errors={n_errors}  skipped={n_skipped_size}")
 
-        results_by_batch[batch_name] = batch_results
+        results_by_batch["batch_name"]["total_parts"] = len(batch_results)
+        results_by_batch[batch_name]["parts"] = batch_results
 
     total_parts = sum(len(v) for v in results_by_batch.values())
     print(f"\nDone. {n_models} models, {n_skipped_size} skipped (file size), "

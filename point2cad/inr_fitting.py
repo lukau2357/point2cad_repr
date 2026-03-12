@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import math
+import sys
 import tqdm
 import time
 import trimesh
@@ -288,7 +289,8 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
     warmup_steps = int(max_steps * warmup_steps_ratio)
     scheduler = LinearWarmupCosineAnnealingLR(optimizer, warmup_steps, max_steps)
 
-    loop = tqdm.tqdm(range(max_steps), desc = "Training the INR network")
+    loop = tqdm.tqdm(range(max_steps), desc="Training the INR network",
+                     disable=not sys.stderr.isatty())
 
     for i, _ in enumerate(loop):
         noise_schedule = (max_steps - 1 - i) / (max_steps - 1)
@@ -375,6 +377,7 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
     best_model = None
 
     dl_generator = get_next_item()
+    inr_t0 = time.time()
     for u in [True, False]:
         for v in [True, False]:
             current_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,
@@ -385,7 +388,8 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
                                            initial_lr = initial_lr,
                                            noise_magnitude_3d = noise_magnitude_3d,
                                            noise_magnitude_uv = noise_magnitude_uv)
-            print(f"  [inr] u_closed={u}  v_closed={v}  error={current_model['error']:.6f}")
+            fit_time = current_model["metadata"]["fitting_time_seconds"]
+            print(f"  [inr] u_closed={u}  v_closed={v}  error={current_model['error']:.6f}  time={fit_time:.2f}s")
             if best_model is None or best_model["error"] > current_model["error"]:
                 best_model = current_model  
     # best_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,
@@ -396,6 +400,8 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
     #                             initial_lr = initial_lr,
     #                             noise_magnitude_3d = noise_magnitude_3d,
     #                             noise_magnitude_uv = noise_magnitude_uv)
+    inr_total = time.time() - inr_t0
+    print(f"  [inr] best: error={best_model['error']:.6f}  total_time={inr_total:.2f}s")
     best_model["params"]["cluster_mean"] = cluster_mean
     best_model["params"]["cluster_scale"] = cluster_scale
     model = best_model["params"]["model"]

@@ -20,7 +20,8 @@ def _local_spacing(cluster, percentile=100.0):
 
 
 def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None,
-                              spacing_percentile=100.0):
+                              spacing_percentile=100.0,
+                              local_spacings=None):
     """
     Compute the symmetric cluster adjacency matrix.
 
@@ -40,6 +41,8 @@ def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None,
                              the per-pair adaptive detection logic.
         spacing_percentile:  percentile of intra-cluster NN distance distribution
                              used for local spacing (default 100.0 = max)
+        local_spacings:      if provided, reuses precomputed per-cluster NN
+                             percentiles instead of recomputing them.
 
     Returns:
         adj:             (n, n) bool array, symmetric, diagonal is False
@@ -53,11 +56,12 @@ def compute_adjacency_matrix(clusters, threshold_factor=1.5, spacing=None,
     """
     n = len(clusters)
 
+    if local_spacings is None:
+        local_spacings = [_local_spacing(c, percentile=spacing_percentile) for c in clusters]
+
     if spacing is None:
         spacing = _reference_spacing(clusters, percentile=spacing_percentile)
     global_threshold = threshold_factor * spacing
-
-    local_spacings = [_local_spacing(c, percentile=spacing_percentile) for c in clusters]
 
     adj = np.zeros((n, n), dtype=bool)
     boundary_strips = {}

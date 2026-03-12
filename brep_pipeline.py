@@ -492,12 +492,11 @@ def run_compute(args):
         compute_all_intersections,
         # find_equivalent_surfaces,
         trim_by_vertices,
-        compute_vertices, compute_vertices_intcs,
+        compute_vertices_intcs,
         sample_curve,
     )
     from point2cad.topology import (
-        filter_vertices_by_proximity,
-        build_edge_arcs, filter_curves_by_proximity, filter_arcs_by_proximity,
+        build_edge_arcs,
         greedy_oracle_filter,
         _score_vertex,
         print_edge_arcs_summary,
@@ -544,7 +543,7 @@ def run_compute(args):
     cluster_offset = 0
 
     for part_idx, sample_path in enumerate(part_files):
-        # if part_idx not in [2, 4, 5]:
+        # if part_idx not in [0]:
         #      continue
         step_stem = f"part_{part_idx}"
         out_dir   = os.path.join(model_out_dir, f"part_{part_idx}")
@@ -565,10 +564,12 @@ def run_compute(args):
         for cid, c_count in zip(unique_clusters, cluster_counts):
             cluster = data[data[:, -1].astype(int) == cid, :3].astype(np.float32)
             clusters.append(cluster)
+            print(f"[surface fitter] Cluster {cid} ({c_count} pts) fitting ...")
             res = fit_surface(
                 cluster,
                 {"hidden_dim": 64, "use_shortcut": True, "fraction_siren": 0.5},
                 np_rng, DEVICE,
+                # simple_error_threshold = 1e6,
                 inr_fit_kwargs={
                     "max_steps": 1500,
                     "noise_magnitude_3d": 0.05,
@@ -586,7 +587,7 @@ def run_compute(args):
             fit_results.append(res["result"])
             fit_meshes.append(res["mesh"])
             occ_surfs.append(
-                to_occ_surface(sid, res["result"], cluster=cluster, uv_margin=0.05)
+                to_occ_surface(sid, res["result"], cluster=cluster, uv_margin = 0.05, grid_resolution = 50)
             )
             # Log surface fitting result with all residual errors
             chosen_err = res["result"]["error"]
@@ -597,12 +598,12 @@ def run_compute(args):
             if errors_str:
                 print(f"  all errors: {errors_str}")
 
-        # Per-cluster KDTrees and NN-distance thresholds — needed by both paths.
+        # Per-cluster KDTrees and NN-distance percentiles — used by adjacency
+        # detection and downstream scoring (oracle filter).  Computed once here
+        # to avoid redundant KDTree builds and NN queries.
         cluster_trees, cluster_nn_percentiles = build_cluster_proximity(
-            clusters, percentile=args.proximity_percentile
+            clusters, percentile=args.spacing_percentile
         )
-
-        # cluster_thresholds = [p * args.proximity_factor for p in cluster_nn_percentiles]
 
         if args.full_adjacency:
             n_surf    = len(clusters)
@@ -616,12 +617,33 @@ def run_compute(args):
             adj, _, spacing, boundary_strips, per_pair_thresholds, boundary_strip_trees = compute_adjacency_matrix(
                 clusters, threshold_factor=args.spacing_factor,
                 spacing_percentile=args.spacing_percentile,
+                local_spacings=cluster_nn_percentiles,
             )
             inter_adj = adj
             print(f"[adjacency] spacing={spacing:.5f}  threshold={args.spacing_factor * spacing:.5f}")
             print(f"[adjacency] adjacent pairs: {adjacency_pairs(adj)}")
             for (i, j), bpts in sorted(boundary_strips.items()):
                 print(f"  boundary ({i},{j}): {len(bpts)} points")
+
+            # Discard adjacency pairs whose boundary point count is a low outlier
+            if boundary_strips and args.boundary_min_percentile > 0:
+                counts = np.array([len(bpts) for bpts in boundary_strips.values()])
+                cutoff = np.percentile(counts, args.boundary_min_percentile)
+                removed = []
+                for (i, j) in list(boundary_strips.keys()):
+                    if len(boundary_strips[(i, j)]) < cutoff:
+                        removed.append((i, j, len(boundary_strips[(i, j)])))
+                        del boundary_strips[(i, j)]
+                        inter_adj[i, j] = False
+                        inter_adj[j, i] = False
+                        per_pair_thresholds.pop((i, j), None)
+                        boundary_strip_trees.pop((i, j), None)
+                if removed:
+                    print(f"[adjacency] boundary filter: cutoff={cutoff:.0f} pts "
+                          f"(percentile={args.boundary_min_percentile})")
+                    for i, j, c in removed:
+                        print(f"  removed ({i},{j}): {c} points")
+                    print(f"[adjacency] {len(boundary_strips)} pairs remaining")
 
         threshold_vertex = 1e-4
 
@@ -768,7 +790,7 @@ def run_compute(args):
             np.savez(os.path.join(out_dir, f"inter_{i}_{j}.npz"), **kw)
 
         # ------------------------------------------------------------------
-        # Step 1: vertex–edge attribution and arc splitting
+        # Step 1: arc splitting
         # ------------------------------------------------------------------
         trim_curves_dict              = {k: v["curves"] for k, v in trim_intersections_.items()}
         edge_arcs, vertices, vertex_edges = build_edge_arcs(
@@ -902,10 +924,10 @@ if __name__ == "__main__":
     parser.add_argument("--spacing_factor", type=float, default=1.5,
                         help="Adjacency detection threshold = spacing factor * "
                              "per-pair local spacing")
-    parser.add_argument("--proximity_percentile", type=float, default=100,
-                        help="Percentile of intra-cluster NN distance distribution "
-                             "used as proximity threshold per cluster. Higher = more "
-                             "generous (default 100).")
+    parser.add_argument("--boundary_min_percentile", type=float, default=0,
+                        help="Discard adjacency pairs whose boundary point count "
+                             "falls below this percentile of all boundary counts. "
+                             "Set to 0 to disable.")
     parser.add_argument("--score_cap", type=float, default=10,
                         help="Max vertex fitness score (d/p) to keep in pre-filter. "
                              "Score is scale-invariant: 1.0 = cluster boundary.")

@@ -7,6 +7,6 @@ output_bspline/
 output_brep/
 logs.txt
 logs/*
-scripts/abc_filtered.json
+scripts/abc_filtered/
 sample_clouds
 sample_clouds_stats
