@@ -458,111 +458,6 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
     return _intersect_occ(oi, oj, tol, label=label)
 
 
-def find_equivalent_surfaces(adj, surface_ids, results,
-                             angle_tol=1e-2, dist_tol=1e-2, radius_tol=1e-2,
-                             theta_tol=1e-2):
-    """
-    Find adjacent clusters that share the same underlying surface.
-
-    Two adjacent clusters are considered equivalent if they have the same
-    surface type and their fitted parameters are close enough:
-      - Plane:    normals nearly parallel AND offsets close
-      - Cylinder: axes nearly parallel, radii close, AND axis lines close
-      - Sphere:   centres close AND radii close
-      - Cone:     axes nearly parallel, apexes close, AND half-angles close
-
-    Returns a canonical-index map: canon[i] = j means cluster i is equivalent
-    to cluster j (j <= i).  Non-equivalent clusters map to themselves.
-    """
-    n = adj.shape[0]
-    canon = list(range(n))
-
-    def _find(x):
-        while canon[x] != x:
-            canon[x] = canon[canon[x]]
-            x = canon[x]
-        return x
-
-    def _union(a, b):
-        ra, rb = _find(a), _find(b)
-        if ra != rb:
-            lo, hi = (ra, rb) if ra < rb else (rb, ra)
-            canon[hi] = lo
-
-    for i, j in adjacency_pairs(adj):
-        if surface_ids[i] != surface_ids[j]:
-            continue
-        sid = surface_ids[i]
-        pi, pj = results[i]["params"], results[j]["params"]
-
-        # Planes are non-periodic — never seam-split by OCC, so no
-        # face merging needed.  Skip to avoid false-positive merges.
-        if sid == SURFACE_PLANE:
-            continue
-
-        elif sid == SURFACE_CYLINDER:
-            ai, aj = _unit(pi["a"]), _unit(pj["a"])
-            dot = abs(float(np.dot(ai, aj)))
-            ri, rj = float(pi["radius"]), float(pj["radius"])
-            ci = np.asarray(pi["center"], dtype=np.float64)
-            cj = np.asarray(pj["center"], dtype=np.float64)
-            diff = cj - ci
-            perp = diff - float(np.dot(diff, ai)) * ai
-            d_angle = 1.0 - dot
-            d_radius = abs(ri - rj)
-            d_axis = float(np.linalg.norm(perp))
-            print(f"[surface equiv] ({i},{j}) cylinder: "
-                  f"1-|dot|={d_angle:.6e}  Δr={d_radius:.6e}  "
-                  f"Δaxis={d_axis:.6e}")
-            if d_angle >= angle_tol or d_radius > radius_tol or d_axis > dist_tol:
-                continue
-            _union(i, j)
-
-        elif sid == SURFACE_SPHERE:
-            ci = np.asarray(pi["center"], dtype=np.float64)
-            cj = np.asarray(pj["center"], dtype=np.float64)
-            d_center = float(np.linalg.norm(ci - cj))
-            ri, rj = float(pi["radius"]), float(pj["radius"])
-            d_radius = abs(ri - rj)
-            print(f"[surface equiv] ({i},{j}) sphere: "
-                  f"Δcenter={d_center:.6e}  Δr={d_radius:.6e}")
-            if d_center > dist_tol or d_radius > radius_tol:
-                continue
-            _union(i, j)
-
-        elif sid == SURFACE_CONE:
-            ai, aj = _unit(pi["a"]), _unit(pj["a"])
-            dot = abs(float(np.dot(ai, aj)))
-            vi = np.asarray(pi["v"], dtype=np.float64)
-            vj = np.asarray(pj["v"], dtype=np.float64)
-            ti, tj = float(pi["theta"]), float(pj["theta"])
-            d_angle = 1.0 - dot
-            d_apex = float(np.linalg.norm(vi - vj))
-            d_theta = abs(ti - tj)
-            print(f"[surface equiv] ({i},{j}) cone: "
-                  f"1-|dot|={d_angle:.6e}  Δapex={d_apex:.6e}  "
-                  f"Δθ={d_theta:.6e}")
-            if d_angle >= angle_tol or d_apex > dist_tol or d_theta > theta_tol:
-                continue
-            _union(i, j)
-
-    # Flatten
-    for i in range(n):
-        canon[i] = _find(i)
-
-    # Report
-    groups = {}
-    for i in range(n):
-        groups.setdefault(canon[i], []).append(i)
-    for rep, members in groups.items():
-        if len(members) > 1:
-            print(f"[surface equiv] clusters {members} share the same "
-                  f"{SURFACE_NAMES[surface_ids[rep]]} surface "
-                  f"(canonical={rep})")
-
-    return canon
-
-
 def compute_all_intersections(adj, surface_ids, results, occ_surfaces,
                               tol=1e-6):
     """
@@ -577,7 +472,7 @@ def compute_all_intersections(adj, surface_ids, results, occ_surfaces,
             surface_ids[i], results[i], occ_surfaces[i],
             surface_ids[j], results[j], occ_surfaces[j],
             tol   = tol,
-            label = f"({i},{j}) {SURFACE_NAMES[surface_ids[i]]}∩{SURFACE_NAMES[surface_ids[j]]}",
+            label = f"({i}, {j}) {SURFACE_NAMES[surface_ids[i]]}∩{SURFACE_NAMES[surface_ids[j]]}",
         )
     return out
 

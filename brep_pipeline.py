@@ -230,7 +230,7 @@ def run_visualize(args):
         n_curves   = int(d["n_curves"])
         n_raw      = int(d["n_untrimmed_curves"])
         ci, cj     = int(d["cluster_i"]), int(d["cluster_j"])
-        print(f"({ci},{cj})  {d['surface_i_name']} ∩ {d['surface_j_name']}"
+        print(f"({ci}, {cj})  {d['surface_i_name']} ∩ {d['surface_j_name']}"
               f"  type={curve_type}  trimmed={n_curves}  raw={n_raw}")
         color = CURVE_TYPE_COLORS.get(curve_type, [0.8, 0.8, 0.8])
         for k in range(n_curves):
@@ -309,22 +309,42 @@ def run_visualize(args):
     vis3.get_render_option().point_size = 8.0
 
     vis4 = o3d.visualization.Visualizer()
-    vis4.create_window("Point clouds + boundary meshes",
-                       width=W, height=H, left=0, top=50 + H + 40)
-    for pcd in cluster_pcds:
-        vis4.add_geometry(pcd)
-    for bpcd in boundary_pcds:
-        vis4.add_geometry(bpcd)
-    vis4.get_render_option().point_size = 2.0
+    if args.boundary_mesh:
+        vis4.create_window("Point clouds + boundary meshes",
+                           width=W, height=H, left=0, top=50 + H + 40)
+        for pcd in cluster_pcds:
+            vis4.add_geometry(pcd)
+        for bpcd in boundary_pcds:
+            vis4.add_geometry(bpcd)
+        vis4.get_render_option().point_size = 2.0
+    else:
+        vis4.create_window("Point clouds",
+                           width=W, height=H, left=0, top=50 + H + 40)
+        for pcd in cluster_pcds:
+            vis4.add_geometry(pcd)
+        vis4.get_render_option().point_size = 2.0
+
+    vis6 = None
+    if not args.boundary_mesh:
+        vis6 = o3d.visualization.Visualizer()
+        vis6.create_window("Boundary strips",
+                           width=W, height=H, left=W, top=50 + H + 40)
+        for bpcd in boundary_pcds:
+            vis6.add_geometry(bpcd)
+        vis6.get_render_option().point_size = 10.0
 
     vis5 = o3d.visualization.Visualizer()
-    vis5.create_window("Fitted surfaces", width=W, height=H, left=W, top=50 + H + 40)
+    vis5.create_window("Fitted surfaces", width=W, height=H,
+                       left=W if args.boundary_mesh else 2 * W, top=50 + H + 40)
     for mesh in surface_meshes:
         vis5.add_geometry(mesh)
 
     vis4.get_render_option().mesh_show_back_face = True
     vis5.get_render_option().mesh_show_back_face = True
     visualizers = [vis1, vis2, vis3, vis4, vis5]
+    if vis6 is not None:
+        vis6.get_render_option().mesh_show_back_face = True
+        visualizers.append(vis6)
     running     = [True] * len(visualizers)
     while all(running):
         for i, vis in enumerate(visualizers):
@@ -347,13 +367,14 @@ def _unit_vec(v):
 
 
 def merge_coincident_surfaces(clusters, surface_ids, fit_results, fit_meshes, occ_surfs,
-                               tol_angle_deg=3.0, tol_dist=1e-2, tol_radius=1e-2,
+                               adj,
+                               tol_angle_deg=1.0, tol_dist=1e-2, tol_radius=1e-2,
                                tol_cone_angle_deg=1.0):
     """
-    Detect clusters fitted to identical (coincident) surfaces and merge them.
+    Detect adjacent clusters fitted to identical (coincident) surfaces and merge them.
 
-    Two clusters are merged when their surface type matches AND all geometric
-    parameters agree within tolerance:
+    Two clusters are merged when they are adjacent AND their surface type matches
+    AND all geometric parameters agree within tolerance:
       Plane    : parallel normals AND same signed offset d
       Cylinder : parallel axes AND axis lines coincide AND equal radii
       Cone     : coincident apex AND parallel axes AND equal half-angles
@@ -431,11 +452,13 @@ def merge_coincident_surfaces(clusters, surface_ids, fit_results, fit_meshes, oc
             continue
         pi = fit_results[i]["params"]
         for j in range(i + 1, n):
+            if not adj[i, j]:
+                continue
             if surface_ids[j] != surface_ids[i] or find(i) == find(j):
                 continue
             if checker(pi, fit_results[j]["params"]):
                 sname = SURFACE_NAMES.get(surface_ids[i], str(surface_ids[i]))
-                print(f"[merge] surfaces {i} and {j} are coincident {sname}s → merging into {i}")
+                print(f"[merge] surfaces {i} and {j} are coincident {sname}s → merging")
                 union(i, j)
 
     groups = defaultdict(list)
@@ -490,7 +513,6 @@ def run_compute(args):
     from point2cad.color_config         import get_surface_color
     from point2cad.surface_intersection import (
         compute_all_intersections,
-        # find_equivalent_surfaces,
         trim_by_vertices,
         compute_vertices_intcs,
         sample_curve,
@@ -605,45 +627,57 @@ def run_compute(args):
             clusters, percentile=args.spacing_percentile
         )
 
-        if args.full_adjacency:
-            n_surf    = len(clusters)
-            inter_adj = np.ones((n_surf, n_surf), dtype=bool)
-            np.fill_diagonal(inter_adj, False)
-            boundary_strips = {}
-            per_pair_thresholds = {}
-            boundary_strip_trees = {}
-            print(f"[adjacency] full adjacency: intersecting all {n_surf * (n_surf - 1) // 2} pairs")
-        else:
-            adj, _, spacing, boundary_strips, per_pair_thresholds, boundary_strip_trees = compute_adjacency_matrix(
-                clusters, threshold_factor=args.spacing_factor,
-                spacing_percentile=args.spacing_percentile,
-                local_spacings=cluster_nn_percentiles,
-            )
-            inter_adj = adj
-            print(f"[adjacency] spacing={spacing:.5f}  threshold={args.spacing_factor * spacing:.5f}")
-            print(f"[adjacency] adjacent pairs: {adjacency_pairs(adj)}")
-            for (i, j), bpts in sorted(boundary_strips.items()):
-                print(f"  boundary ({i},{j}): {len(bpts)} points")
+        adj, _, spacing, boundary_strips, per_pair_thresholds, boundary_strip_trees = compute_adjacency_matrix(
+            clusters, threshold_factor=args.spacing_factor,
+            spacing_percentile=args.spacing_percentile,
+            local_spacings=cluster_nn_percentiles,
+        )
+        inter_adj = adj
+        print(f"[adjacency] spacing={spacing:.5f}  threshold={args.spacing_factor * spacing:.5f}")
+        print(f"[adjacency] adjacent pairs: {adjacency_pairs(adj)}")
+        for (i, j), bpts in sorted(boundary_strips.items()):
+            print(f"  boundary ({i}, {j}): {len(bpts)} points")
 
-            # Discard adjacency pairs whose boundary point count is a low outlier
-            if boundary_strips and args.boundary_min_percentile > 0:
-                counts = np.array([len(bpts) for bpts in boundary_strips.values()])
-                cutoff = np.percentile(counts, args.boundary_min_percentile)
-                removed = []
-                for (i, j) in list(boundary_strips.keys()):
-                    if len(boundary_strips[(i, j)]) < cutoff:
-                        removed.append((i, j, len(boundary_strips[(i, j)])))
-                        del boundary_strips[(i, j)]
-                        inter_adj[i, j] = False
-                        inter_adj[j, i] = False
-                        per_pair_thresholds.pop((i, j), None)
-                        boundary_strip_trees.pop((i, j), None)
-                if removed:
-                    print(f"[adjacency] boundary filter: cutoff={cutoff:.0f} pts "
-                          f"(percentile={args.boundary_min_percentile})")
-                    for i, j, c in removed:
-                        print(f"  removed ({i},{j}): {c} points")
-                    print(f"[adjacency] {len(boundary_strips)} pairs remaining")
+        # Discard adjacency pairs whose boundary point count is a low outlier
+        if boundary_strips and args.boundary_min_percentile > 0:
+            counts = np.array([len(bpts) for bpts in boundary_strips.values()])
+            cutoff = np.percentile(counts, args.boundary_min_percentile)
+            removed = []
+            for (i, j) in list(boundary_strips.keys()):
+                if len(boundary_strips[(i, j)]) < cutoff:
+                    removed.append((i, j, len(boundary_strips[(i, j)])))
+                    del boundary_strips[(i, j)]
+                    inter_adj[i, j] = False
+                    inter_adj[j, i] = False
+                    per_pair_thresholds.pop((i, j), None)
+                    boundary_strip_trees.pop((i, j), None)
+            if removed:
+                print(f"[adjacency] boundary filter: cutoff={cutoff:.0f} pts "
+                      f"(percentile={args.boundary_min_percentile})")
+                for i, j, c in removed:
+                    print(f"  removed ({i}, {j}): {c} points")
+                print(f"[adjacency] {len(boundary_strips)} pairs remaining")
+
+        # Merge adjacent clusters fitted to coincident surfaces.
+        if args.merge_surfaces:
+            prev_n = len(clusters)
+            clusters, surface_ids, fit_results, fit_meshes, occ_surfs = \
+                merge_coincident_surfaces(
+                    clusters, surface_ids, fit_results, fit_meshes, occ_surfs,
+                    adj=inter_adj,
+                )
+            if len(clusters) < prev_n:
+                print(f"[merge] {prev_n} → {len(clusters)} clusters after merging")
+                cluster_trees, cluster_nn_percentiles = build_cluster_proximity(
+                    clusters, percentile=args.spacing_percentile
+                )
+                adj, _, spacing, boundary_strips, per_pair_thresholds, boundary_strip_trees = compute_adjacency_matrix(
+                    clusters, threshold_factor=args.spacing_factor,
+                    spacing_percentile=args.spacing_percentile,
+                    local_spacings=cluster_nn_percentiles,
+                )
+                inter_adj = adj
+                print(f"[adjacency] recomputed after merge: {len(adjacency_pairs(adj))} pairs")
 
         threshold_vertex = 1e-4
 
@@ -717,7 +751,7 @@ def run_compute(args):
               f"range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, {0 if scores_arr.size == 0 else scores_arr.max():.4f}]")
         for rank, idx in enumerate(sorted_indices):
             edges_str = " ".join(
-                f"({min(e)},{max(e)})" for e in vertex_edges[idx])
+                f"({min(e)}, {max(e)})" for e in vertex_edges[idx])
             print(f"  v{idx:3d}  score={scores_arr[idx]:10.4f}  "
                   f"edges=[{edges_str}]")
 
@@ -746,7 +780,7 @@ def run_compute(args):
             inter_trim = trim_intersections_[(i, j)]
             si = SURFACE_NAMES[surface_ids[i]]
             sj = SURFACE_NAMES[surface_ids[j]]
-            print(f"[intersect] ({i},{j})  {si} ∩ {sj}  type={inter_raw['type']}"
+            print(f"[intersect] ({i}, {j})  {si} ∩ {sj}  type={inter_raw['type']}"
                   f"  method={inter_raw['method']}"
                   f"  raw={len(inter_raw['curves'])}  trimmed={len(inter_trim['curves'])}")
             kw = dict(
@@ -933,11 +967,10 @@ if __name__ == "__main__":
                              "Score is scale-invariant: 1.0 = cluster boundary.")
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
-                             "instead of point clouds (visualize mode only)", default = True)
-    parser.add_argument("--full_adjacency", action="store_true",
-                        help="Intersect all surface pairs, not just adjacent ones; "
-                             "uses curve-proximity phantom filtering instead of "
-                             "pre-computed boundary strips")
+                             "instead of point clouds (visualize mode only)")
+    parser.add_argument("--merge_surfaces", action="store_true",
+                        help="Merge adjacent clusters fitted to coincident surfaces "
+                             "(e.g. over-segmented planes with identical parameters)")
     parser.add_argument("--bspline_method", type=str, default="uv_bounds",
                         choices=["uv_bounds", "explicit_pcurve"],
                         help="How BSpline (INR) faces are constructed. "

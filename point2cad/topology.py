@@ -294,6 +294,8 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-4):
                             "edge_key": edge_key,
                         })
 
+        for arc_idx, arc in enumerate(arcs_for_edge):
+            arc["arc_idx"] = arc_idx
         edge_arcs[edge_key] = arcs_for_edge
 
     out_vertices = np.array(verts, dtype=np.float64) if verts else np.zeros((0, 3))
@@ -826,11 +828,11 @@ def _select_next_arc_angular(v_cur, prev_arc, candidates, face_idx, occ_surfaces
     # Edge continuity: prefer candidates from the same edge as prev_arc.
     # This keeps the wire on a single intersection curve before switching
     # to a different curve at a shared vertex.
-    prev_edge = prev_arc.get("edge_key")
-    if prev_edge is not None:
-        same_edge = [c for c in candidates if c[0].get("edge_key") == prev_edge]
-        if same_edge:
-            return min(same_edge, key=lambda c: _ccw_angle(*c))
+    # prev_edge = prev_arc.get("edge_key")
+    # if prev_edge is not None:
+    #     same_edge = [c for c in candidates if c[0].get("edge_key") == prev_edge]
+    #     if same_edge:
+    #         return min(same_edge, key=lambda c: _ccw_angle(*c))
 
     return min(candidates, key=lambda c: _ccw_angle(*c))
 
@@ -972,8 +974,11 @@ def print_face_wires_summary(face_wires):
             for arc, fwd in wire:
                 vs = arc["v_start"]
                 ve = arc["v_end"]
+                ek = arc.get("edge_key", None)
+                ai = arc.get("arc_idx", "?")
                 cl = "closed" if arc["closed"] else ("fwd" if fwd else "rev")
-                arc_descs.append(f"({vs}→{ve},{cl})")
+                edge_str = f"e({ek[0]}, {ek[1]})[{ai}]" if ek else "e?"
+                arc_descs.append(f"({vs}→{ve}, {cl}, {edge_str})")
             print(f"    wire[{w_idx}]  arcs={len(wire)}  " + "  ".join(arc_descs))
 
 
