@@ -242,7 +242,9 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-4):
                     # parameters beyond [t_min, t_max].  Three cases:
                     #   1. Geom_TrimmedCurve → BasisCurve() gives the periodic basis
                     #   2. Raw closed curve (e.g. Geom_Circle) → use it directly
-                    #   3. Non-closed, no BasisCurve → seam-split fallback
+                    #   3. Non-periodic closed curve (e.g. BSpline) → split into
+                    #      two sub-arcs [t_last, t_max] + [t_min, t_first] with a
+                    #      seam vertex at the curve's start/end point.
                     basis = _basis_curve(curve)
                     if basis is None and curve_is_closed(curve):
                         basis = curve
@@ -260,12 +262,36 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-4):
                             })
                             wrap_ok = True
                         except Exception:
-                            pass  # OCC rejected wrap parameters — skip arc
-                    if not wrap_ok:
-                        # Cannot represent wrap-around arc — skip it.
-                        # The interior arcs cover the genuine portion;
-                        # the back portion would be filtered anyway.
-                        pass
+                            pass  # OCC rejected wrap parameters (e.g. BSpline)
+                    if not wrap_ok and curve_is_closed(curve):
+                        # Seam-split fallback: emit two sub-arcs joined at a
+                        # seam vertex placed at the curve start/end point.
+                        seam_pos = _pnt_to_np(curve.Value(t_min))
+                        seam_idx = len(verts)
+                        verts.append(seam_pos)
+                        vedge_sets.append({edge_key})
+                        try:
+                            arcs_for_edge.append({
+                                "curve":   _make_arc(curve, t_last, t_max),
+                                "v_start": v_last,
+                                "v_end":   seam_idx,
+                                "t_start": t_last,
+                                "t_end":   t_max,
+                                "closed":  False,
+                                "edge_key": edge_key,
+                            })
+                            arcs_for_edge.append({
+                                "curve":   _make_arc(curve, t_min, t_first),
+                                "v_start": seam_idx,
+                                "v_end":   v_first,
+                                "t_start": t_min,
+                                "t_end":   t_first,
+                                "closed":  False,
+                                "edge_key": edge_key,
+                            })
+                            wrap_ok = True
+                        except Exception:
+                            pass
 
             else:
                 # Open curve.
@@ -524,9 +550,6 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     for edge_key, arcs in edge_arcs.items():
         i, j = edge_key
         for arc_idx, arc in enumerate(arcs):
-            if arc["closed"]:
-                arc_scores.append((0.0, edge_key, arc_idx))
-                continue
             score = _score_arc(arc, i, j, cluster_trees,
                                cluster_nn_percentiles)
             arc_scores.append((score, edge_key, arc_idx))
@@ -534,8 +557,6 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     # Build arc candidate list, sorted worst-first.
     arc_candidates = []
     for score, edge_key, arc_idx in arc_scores:
-        if score <= 0:
-            continue  # never remove closed arcs
         arc = edge_arcs[edge_key][arc_idx]
         arc_candidates.append((score, (edge_key, arc_idx), arc_idx))
     arc_candidates.sort(key=lambda c: c[0], reverse=True)
@@ -545,7 +566,7 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
               f"(score range: {arc_candidates[-1][0]:.4f} — "
               f"{arc_candidates[0][0]:.4f})")
     else:
-        print("[oracle filter] no removable candidates (all arcs closed)")
+        print("[oracle filter] no removable candidates")
 
     # ------------------------------------------------------------------
     # Phase 2: Remove isolated vertices unconditionally

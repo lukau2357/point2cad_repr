@@ -215,7 +215,7 @@ docker build -t <tag> . - Builds an image from the Dockerfile in the current dir
 
 docker run --rm -it --gpus all -e DISPLAY=${DISPLAY} -v $(pwd):/work <image_name> <command>
 docker run --rm -it --gpus all -v $(pwd):/work <image_name> <command>
-docker run --rm -it --gpus all -v $(pwd):/work point2cad_repr bash
+docker run --rm -it --gpus all -v $(pwd):/work -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix point2cad_repr bash
 ```
 
 ### Point2CAD repr shortcuts

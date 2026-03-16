@@ -33,7 +33,8 @@ RUN pip install --no-cache-dir \
     open3d \
     matplotlib \
     tqdm \
-    trimesh
+    trimesh \
+    pyvista
 
 COPY entrypoint_occt.sh /entrypoint_occt.sh
 RUN chmod +x /entrypoint_occt.sh

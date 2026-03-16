@@ -29,6 +29,7 @@
   - 00000077 (default, default)
   - 00000104 - Does not work, 0 vertices, simple model in that regard. Lowering the spacing factor to as low as 0.1 did produce better curves,
     but still not correct results. Sphere/cylinder intersection return 4 BSpline curves that should constitute a single closed curve,
-    the algorithm breaks...
+    the algorithm breaks... With mesh intersections, works fine when reducing spacing_factor to 0.1, but still FreeCAD rejects it because of 
+    "Invalid tolerance values". Try to catch these cases?
   - 00000121 (default, default). Good showcase of the algorithm for tomorrow's presentation.
 

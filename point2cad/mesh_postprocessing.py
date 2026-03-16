@@ -426,20 +426,18 @@ def _filter_area_per_point(counter_nearest, submeshes_cur, area_multiplier, surf
 
     # np.array(counter_nearest) is of shape (K, 2). First entry is the cluster_id, the second entry
     # is the number of supporting points
-    nonzero_indices = np.nonzero(area_per_point)
-    best_app = area_per_point[nonzero_indices].min()
+    nonzero_indices = np.nonzero(area_per_point)[0]
 
-    if len(nonzero_indices[0]) == 0:
+    if len(nonzero_indices) == 0:
         print(f"Warning: surface {surface_idx} has only zero-area components.")
         return []
 
+    # Match original Point2CAD: reference is the first non-zero ratio
+    # (most-supported component, since counter_nearest is sorted by count desc)
+    best_app = area_per_point[nonzero_indices[0]]
+
     return np.array(counter_nearest)[:, 0][
         np.logical_and(
-            # Compare each area_per_point with the first non-zero element of area_per_point multiplied by area_multiplier
-            # First element of area_per_point will contain the best fitting fragment/submesh, with respect to the number
-            # of points closest to it. Allowance is best_area_per_point * 2 (default value of area_multiplier)
-            # but this is parametrizable. Remember, smaller area_per_point is better
-            # Of course, we disallow fragments with zero area - covered by the second condition.
             area_per_point < best_app * area_multiplier,
             area_per_point != 0,
         )
