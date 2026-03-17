@@ -3,7 +3,6 @@ import itertools
 import open3d as o3d
 import torch
 import trimesh
-
 from .color_config import get_surface_color
 
 def rotation_matrix_a_to_b(A, B):
@@ -200,8 +199,7 @@ def generate_plane_mesh(mesh_dim, a, d, cluster, np_rng, device,
                          threshold_multiplier = threshold_multiplier,
                          spacing_percentile = spacing_percentile,
                          spacing = spacing)
-    mesh = triangulate_and_mesh(vertices, mesh_dim, mesh_dim, "plane", mask = mask)
-    return mesh
+    return triangulate_and_mesh(vertices, mesh_dim, mesh_dim, "plane", mask = mask)
 
 def sample_sphere(dim_theta, dim_lambda, radius, center):
     center = center.reshape((1, 3))
@@ -231,8 +229,7 @@ def generate_sphere_mesh(dim_theta, dim_lambda, radius, center, cluster, device,
                          threshold_multiplier = threshold_multiplier,
                          spacing_percentile = spacing_percentile,
                          spacing = spacing)
-    mesh = triangulate_and_mesh(vertices, dim_theta, dim_lambda, "sphere", mask = mask)
-    return mesh
+    return triangulate_and_mesh(vertices, dim_theta, dim_lambda, "sphere", mask = mask)
 
 def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_margin = 0):
     # Input cluster is needed as points parameter, in order to determine minimum and maximum height for cylinder sampling
@@ -280,8 +277,7 @@ def generate_cylinder_mesh(dim_theta, dim_height, radius, center, axis, cluster,
                          threshold_multiplier = threshold_multiplier,
                          spacing_percentile = spacing_percentile,
                          spacing = spacing)
-    mesh = triangulate_and_mesh(vertices, dim_theta, 2 * dim_height, "cylinder", mask = mask)
-    return mesh
+    return triangulate_and_mesh(vertices, dim_theta, 2 * dim_height, "cylinder", mask = mask)
 
 def sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, height_margin = 0, single_sided = True):
     vertex = vertex.reshape(3).astype(np.float32)
@@ -347,8 +343,7 @@ def generate_cone_mesh(dim_theta, dim_height, vertex, axis, theta, cluster_point
                          threshold_multiplier = threshold_multiplier,
                          spacing_percentile = spacing_percentile,
                          spacing = spacing)
-    mesh = triangulate_and_mesh(vertices, dim_theta, dim_height, "cone", mask = mask)
-    return mesh
+    return triangulate_and_mesh(vertices, dim_theta, dim_height, "cone", mask = mask)
 
 if __name__ == "__main__":
     np_rng = np.random.default_rng(41)

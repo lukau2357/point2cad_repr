@@ -188,7 +188,7 @@ def _fit_bspline(pts):
 # ---------------------------------------------------------------------------
 
 def compute_mesh_intersections(adj, surface_ids, results, fit_meshes,
-                               tol=1e-6):
+                               tol=1e-6, pairs=None):
     """
     Compute intersections for every adjacent pair using mesh representations.
 
@@ -199,6 +199,8 @@ def compute_mesh_intersections(adj, surface_ids, results, fit_meshes,
     results    : list of fitting result dicts (with "params" key)
     fit_meshes : list of Open3D TriangleMesh, one per cluster
     tol        : unused (kept for API compatibility with compute_all_intersections)
+    pairs      : optional list of (i, j) pairs to compute; if None, all
+                 adjacent pairs from adj are used.
 
     Returns
     -------
@@ -212,7 +214,8 @@ def compute_mesh_intersections(adj, surface_ids, results, fit_meshes,
     out = {}
     polyline_map = {}
 
-    for i, j in adjacency_pairs(adj):
+    iter_pairs = pairs if pairs is not None else adjacency_pairs(adj)
+    for i, j in iter_pairs:
         si, sj = surface_ids[i], surface_ids[j]
         label = f"({i}, {j}) {SURFACE_NAMES[si]}∩{SURFACE_NAMES[sj]}"
 

@@ -1,4 +1,5 @@
 import numpy as np
+import open3d as o3d
 
 from .inr_fitting import fit_inr
 from .primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder_optimized, fit_cone
@@ -22,6 +23,53 @@ PRIMITIVE_FITTERS = {
 def ratio(x, y, eps = 1e-8):
     return (x + eps) / (y + eps)
 
+def _inflate_mesh(o3d_mesh, trimesh_mesh, surface_id, params,
+                  radius_inflation, angle_inflation_deg):
+    """Push mesh vertices outward after trimming. Modifies meshes in-place."""
+    if surface_id == SURFACE_SPHERE and radius_inflation != 0.0:
+        center = params["center"].reshape(1, 3)
+        verts = np.asarray(o3d_mesh.vertices)
+        dirs = verts - center
+        norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        verts += dirs / norms * radius_inflation
+        o3d_mesh.vertices = o3d.utility.Vector3dVector(verts)
+        trimesh_mesh.vertices += (dirs / norms * radius_inflation)[:len(trimesh_mesh.vertices)]
+
+    elif surface_id == SURFACE_CYLINDER and radius_inflation != 0.0:
+        center = params["center"].reshape(1, 3)
+        axis = params["a"].reshape(3)
+        verts = np.asarray(o3d_mesh.vertices)
+        shifted = verts - center
+        along = (shifted @ axis).reshape(-1, 1) * axis.reshape(1, 3)
+        radial = shifted - along
+        radial_norm = np.linalg.norm(radial, axis=1, keepdims=True)
+        radial_norm = np.maximum(radial_norm, 1e-10)
+        offset = radial / radial_norm * radius_inflation
+        verts += offset
+        o3d_mesh.vertices = o3d.utility.Vector3dVector(verts)
+        trimesh_mesh.vertices += offset[:len(trimesh_mesh.vertices)]
+
+    elif surface_id == SURFACE_CONE and angle_inflation_deg != 0.0:
+        vertex = params["v"].reshape(1, 3)
+        axis = params["a"].reshape(3)
+        theta = params["theta"]
+        theta_new = theta + np.radians(angle_inflation_deg)
+        scale = np.tan(theta_new) / (np.tan(theta) + 1e-10)
+
+        verts = np.asarray(o3d_mesh.vertices)
+        shifted = verts - vertex
+        along = (shifted @ axis).reshape(-1, 1) * axis.reshape(1, 3)
+        radial = shifted - along
+        new_verts = vertex + along + radial * scale
+        o3d_mesh.vertices = o3d.utility.Vector3dVector(new_verts)
+        tv = trimesh_mesh.vertices
+        t_shifted = tv - vertex
+        t_along = (t_shifted @ axis).reshape(-1, 1) * axis.reshape(1, 3)
+        t_radial = t_shifted - t_along
+        trimesh_mesh.vertices = vertex + t_along + t_radial * scale
+
+
 def resolve_mesh(surface_id,
                  result,
                  cluster,
@@ -31,7 +79,9 @@ def resolve_mesh(surface_id,
                  sphere_mesh_kwargs,
                  cylinder_mesh_kwargs,
                  cone_mesh_kwargs,
-                 inr_mesh_kwargs):
+                 inr_mesh_kwargs,
+                 radius_inflation=0.0,
+                 angle_inflation_deg=0.0):
 
     params = result["params"]
 
@@ -42,37 +92,46 @@ def resolve_mesh(surface_id,
             cluster = cluster,
             np_rng = np_rng,
             device = device,
-            **plane_mesh_kwargs
+**plane_mesh_kwargs
         )
 
     if surface_id == SURFACE_SPHERE:
-        return generate_sphere_mesh(
+        mesh = generate_sphere_mesh(
             radius = params["radius"],
             center = params["center"],
             cluster = cluster,
             device = device,
-            **sphere_mesh_kwargs
+**sphere_mesh_kwargs
         )
+        if radius_inflation != 0.0:
+            _inflate_mesh(mesh[0], mesh[1], surface_id, params, radius_inflation, angle_inflation_deg)
+        return mesh
 
     if surface_id == SURFACE_CYLINDER:
-        return generate_cylinder_mesh(
+        mesh = generate_cylinder_mesh(
             radius = params["radius"],
             center = params["center"],
             axis = params["a"],
             cluster = cluster,
             device = device,
-            **cylinder_mesh_kwargs
+**cylinder_mesh_kwargs
         )
+        if radius_inflation != 0.0:
+            _inflate_mesh(mesh[0], mesh[1], surface_id, params, radius_inflation, angle_inflation_deg)
+        return mesh
 
     if surface_id == SURFACE_CONE:
-        return generate_cone_mesh(
+        mesh = generate_cone_mesh(
             vertex = params["v"],
             axis = params["a"],
             theta = params["theta"],
             cluster_points = cluster,
             device = device,
-            **cone_mesh_kwargs
+**cone_mesh_kwargs
         )
+        if angle_inflation_deg != 0.0:
+            _inflate_mesh(mesh[0], mesh[1], surface_id, params, radius_inflation, angle_inflation_deg)
+        return mesh
 
     if surface_id == SURFACE_INR:
         model = params["model"]
@@ -141,7 +200,9 @@ def fit_surface(cluster,
                 sphere_mesh_kwargs = None,
                 cylinder_mesh_kwargs = None,
                 cone_mesh_kwargs = None,
-                inr_mesh_kwargs = None):
+                inr_mesh_kwargs = None,
+                radius_inflation = 0.0,
+                angle_inflation_deg = 0.0):
 
     sphere_fit_kwargs = sphere_fit_kwargs or {}
     cylinder_fit_kwargs = cylinder_fit_kwargs or {}
@@ -183,7 +244,8 @@ def fit_surface(cluster,
         
             if cone_results != -1:
                 mesh = resolve_mesh(cone_results, results[cone_results], cluster, np_rng, device,
-                            plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
+                            plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
+                            radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
 
                 return {"surface_id": cone_results, "result": results[cone_results], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
 
@@ -192,7 +254,8 @@ def fit_surface(cluster,
             if simple_min == SURFACE_PLANE:
                 surface_to_use = plane_special_handling(results, errors, plane_sphere_ratio_threshold)
             mesh = resolve_mesh(surface_to_use, results[surface_to_use], cluster, np_rng, device,
-            plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
+            plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
+            radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
             return {"surface_id": surface_to_use, "result": results[surface_to_use], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
         
     errors_str = "  ".join(f"{SURFACE_NAMES[sid]}={errors[sid]:.6f}" for sid in range(len(PRIMITIVE_FITTERS)))
@@ -220,6 +283,7 @@ def fit_surface(cluster,
             resulting_min = plane_special_handling(results, errors[:-1], plane_sphere_ratio_threshold)
 
     mesh = resolve_mesh(resulting_min, results[resulting_min], cluster, np_rng, device,
-                        plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs)
+                        plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
+                        radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
 
     return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}

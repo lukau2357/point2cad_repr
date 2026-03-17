@@ -183,12 +183,23 @@ def run_visualize(args):
 
     # Point clouds
     cluster_pcds = []
+    all_cluster_pts = []
     for i in range(n_clusters):
         pts = np.load(os.path.join(out_dir, f"cluster_{i}.npy"))
+        all_cluster_pts.append(pts)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts)
         pcd.paint_uniform_color(clust_colors[i].tolist())
         cluster_pcds.append(pcd)
+
+    # Bounding box for filtering out-of-range curves in visualization
+    _all_pts = np.concatenate(all_cluster_pts, axis=0)
+    _bbox_min = _all_pts.min(axis=0)
+    _bbox_max = _all_pts.max(axis=0)
+    _bbox_diag = np.linalg.norm(_bbox_max - _bbox_min)
+    _bbox_margin = 0.5 * _bbox_diag
+    _vis_min = _bbox_min - _bbox_margin
+    _vis_max = _bbox_max + _bbox_margin
 
     # Intersection curves (sampled to numpy by the compute mode)
     def _lineset(pts, color):
@@ -198,6 +209,30 @@ def run_visualize(args):
         ls.lines  = o3d.utility.Vector2iVector(lines)
         ls.colors = o3d.utility.Vector3dVector([color] * len(lines))
         return ls
+
+    def _clip_to_bbox(pts):
+        """Return only the contiguous segment of pts that lies within the bbox.
+        Returns None if no points are inside."""
+        inside = np.all((pts >= _vis_min) & (pts <= _vis_max), axis=1)
+        if not np.any(inside):
+            return None
+        # Keep the largest contiguous run of inside points
+        idxs = np.where(inside)[0]
+        # Find longest contiguous block
+        best_start, best_len = idxs[0], 1
+        cur_start, cur_len = idxs[0], 1
+        for i in range(1, len(idxs)):
+            if idxs[i] == idxs[i-1] + 1:
+                cur_len += 1
+            else:
+                if cur_len > best_len:
+                    best_start, best_len = cur_start, cur_len
+                cur_start, cur_len = idxs[i], 1
+        if cur_len > best_len:
+            best_start, best_len = cur_start, cur_len
+        if best_len < 2:
+            return None
+        return pts[best_start:best_start + best_len]
 
     # Per-arc linesets (post-filter: arcs_I_J.npz)
     arc_linesets = []
@@ -217,7 +252,9 @@ def run_visualize(args):
         d      = np.load(arc_path, allow_pickle=True)
         n_arcs = int(d["n_arcs"])
         for k in range(n_arcs):
-            pts   = d[f"arc_points_{k}"]
+            pts = _clip_to_bbox(d[f"arc_points_{k}"])
+            if pts is None:
+                continue
             color = d[f"arc_color_{k}"].tolist()
             pre_filter_arc_linesets.append(_lineset(pts, color))
 
@@ -231,13 +268,22 @@ def run_visualize(args):
         n_curves   = int(d["n_curves"])
         n_raw      = int(d["n_untrimmed_curves"])
         ci, cj     = int(d["cluster_i"]), int(d["cluster_j"])
+        method     = str(d["method"]) if "method" in d else "analytical"
         print(f"({ci}, {cj})  {d['surface_i_name']} ∩ {d['surface_j_name']}"
-              f"  type={curve_type}  trimmed={n_curves}  raw={n_raw}")
-        color = CURVE_TYPE_COLORS.get(curve_type, [0.8, 0.8, 0.8])
+              f"  type={curve_type}  method={method}  trimmed={n_curves}  raw={n_raw}")
+        # OCC curves: color by curve type; mesh curves: magenta
+        if method == "mesh":
+            color = [1.0, 0.0, 0.8]  # magenta for mesh-derived curves
+        else:
+            color = CURVE_TYPE_COLORS.get(curve_type, [0.8, 0.8, 0.8])
         for k in range(n_curves):
-            trimmed_linesets.append(_lineset(d[f"curve_points_{k}"], color))
+            pts = _clip_to_bbox(d[f"curve_points_{k}"])
+            if pts is not None:
+                trimmed_linesets.append(_lineset(pts, color))
         for k in range(n_raw):
-            untrimmed_linesets.append(_lineset(d[f"untrimmed_curve_points_{k}"], color))
+            pts = _clip_to_bbox(d[f"untrimmed_curve_points_{k}"])
+            if pts is not None:
+                untrimmed_linesets.append(_lineset(pts, color))
         # Raw polylines from mesh intersections (cyan)
         n_polys = int(d["n_polylines"]) if "n_polylines" in d else 0
         for k in range(n_polys):
@@ -538,7 +584,7 @@ def run_compute(args):
         print_edge_arcs_summary,
         face_arc_incidence, print_face_arcs_summary,
         assemble_wires, print_face_wires_summary,
-        build_brep_shape, build_brep_shape_bop, export_step, merge_step_files,
+        build_brep_shape, export_step, merge_step_files,
         apply_inverse_normalization,
     )
     import point2cad.primitive_fitting_utils as pfu
@@ -625,27 +671,21 @@ def run_compute(args):
             print(f"[surface fitter] Cluster {cid} ({c_count} pts) fitting ...")
             # Mesh pathway: pass per-cluster spacing so grid_trimming
             # uses the same threshold as adjacency detection.
-            if args.intersection_method == "mesh":
-                _spacing = cluster_nn_percentiles[idx]
-                _plane_kw    = {"mesh_dim": 100, "plane_sampling_deviation": 0.5,
-                                "spacing": _spacing,
-                                "threshold_multiplier": 5}
-                _sphere_kw   = {"dim_theta": 100, "dim_lambda": 100,
-                                "spacing": _spacing,
-                                "threshold_multiplier": 5}
-                _cylinder_kw = {"dim_theta": 200, "dim_height": 50,
-                                "cylinder_height_margin": 0.5,
-                                "spacing": _spacing,
-                                "threshold_multiplier": 0.5}
-                _cone_kw     = {"dim_theta": 100, "dim_height": 100,
-                                "cone_height_margin": 0.5,
-                                "spacing": _spacing,
-                                "threshold_multiplier": 5}
-            else:
-                _plane_kw    = None
-                _sphere_kw   = None
-                _cylinder_kw = None
-                _cone_kw     = None
+            _spacing = cluster_nn_percentiles[idx]
+            _plane_kw    = {"mesh_dim": 100, "plane_sampling_deviation": 0.5,
+                            "spacing": _spacing,
+                            "threshold_multiplier": 5}
+            _sphere_kw   = {"dim_theta": 100, "dim_lambda": 100,
+                            "spacing": _spacing,
+                            "threshold_multiplier": 5}
+            _cylinder_kw = {"dim_theta": 100, "dim_height": 50,
+                            "cylinder_height_margin": 0.5,
+                            "spacing": _spacing,
+                            "threshold_multiplier": 5}
+            _cone_kw     = {"dim_theta": 100, "dim_height": 100,
+                            "cone_height_margin": 0.5,
+                            "spacing": _spacing,
+                            "threshold_multiplier": 5}
 
             res = fit_surface(
                 cluster,
@@ -667,6 +707,8 @@ def run_compute(args):
                 sphere_mesh_kwargs=_sphere_kw,
                 cylinder_mesh_kwargs=_cylinder_kw,
                 cone_mesh_kwargs=_cone_kw,
+                radius_inflation=0,
+                angle_inflation_deg=0,
             )
             sid = res["surface_id"]
             surface_ids.append(sid)
@@ -759,121 +801,77 @@ def run_compute(args):
         # Surface-surface intersection + trimming
         # ------------------------------------------------------------------
         cluster_bboxes = None
+        polyline_map = {}  # only populated by mesh method
 
+        # ------------------------------------------------------------------
+        # Compute raw intersection curves
+        # ------------------------------------------------------------------
         if args.intersection_method == "mesh":
-            # ---- Mesh pathway ----
             raw_intersections, polyline_map = compute_mesh_intersections(
                 inter_adj, surface_ids, fit_results, fit_meshes,
             )
-            # Vertex detection via IntCS (curve ∩ surface)
-            vertices, vertex_edges = compute_vertices_intcs(
-                inter_adj, raw_intersections, occ_surfaces=occ_surfs,
-                threshold=threshold_vertex,
-            )
-            print(f"[vertices] found {len(vertices)} vertices (IntCS)")
-
-            # Score-cap filter: remove vertices too far from their clusters.
-            vertex_scores = []
-            for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
-                involved = set()
-                for edge in edges:
-                    involved.update(edge)
-                score = _score_vertex(vpos, involved, cluster_trees,
-                                      cluster_nn_percentiles)
-                vertex_scores.append(score)
-
-            score_cap = args.score_cap
-            scores_arr = np.array(vertex_scores)
-
-            sorted_indices = np.argsort(scores_arr)
-            print(f"[vertex scores] {len(scores_arr)} vertices, "
-                  f"range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, "
-                  f"{0 if scores_arr.size == 0 else scores_arr.max():.4f}]")
-            for rank, idx in enumerate(sorted_indices):
-                edges_str = " ".join(
-                    f"({min(e)}, {max(e)})" for e in vertex_edges[idx])
-                print(f"  v{idx:3d}  score={scores_arr[idx]:10.4f}  "
-                      f"edges=[{edges_str}]")
-
-            keep_v = scores_arr <= score_cap
-            n_drop = int(np.sum(~keep_v))
-            n_keep = int(np.sum(keep_v))
-            if n_drop > 0 and n_keep >= 2:
-                print(f"[score-cap filter] threshold: {score_cap:.2f}  "
-                      f"keeping {n_keep}, dropping {n_drop}/{len(scores_arr)} vertices")
-                vertices = vertices[keep_v]
-                vertex_edges = [vertex_edges[i]
-                                for i in range(len(keep_v)) if keep_v[i]]
-            else:
-                print(f"[score-cap filter] threshold {score_cap:.2f} "
-                      f"would keep {n_keep} / drop {n_drop} — skipping")
-            print(f"[score-cap filter] after filter: {len(vertices)} vertices")
         else:
-            # ---- Analytical pathway (OCC) ----
+            # Analytical pathway (OCC)
             raw_intersections = compute_all_intersections(
                 inter_adj, surface_ids, fit_results, occ_surfs,
             )
-            # Vertex-first flow:
-            #   1. Find vertices on raw (untrimmed) curves — NMS is built into
-            #      compute_vertices so the result is already deduplicated.
-            #   2. Drop vertices too far from their constituent clusters
-            #      (spurious intersections outside the physical model).
-            #   3. Trim open curves using the surviving vertex parameters.
-            vertices, vertex_edges = compute_vertices_intcs(
-                inter_adj, raw_intersections, occ_surfaces=occ_surfs,
-                threshold=threshold_vertex,
-            )
-            print(f"[vertices] found {len(vertices)} raw vertices")
 
-            # Score-cap vertex pre-filter: remove vertices whose fitness score
-            # exceeds a threshold.  The score d/p is already scale-invariant
-            # (NN distance normalised by intra-cluster spacing), so the cap
-            # has a physical meaning: score <= N means "within Nx the cluster's
-            # own point spacing".
-            vertex_scores = []
-            for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
-                involved = set()
-                for edge in edges:
-                    involved.update(edge)
-                score = _score_vertex(vpos, involved, cluster_trees,
-                                      cluster_nn_percentiles)
-                vertex_scores.append(score)
+        # ------------------------------------------------------------------
+        # Vertex detection (shared by all methods)
+        # ------------------------------------------------------------------
+        vertices, vertex_edges = compute_vertices_intcs(
+            inter_adj, raw_intersections, occ_surfaces=occ_surfs,
+            threshold=threshold_vertex,
+        )
+        print(f"[vertices] found {len(vertices)} vertices (IntCS)")
 
-            score_cap = args.score_cap
-            scores_arr = np.array(vertex_scores)
+        # Score-cap filter: remove vertices too far from their clusters.
+        vertex_scores = []
+        for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
+            involved = set()
+            for edge in edges:
+                involved.update(edge)
+            score = _score_vertex(vpos, involved, cluster_trees,
+                                  cluster_nn_percentiles)
+            vertex_scores.append(score)
 
-            # Log all vertex scores sorted for analysis
-            sorted_indices = np.argsort(scores_arr)
-            print(f"[vertex scores] {len(scores_arr)} vertices, "
-                  f"range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, {0 if scores_arr.size == 0 else scores_arr.max():.4f}]")
-            for rank, idx in enumerate(sorted_indices):
-                edges_str = " ".join(
-                    f"({min(e)}, {max(e)})" for e in vertex_edges[idx])
-                print(f"  v{idx:3d}  score={scores_arr[idx]:10.4f}  "
-                      f"edges=[{edges_str}]")
+        score_cap = args.score_cap
+        scores_arr = np.array(vertex_scores)
 
-            keep_v = scores_arr <= score_cap
-            n_drop = int(np.sum(~keep_v))
-            n_keep = int(np.sum(keep_v))
-            if n_drop > 0 and n_keep >= 2:
-                print(f"[score-cap filter] threshold: {score_cap:.2f}  "
-                      f"keeping {n_keep}, dropping {n_drop}/{len(scores_arr)} vertices")
-                vertices = vertices[keep_v]
-                vertex_edges = [vertex_edges[i]
-                                for i in range(len(keep_v)) if keep_v[i]]
-            else:
-                print(f"[score-cap filter] threshold {score_cap:.2f} "
-                      f"would keep {n_keep} / drop {n_drop} — skipping")
-            print(f"[score-cap filter] after filter: {len(vertices)} vertices")
+        sorted_indices = np.argsort(scores_arr)
+        print(f"[vertex scores] {len(scores_arr)} vertices, "
+              f"range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, "
+              f"{0 if scores_arr.size == 0 else scores_arr.max():.4f}]")
+        for rank, idx in enumerate(sorted_indices):
+            edges_str = " ".join(
+                f"({min(e)}, {max(e)})" for e in vertex_edges[idx])
+            print(f"  v{idx:3d}  score={scores_arr[idx]:10.4f}  "
+                  f"edges=[{edges_str}]")
 
+        keep_v = scores_arr <= score_cap
+        n_drop = int(np.sum(~keep_v))
+        n_keep = int(np.sum(keep_v))
+        if n_drop > 0 and n_keep >= 2:
+            print(f"[score-cap filter] threshold: {score_cap:.2f}  "
+                  f"keeping {n_keep}, dropping {n_drop}/{len(scores_arr)} vertices")
+            vertices = vertices[keep_v]
+            vertex_edges = [vertex_edges[i]
+                            for i in range(len(keep_v)) if keep_v[i]]
+        else:
+            print(f"[score-cap filter] threshold {score_cap:.2f} "
+                  f"would keep {n_keep} / drop {n_drop} — skipping")
+        print(f"[score-cap filter] after filter: {len(vertices)} vertices")
+
+        # ------------------------------------------------------------------
+        # Trimming
+        # ------------------------------------------------------------------
+        if args.intersection_method == "mesh":
+            trim_intersections_ = raw_intersections  # no separate trimming step
+        else:
             trim_intersections_ = trim_by_vertices(
                 raw_intersections, vertices, vertex_edges,
                 extension_factor=0.05,
             )
-
-        # Sample curves to numpy for the visualizer (no OCC on host).
-        if args.intersection_method == "mesh":
-            trim_intersections_ = raw_intersections  # no separate trimming step
         for (i, j) in raw_intersections:
             inter_raw  = raw_intersections[(i, j)]
             inter_trim = trim_intersections_[(i, j)]
@@ -908,18 +906,21 @@ def run_compute(args):
                       f"  endpoint_dist={endpoint_dist:.6e}")
                 kw[f"curve_points_{k}"] = _denorm(
                     sample_curve(curve, n_points=200), part_mean, part_R, part_scale)
+            # Save raw curves, skipping infinite ones (they distort the visualizer).
+            raw_saved = 0
             for k, curve in enumerate(inter_raw["curves"]):
                 t0_raw, t1_raw = curve.FirstParameter(), curve.LastParameter()
                 if abs(t0_raw) > 1e50 or abs(t1_raw) > 1e50:
-                    bounds_str = "[infinite]"
-                else:
-                    bounds_str = f"[{t0_raw:.6f}, {t1_raw:.6f}]"
-                print(f"  raw      curve[{k}] {bounds_str}")
-                kw[f"untrimmed_curve_points_{k}"] = _denorm(
-                    sample_curve(curve, n_points=200, line_extent=1.0),
+                    print(f"  raw      curve[{k}] [infinite] — skipped")
+                    continue
+                print(f"  raw      curve[{k}] [{t0_raw:.6f}, {t1_raw:.6f}]")
+                kw[f"untrimmed_curve_points_{raw_saved}"] = _denorm(
+                    sample_curve(curve, n_points=200),
                     part_mean, part_R, part_scale)
-            # Save raw polylines (mesh pathway only)
-            if args.intersection_method == "mesh":
+                raw_saved += 1
+            kw["n_untrimmed_curves"] = raw_saved
+            # Save raw polylines (mesh pathway)
+            if polyline_map:
                 polys = polyline_map.get((i, j), [])
                 kw["n_polylines"] = len(polys)
                 for k, poly in enumerate(polys):
@@ -993,18 +994,6 @@ def run_compute(args):
                 shape_world = shape
             export_step(shape_world, step_path)
 
-        # ------------------------------------------------------------------
-        # Step 4b: BRep assembly — BOPAlgo_MakerVolume with cluster UV bounds
-        # ------------------------------------------------------------------
-        step_path_bop = os.path.join(out_dir, f"{step_stem}_bop.step")
-        #shape_bop = build_brep_shape_bop(
-        #    occ_surfs, vertices, vertex_edges, face_arcs,
-        #    surface_ids=surface_ids,
-        #    tolerance=1e-3, rel_margin=0.5,
-        #)
-        #if shape_bop is not None:
-        #    export_step(apply_inverse_normalization(shape_bop, part_mean, part_R, part_scale),
-        #                step_path_bop)
         print(f"\n[part] all results saved to {out_dir}/")
 
         if args.model_id:
@@ -1019,19 +1008,10 @@ def run_compute(args):
             os.path.join(d, f"{os.path.basename(d)}.step")
             for d, _, _ in part_dirs
         ]
-        bop_paths = [
-            os.path.join(d, f"{os.path.basename(d)}_bop.step")
-            for d, _, _ in part_dirs
-        ]
         merge_step_files(
             [p for p in manual_paths if os.path.exists(p)],
             os.path.join(unified_dir, "unified.step"),
         )
-        #merge_step_files(
-        #    [p for p in bop_paths if os.path.exists(p)],
-        #    os.path.join(unified_dir, "unified_bop.step"),
-        #)
-        #print(f"\nUnified results saved to {unified_dir}/")
 
 
 # ---------------------------------------------------------------------------

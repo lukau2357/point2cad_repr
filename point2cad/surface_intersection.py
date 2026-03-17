@@ -427,33 +427,27 @@ def intersect_surfaces(surface_id_i, result_i, occ_surf_i,
     # Plane ∩ Cylinder: try OCC first (handles circle / ellipse correctly);
     # fall back to analytical tangent-line if OCC returns empty.
     # TODO: add plane ∩ cone tangent fallback when needed.
-    if si == SURFACE_PLANE and sj == SURFACE_CYLINDER:
-        # Always check the analytical tangent condition first.
-        # OCC sometimes returns a degenerate ellipse for near-tangent cases
-        # (plane barely secant to cylinder, δ ≈ r) instead of returning empty.
-        tangent = _intersect_plane_cylinder_tangent(pi, pj)
-        if tangent["type"] != "empty":
-            return tangent
-        occ = _intersect_occ(oi, oj, tol, label=label)
-        if occ["type"] == "empty":
-            return _intersect_plane_cylinder_tangent(pi, pj)
-        return occ
+    # if si == SURFACE_PLANE and sj == SURFACE_CYLINDER:
+    #     occ = _intersect_occ(oi, oj, tol, label=label)
+    #     if occ["type"] == "empty":
+    #         return _intersect_plane_cylinder_tangent(pi, pj)
+    #     return occ
 
-    # Cylinder ∩ Cylinder: try OCC first; fall back to analytical parallel-
-    # axis formula if OCC fails (IsDone=False) or returns empty.
-    if si == SURFACE_CYLINDER and sj == SURFACE_CYLINDER:
-        occ = _intersect_occ(oi, oj, tol, label=label)
-        if occ["type"] in ("failed", "empty"):
-            analytical = _intersect_cylinder_cylinder_parallel(pi, pj)
-            if analytical is not None and analytical["type"] != "empty":
-                if label:
-                    for c in analytical["curves"]:
-                        t0, t1 = c.FirstParameter(), c.LastParameter()
-                        t0s = f"{t0:.4g}" if abs(t0) < _OCC_INF else "-inf"
-                        t1s = f"{t1:.4g}" if abs(t1) < _OCC_INF else "+inf"
-                        print(f"  [intersect] {label}: Line (analytical)  t=[{t0s}, {t1s}]")
-                return analytical
-        return occ
+    # # Cylinder ∩ Cylinder: try OCC first; fall back to analytical parallel-
+    # # axis formula if OCC fails (IsDone=False) or returns empty.
+    # if si == SURFACE_CYLINDER and sj == SURFACE_CYLINDER:
+    #     occ = _intersect_occ(oi, oj, tol, label=label)
+    #     if occ["type"] in ("failed", "empty"):
+    #         analytical = _intersect_cylinder_cylinder_parallel(pi, pj)
+    #         if analytical is not None and analytical["type"] != "empty":
+    #             if label:
+    #                 for c in analytical["curves"]:
+    #                     t0, t1 = c.FirstParameter(), c.LastParameter()
+    #                     t0s = f"{t0:.4g}" if abs(t0) < _OCC_INF else "-inf"
+    #                     t1s = f"{t1:.4g}" if abs(t1) < _OCC_INF else "+inf"
+    #                     print(f"  [intersect] {label}: Line (analytical)  t=[{t0s}, {t1s}]")
+    #             return analytical
+    #     return occ
 
     return _intersect_occ(oi, oj, tol, label=label)
 

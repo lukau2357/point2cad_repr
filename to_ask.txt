@@ -33,3 +33,7 @@
     "Invalid tolerance values". Try to catch these cases?
   - 00000121 (default, default). Good showcase of the algorithm for tomorrow's presentation.
 
+------------------------------
+Experiments:
+- Inflation after grid trimming, try to replace grid trimming with triangle-level filtering on a mesh.
+- OCC as main engine, fallback to mesh intersection if it fails. How to merge multiple close mesh polylines into a single curve?

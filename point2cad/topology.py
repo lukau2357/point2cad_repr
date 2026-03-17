@@ -52,7 +52,7 @@ try:
     from OCC.Core.STEPControl    import (STEPControl_Writer, STEPControl_AsIs,
                                           STEPControl_Reader)
     from OCC.Core.IFSelect       import IFSelect_RetDone
-    from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume
+    from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume, BOPAlgo_Builder, BOPAlgo_GlueFull
     from OCC.Core.BRepCheck      import BRepCheck_Analyzer
     from OCC.Core.Message        import Message_ProgressRange
     OCC_AVAILABLE = True
@@ -1610,110 +1610,179 @@ def _uv_bounds_from_3d_points(surface, points_3d, rel_margin=1.0):
     return umin_out, umax_out, vmin_out, vmax_out
 
 
-def build_brep_shape_bop(occ_surfaces, vertices, vertex_edges, face_arcs,
-                          surface_ids=None,
-                          tolerance=1e-3, rel_margin=0.05,
-                          curve_samples=100):
+def _project_to_uv(surface, pts_3d):
+    """Project 3D points onto surface, return (N,2) UV array and mask of successful projections."""
+    uv = []
+    ok = []
+    # step = max(1, len(pts_3d) // 500)  # subsample for speed
+    for pt in pts_3d:
+        pnt = gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2]))
+        try:
+            proj = GeomAPI_ProjectPointOnSurf(pnt, surface)
+            if proj.NbPoints() > 0:
+                u, v = proj.LowerDistanceParameters()
+                uv.append([u, v])
+                ok.append(True)
+            else:
+                ok.append(False)
+        except Exception:
+            ok.append(False)
+    if not uv:
+        return None
+    return np.array(uv, dtype=np.float64)
+
+
+def _alpha_shape_boundary(uv_pts, alpha=0.0):
     """
-    Build a TopoDS_Shape using BOPAlgo_MakerVolume.
+    Compute the boundary polygon of a 2D point set using alpha shapes.
 
-    Face patch UV bounds are determined from the intersection geometry:
+    alpha=0 uses the convex hull.  alpha>0 uses Delaunay triangulation
+    filtered by circumradius < 1/alpha, giving a concave boundary.
 
-      1. **Vertices exist** for the face: project incident vertices onto the
-         surface → UV bounding box (cheapest, most precise).
-      2. **No vertices, but closed curves** on the face: sample points along
-         incident closed curves → UV bounding box.
-      3. **Geom_BSplineSurface**: uses the natural UV domain.
+    Returns an ordered (M,2) array of boundary UV points, or None on failure.
+    """
+    from scipy.spatial import Delaunay, ConvexHull
 
-    UV bounds are clipped to surface.Bounds() to prevent wrapping past
-    periodic boundaries.
+    if len(uv_pts) < 3:
+        return None
+
+    if alpha <= 0:
+        try:
+            hull = ConvexHull(uv_pts)
+            return uv_pts[hull.vertices]
+        except Exception:
+            return None
+
+    try:
+        tri = Delaunay(uv_pts)
+    except Exception:
+        return None
+
+    # Filter triangles by circumradius
+    from collections import defaultdict
+    edge_count = defaultdict(int)
+
+    for simplex in tri.simplices:
+        a, b, c = uv_pts[simplex[0]], uv_pts[simplex[1]], uv_pts[simplex[2]]
+        # Circumradius
+        ab = np.linalg.norm(b - a)
+        bc = np.linalg.norm(c - b)
+        ca = np.linalg.norm(a - c)
+        s = (ab + bc + ca) / 2.0
+        area = max(s * (s - ab) * (s - bc) * (s - ca), 0.0) ** 0.5
+        if area < 1e-15:
+            continue
+        circum_r = (ab * bc * ca) / (4.0 * area)
+        if circum_r < 1.0 / alpha:
+            for e in [(simplex[0], simplex[1]),
+                      (simplex[1], simplex[2]),
+                      (simplex[2], simplex[0])]:
+                edge = tuple(sorted(e))
+                edge_count[edge] += 1
+
+    # Boundary edges appear exactly once
+    boundary_edges = [e for e, cnt in edge_count.items() if cnt == 1]
+    if not boundary_edges:
+        return None
+
+    # Order boundary edges into a polygon
+    from collections import deque
+    adj = defaultdict(list)
+    for a, b in boundary_edges:
+        adj[a].append(b)
+        adj[b].append(a)
+
+    # Walk the boundary
+    start = boundary_edges[0][0]
+    ordered = [start]
+    visited = {start}
+    current = start
+    while True:
+        nexts = [n for n in adj[current] if n not in visited]
+        if not nexts:
+            break
+        current = nexts[0]
+        ordered.append(current)
+        visited.add(current)
+
+    if len(ordered) < 3:
+        return None
+
+    return uv_pts[np.array(ordered)]
+
+
+def build_brep_shape_bop(occ_surfaces, clusters, surface_ids=None,
+                          tolerance=1e-3, alpha=0.0):
+    """
+    Build a TopoDS_Shape by creating faces bounded by cluster UV boundaries.
+
+    For each fitted surface, project cluster points into UV space, compute
+    the boundary polygon (convex hull or alpha shape), map boundary UV points
+    back to 3D, and build an OCC wire + face.
 
     Parameters
     ----------
     occ_surfaces   : list[Geom_Surface or None]
-    vertices       : np.ndarray (M, 3)
-    vertex_edges   : list[set]
-    face_arcs      : dict i -> list[arc_dict]
+    clusters       : list[np.ndarray (N_i, 3)]  — cluster point clouds
     surface_ids    : list[int] or None
     tolerance      : float
-    rel_margin     : float — relative UV margin (default 5%)
-    curve_samples  : int — samples per closed curve for fallback UV bounds
+    alpha          : float — alpha shape parameter (0 = convex hull)
     """
     n = len(occ_surfaces)
-
-    # Per-face incident vertices from surviving arcs.
-    face_vertex_positions = {}
-    for face_idx, arcs in face_arcs.items():
-        vset = set()
-        for arc in arcs:
-            if arc.get("v_start") is not None:
-                vset.add(arc["v_start"])
-            if arc.get("v_end") is not None:
-                vset.add(arc["v_end"])
-        if vset:
-            face_vertex_positions[face_idx] = [vertices[v] for v in vset]
 
     occ_faces = []
     for i in range(n):
         surface = occ_surfaces[i]
         if surface is None:
             continue
+        if i >= len(clusters) or len(clusters[i]) == 0:
+            print(f"[bop] face {i}: no cluster points — skipping")
+            continue
 
         dtype = surface.DynamicType().Name()
-        face = None
         try:
-            # Tier 1: incident vertices.
-            vpos_list = face_vertex_positions.get(i)
-            if vpos_list:
-                bounds = _uv_bounds_from_3d_points(
-                    surface, np.array(vpos_list), rel_margin=rel_margin
-                )
-                if bounds is not None:
-                    umin, umax, vmin, vmax = bounds
-                    fm = BRepBuilderAPI_MakeFace(surface, umin, umax,
-                                                 vmin, vmax, tolerance)
-                    if fm.IsDone():
-                        face = fm.Face()
-                        print(f"[bop] face {i}: UV from {len(vpos_list)} "
-                              f"vertices [{umin:.3f},{umax:.3f}]×"
-                              f"[{vmin:.3f},{vmax:.3f}]")
+            # Project cluster points to UV
+            uv = _project_to_uv(surface, clusters[i])
+            if uv is None or len(uv) < 3:
+                print(f"[bop] face {i} ({dtype}): UV projection failed — skipping")
+                continue
 
-            # Tier 2: sample closed curves.
-            if face is None:
-                arcs = face_arcs.get(i, [])
-                sample_pts = []
-                for arc in arcs:
-                    if not arc.get("closed", False):
-                        continue
-                    t0, t1 = arc["t_start"], arc["t_end"]
-                    for k in range(curve_samples):
-                        t = t0 + (t1 - t0) * k / max(curve_samples - 1, 1)
-                        try:
-                            p = arc["curve"].Value(t)
-                            sample_pts.append([p.X(), p.Y(), p.Z()])
-                        except Exception:
-                            pass
-                if sample_pts:
-                    bounds = _uv_bounds_from_3d_points(
-                        surface, np.array(sample_pts),
-                        rel_margin=rel_margin
-                    )
-                    if bounds is not None:
-                        umin, umax, vmin, vmax = bounds
-                        fm = BRepBuilderAPI_MakeFace(
-                            surface, umin, umax, vmin, vmax, tolerance
-                        )
-                        if fm.IsDone():
-                            face = fm.Face()
-                            print(f"[bop] face {i}: UV from "
-                                  f"{len(sample_pts)} curve samples "
-                                  f"[{umin:.3f},{umax:.3f}]×"
-                                  f"[{vmin:.3f},{vmax:.3f}]")
+            # Compute boundary polygon in UV
+            boundary_uv = _alpha_shape_boundary(uv, alpha=alpha)
+            if boundary_uv is None or len(boundary_uv) < 3:
+                print(f"[bop] face {i} ({dtype}): boundary extraction failed — skipping")
+                continue
 
-            if face is not None:
-                occ_faces.append(face)
-            else:
-                print(f"[bop] face {i}: could not build patch — skipping")
+            # Map boundary UV points back to 3D via surface.Value()
+            boundary_3d = []
+            for u, v in boundary_uv:
+                p = surface.Value(float(u), float(v))
+                boundary_3d.append(gp_Pnt(p.X(), p.Y(), p.Z()))
+
+            # Build wire from boundary polygon
+            wire_builder = BRepBuilderAPI_MakeWire()
+            for k in range(len(boundary_3d)):
+                p0 = boundary_3d[k]
+                p1 = boundary_3d[(k + 1) % len(boundary_3d)]
+                edge = BRepBuilderAPI_MakeEdge(p0, p1).Edge()
+                wire_builder.Add(edge)
+
+            if not wire_builder.IsDone():
+                print(f"[bop] face {i} ({dtype}): wire construction failed")
+                continue
+            wire = wire_builder.Wire()
+
+            # Build face: analytical surface bounded by wire
+            face_maker = BRepBuilderAPI_MakeFace(surface, wire)
+            if not face_maker.IsDone():
+                print(f"[bop] face {i} ({dtype}): MakeFace failed "
+                      f"(error {face_maker.Error()})")
+                continue
+
+            occ_faces.append(face_maker.Face())
+            print(f"[bop] face {i} ({dtype}): {len(boundary_uv)} boundary pts "
+                  f"({len(clusters[i])} cluster pts)")
+
         except Exception as exc:
             print(f"[bop] face {i} ({dtype}): exception: {exc}")
 
@@ -1721,23 +1790,40 @@ def build_brep_shape_bop(occ_surfaces, vertices, vertex_edges, face_arcs,
         print("[bop] no faces built — aborting")
         return None
 
-    print(f"[bop] built {len(occ_faces)} face patches, "
-          f"running BOPAlgo_MakerVolume ...")
-    mv = BOPAlgo_MakerVolume()
-    mv.SetIntersect(True)
+    # Sew faces together
+    print(f"[bop] sewing {len(occ_faces)} faces ...")
+    sewing = BRepBuilderAPI_Sewing(tolerance)
     for face in occ_faces:
-        mv.AddArgument(face)
-    mv.Perform()
+        sewing.Add(face)
+    sewing.Perform()
+    shape = sewing.SewedShape()
 
-    if mv.HasErrors():
-        print("[bop] BOPAlgo_MakerVolume reported errors")
+    if shape is None or shape.IsNull():
+        print("[bop] sewing produced no shape")
         return None
 
-    shape = mv.Shape()
+    # Heal
+    try:
+        breplib.BuildCurves3d(shape)
+    except Exception:
+        pass
+    fixer = ShapeFix_Shape(shape)
+    fixer.SetPrecision(tolerance)
+    fixer.Perform()
+    shape = fixer.Shape()
+
+    # Count output faces
+    n_output = 0
+    fexp = TopExp_Explorer(shape, TopAbs_FACE)
+    while fexp.More():
+        n_output += 1
+        fexp.Next()
+
     analyzer = BRepCheck_Analyzer(shape)
-    eval_result = analyzer.IsValid()
-    print(f"[bop] BRep correctness: {eval_result}")
-    print(f"[bop] MakerVolume done — shape type: {shape.ShapeType()}")
+    valid = analyzer.IsValid()
+    print(f"[bop] BRep correctness: {valid}")
+    print(f"[bop] done — {n_output} faces, "
+          f"shape type: {shape.ShapeType()}")
     return shape
 
 
