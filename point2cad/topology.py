@@ -29,14 +29,12 @@ import numpy as np
 
 try:
     from OCC.Core.Geom           import Geom_TrimmedCurve
-    from OCC.Core.Geom2dAPI      import Geom2dAPI_PointsToBSpline
     from OCC.Core.GeomAPI        import GeomAPI_ProjectPointOnCurve, GeomAPI_ProjectPointOnSurf
     from OCC.Core.GeomLProp      import GeomLProp_SLProps
-    from OCC.Core.gp             import gp_Pnt, gp_Pnt2d, gp_GTrsf
-    from OCC.Core.TColgp         import TColgp_Array1OfPnt2d
+    from OCC.Core.gp             import gp_Pnt, gp_GTrsf
     from OCC.Core.BRep           import BRep_Builder, BRep_Tool
     from OCC.Core.TopExp         import TopExp_Explorer
-    from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_SHELL, TopAbs_SOLID
+    from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_WIRE, TopAbs_SHELL, TopAbs_SOLID
     from OCC.Core.TopoDS         import topods, TopoDS_Wire, TopoDS_Compound
     from OCC.Core.BRepBuilderAPI import (
         BRepBuilderAPI_MakeVertex,
@@ -47,13 +45,14 @@ try:
         BRepBuilderAPI_Sewing,
         BRepBuilderAPI_GTransform,
     )
-    from OCC.Core.ShapeFix       import ShapeFix_Wire, ShapeFix_Shape
+    from OCC.Core.ShapeFix       import ShapeFix_Wire, ShapeFix_Shape, ShapeFix_Shell
     from OCC.Core.BRepLib        import breplib
     from OCC.Core.STEPControl    import (STEPControl_Writer, STEPControl_AsIs,
                                           STEPControl_Reader)
     from OCC.Core.IFSelect       import IFSelect_RetDone
-    from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume, BOPAlgo_Builder, BOPAlgo_GlueFull
-    from OCC.Core.BRepCheck      import BRepCheck_Analyzer
+    from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume, BOPAlgo_Builder, BOPAlgo_GlueFull, BOPAlgo_BuilderFace
+    from OCC.Core.TopTools       import TopTools_ListOfShape
+    from OCC.Core.BRepCheck      import BRepCheck_Analyzer, BRepCheck_NoError
     from OCC.Core.Message        import Message_ProgressRange
     OCC_AVAILABLE = True
 except ImportError:
@@ -67,6 +66,106 @@ except ImportError:
 # Geometric closure tolerance — endpoint distance below this means the curve
 # is a closed loop (e.g. cylinder-plane circle gives ~1e-17, lines give ~1e-1).
 CLOSURE_TOL = 1e-4
+
+
+_BREP_CHECK_STATUS_NAMES = {
+    0: "NoError",
+    1: "InvalidPointOnCurve",
+    2: "InvalidPointOnCurveOnSurface",
+    3: "InvalidPointOnSurface",
+    4: "No3DCurve",
+    5: "Multiple3DCurve",
+    6: "Invalid3DCurve",
+    7: "NoCurveOnSurface",
+    8: "InvalidCurveOnSurface",
+    9: "InvalidCurveOnClosedSurface",
+    10: "InvalidSameRangeFlag",
+    11: "InvalidSameParameterFlag",
+    12: "InvalidDegeneratedFlag",
+    13: "FreeEdge",
+    14: "InvalidMultiConnexity",
+    15: "InvalidRange",
+    16: "EmptyWire",
+    17: "RedundantEdge",
+    18: "SelfIntersectingWire",
+    19: "NoSurface",
+    20: "InvalidWire",
+    21: "RedundantWire",
+    22: "IntersectingWires",
+    23: "InvalidImbricationOfWires",
+    24: "EmptyShell",
+    25: "RedundantFace",
+    26: "InvalidToleranceValue",
+    27: "UnorientableShape",
+    28: "NotClosed",
+    29: "NotConnected",
+    30: "SubshapeNotInShape",
+    31: "BadOrientation",
+    32: "BadOrientationOfSubshape",
+    33: "InvalidPolygonOnTriangulation",
+    34: "InvalidToleranceValue",
+    35: "EnclosedRegion",
+    36: "CheckFail",
+}
+
+
+def _status_name(code):
+    """Human-readable name for a BRepCheck status code."""
+    if isinstance(code, int):
+        return _BREP_CHECK_STATUS_NAMES.get(code, f"Unknown({code})")
+    # pythonocc enum object — try .value or str
+    try:
+        val = int(code)
+        return _BREP_CHECK_STATUS_NAMES.get(val, f"Unknown({val})")
+    except (TypeError, ValueError):
+        return str(code)
+
+
+def _print_brep_check_details(analyzer, shape):
+    """Print per-sub-shape BRepCheck errors when the analyzer reports invalid."""
+    _shape_type_names = {
+        TopAbs_VERTEX: "Vertex", TopAbs_EDGE: "Edge", TopAbs_WIRE: "Wire",
+        TopAbs_FACE: "Face", TopAbs_SHELL: "Shell", TopAbs_SOLID: "Solid",
+    }
+    for stype in (TopAbs_VERTEX, TopAbs_EDGE, TopAbs_WIRE,
+                  TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID):
+        exp = TopExp_Explorer(shape, stype)
+        idx = 0
+        while exp.More():
+            sub = exp.Current()
+            try:
+                result = analyzer.Result(sub)
+                if result is None:
+                    idx += 1
+                    exp.Next()
+                    continue
+                status_list = result.Status()
+                errors = []
+                # Try list-style iteration (works across pythonocc versions)
+                try:
+                    it = status_list.begin()
+                    end = status_list.end()
+                    while it != end:
+                        s = it.Value()
+                        if s != BRepCheck_NoError:
+                            errors.append(_status_name(s))
+                        it.Next()
+                except (AttributeError, TypeError):
+                    # Fallback: try Python-style iteration
+                    try:
+                        for s in status_list:
+                            if s != BRepCheck_NoError:
+                                errors.append(_status_name(s))
+                    except TypeError:
+                        errors.append("(could not iterate status list)")
+                if errors:
+                    name = _shape_type_names.get(stype, str(stype))
+                    print(f"  [BRepCheck] {name} {idx}: {errors}")
+            except Exception as exc:
+                name = _shape_type_names.get(stype, str(stype))
+                print(f"  [BRepCheck] {name} {idx}: error reading status: {exc}")
+            idx += 1
+            exp.Next()
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +241,7 @@ def _project_vertex_on_curve(vertex_pos, curve, t_min, t_max):
 
 def _pnt_to_np(pnt):
     return np.array([pnt.X(), pnt.Y(), pnt.Z()], dtype=np.float64)
+
 
 # ---------------------------------------------------------------------------
 # Main function
@@ -495,8 +595,8 @@ def _apply_removals(edge_arcs, vertices, vertex_edges, removed_vertices,
 def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
                          clusters, cluster_trees, cluster_nn_percentiles,
                          occ_surfaces, surface_ids=None,
-                         bspline_method="uv_bounds", tolerance=1e-3,
-                         cluster_bboxes=None):
+                         tolerance=1e-3,
+                         cluster_bboxes=None, wire_method="manual"):
     """
     Greedy worst-first removal guided by OCC BRepCheck_Analyzer.
 
@@ -520,7 +620,6 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     occ_surfaces : list[Geom_Surface]
         OCC surfaces for BRep construction.
     surface_ids : list[int] or None
-    bspline_method : str
     tolerance : float
     cluster_bboxes : unused, kept for call-site compatibility
 
@@ -588,33 +687,49 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
 
         Validity requires BOTH:
           - All face wire graphs are Eulerian (necessary for complete wires)
+            (skipped when wire_method="builderface" — BuilderFace handles
+            non-Eulerian graphs gracefully)
           - BRepCheck_Analyzer returns True (geometric correctness)
         """
         ea, verts, ve = _apply_removals(edge_arcs, vertices, vertex_edges,
                                         removed_v, removed_a)
-        # Fast Euler pre-check — if any face is non-Eulerian, wire assembly
-        # will skip it, producing an incomplete (thus invalid) model.
-        bad_faces = _non_eulerian_faces_direct(ea)
-        if bad_faces:
-            return False, None, {"valid": False, "n_faces": 0,
-                                 "n_input_faces": 0,
-                                 "non_eulerian": sorted(bad_faces)}, ea, verts, ve
-        fa = face_arc_incidence(ea)
-        fw = assemble_wires(fa, occ_surfaces, verts, surface_ids=surface_ids)
-        shape, info = build_brep_shape(
-            fa, occ_surfaces, verts, surface_ids=surface_ids,
-            face_wires=fw, tolerance=tolerance,
-            bspline_method=bspline_method,
-        )
+
+        if wire_method == "builderface":
+            fa = face_arc_incidence(ea)
+            shape, info = build_brep_shape_builderface(
+                fa, occ_surfaces, verts, surface_ids=surface_ids,
+                tolerance=tolerance,
+            )
+        else:
+            # Manual wire assembly (original method)
+            # Fast Euler pre-check — if any face is non-Eulerian, wire assembly
+            # will skip it, producing an incomplete (thus invalid) model.
+            bad_faces = _non_eulerian_faces_direct(ea)
+            if bad_faces:
+                return False, None, {"valid": False, "n_faces": 0,
+                                     "n_input_faces": 0,
+                                     "non_eulerian": sorted(bad_faces)}, ea, verts, ve
+            fa = face_arc_incidence(ea)
+            fw = assemble_wires(fa, occ_surfaces, verts, surface_ids=surface_ids)
+            shape, info = build_brep_shape(
+                fa, occ_surfaces, verts, surface_ids=surface_ids,
+                face_wires=fw, tolerance=tolerance,
+            )
+
         valid = (info.get("valid", False) and
                  info.get("n_faces", 0) > 0)
         return valid, shape, info, ea, verts, ve
 
     # Try with everything first (minus isolated vertices)
     print("[oracle filter] trying full model ...")
-    with contextlib.redirect_stdout(io.StringIO()):
+    _captured = io.StringIO()
+    with contextlib.redirect_stdout(_captured):
         valid, shape, info, final_ea, final_v, final_ve = _try_build(
             removed_vertices, removed_arc_keys)
+    # Print BRepCheck details if the build failed
+    for _line in _captured.getvalue().splitlines():
+        if "[BRepCheck]" in _line or "[builderface]" in _line:
+            print(_line)
     # Log arcs silently dropped by _apply_removals (open arcs with
     # v_start=None/v_end=None that can't survive vertex compaction).
     n_in = sum(len(a) for a in edge_arcs.values())
@@ -650,9 +765,13 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
         print(f"[oracle filter] removing arc {edge_key}[{arc_idx}] "
               f"t=[{arc['t_start']:.4f},{arc['t_end']:.4f}] score={score:.4f}")
 
-        with contextlib.redirect_stdout(io.StringIO()):
+        _captured = io.StringIO()
+        with contextlib.redirect_stdout(_captured):
             valid, shape, info, ea, verts, ve = _try_build(
                 removed_vertices, removed_arc_keys)
+        for _line in _captured.getvalue().splitlines():
+            if "[BRepCheck]" in _line or "[builderface]" in _line:
+                print(_line)
 
         n_faces = info.get("n_faces", 0)
         if valid:
@@ -868,8 +987,6 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
     wires (boundary loops).
 
     All faces — including BSpline (INR) faces — are processed identically.
-    Whether the resulting wires are used for face construction depends on the
-    `bspline_method` passed to `build_brep_shape`.
 
     Closed arcs (closed=True) each form a trivial one-arc wire immediately.
 
@@ -1007,52 +1124,10 @@ def print_face_wires_summary(face_wires):
 # Step 5 — BRep assembly and STEP export
 # ---------------------------------------------------------------------------
 
-def _build_pcurve_on_bspline(curve_3d, t0, t1, surface, n_samples=50, tolerance=1e-3):
-    """
-    Compute a Geom2d pcurve for the 3D curve segment [t0, t1] on a BSpline surface.
-
-    Steps:
-      1. Sample n_samples points evenly on curve_3d between t0 and t1.
-      2. Project each 3D point onto the surface via GeomAPI_ProjectPointOnSurf
-         (Newton iteration) to obtain (u_k, v_k).
-      3. Fit a Geom2d_BSplineCurve through the (u_k, v_k) sequence via
-         Geom2dAPI_PointsToBSpline (degree 3–8, C2 continuity).
-
-    Returns the Geom2d_BSplineCurve on success, or None if fewer than 2
-    points project successfully or if the 2D BSpline fit fails.
-    """
-    uv_pts = []
-    for k in range(n_samples):
-        t = t0 + (t1 - t0) * k / max(n_samples - 1, 1)
-        try:
-            p3d = curve_3d.Value(t)
-            proj = GeomAPI_ProjectPointOnSurf(p3d, surface)
-            if proj.NbPoints() > 0:
-                u, v = proj.LowerDistanceParameters()
-                uv_pts.append((float(u), float(v)))
-        except Exception:
-            pass
-
-    if len(uv_pts) < 2:
-        return None
-
-    try:
-        pts_arr = TColgp_Array1OfPnt2d(1, len(uv_pts))
-        for i, (u, v) in enumerate(uv_pts):
-            pts_arr.SetValue(i + 1, gp_Pnt2d(u, v))
-        approx = Geom2dAPI_PointsToBSpline(pts_arr)
-        if not approx.IsDone():
-            return None
-        return approx.Curve()
-    except Exception:
-        return None
-
-
 def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
                      face_wires=None, tolerance=1e-3,
                      inr_geom_close_tol=0.05, inr_arc_samples=30,
                      inr_uv_margin=0.02,
-                     bspline_method="uv_bounds",
                      same_parameter=True,
                      orient_solid=True):
     """
@@ -1064,28 +1139,13 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
     wire is built directly from the ordered (arc, forward) sequence — arc
     orientation is encoded by edge.Reversed() when forward=False.
 
-    BSpline (INR) surfaces — two methods
-    -------------------------------------
-    bspline_method="uv_bounds"  (default)
-        The face is built with explicit UV parameter bounds:
-        `BRepBuilderAPI_MakeFace(surface, u_min, u_max, v_min, v_max, tolerance)`.
-        The bounds are estimated by projecting sampled points from incident arcs
-        onto the BSpline surface.  Geometric closure in each direction is
-        detected and SetUPeriodic / SetVPeriodic called accordingly.
-        OCC computes trivial iso-parameter pcurves automatically.
-        Sewing bridges the gap between these iso-parameter edges and the exact
-        intersection curve edges of adjacent analytical faces.
-        Restriction: the face must have rectangular UV topology (at most two
-        open boundary loops); fails for non-tubular or multi-boundary shapes.
-
-    bspline_method="explicit_pcurve"
-        The face is built from the intersection curve wires assembled by
-        assemble_wires, exactly as for analytical faces.  After MakeFace,
-        `breplib.BuildCurve2d` is called for every edge of the BSpline face to
-        project the 3D intersection curves onto the UV domain and compute
-        explicit pcurves via Newton iteration.  Topologically general — handles
-        any number of boundary loops — but more expensive and can fail if Newton
-        diverges near surface seams or low-curvature regions.
+    BSpline (INR) surfaces
+    ----------------------
+    INR faces are built with explicit UV parameter bounds:
+    `BRepBuilderAPI_MakeFace(surface, u_min, u_max, v_min, v_max, tolerance)`.
+    The bounds are estimated by projecting sampled points from incident arcs
+    onto the BSpline surface.  Geometric closure in each direction is
+    detected and SetUPeriodic / SetVPeriodic called accordingly.
 
     All faces are sewn with BRepBuilderAPI_Sewing and healed with
     ShapeFix_Shape.
@@ -1102,18 +1162,14 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
         (for primitive faces), and ShapeFix_Wire / ShapeFix_Shape.  In principle
         these could differ; a single value is a pragmatic simplification.
     inr_geom_close_tol : float
-        (uv_bounds only) Maximum 3D distance between opposite BSpline boundary
-        curves for a parametric direction to be declared geometrically closed.
+        Maximum 3D distance between opposite BSpline boundary curves for a
+        parametric direction to be declared geometrically closed.
         Default 0.05 (5% of unit-normalised scale).
     inr_arc_samples   : int
-        (uv_bounds only) Number of points sampled per arc for UV bound estimation.
-        Default 30.
+        Number of points sampled per arc for UV bound estimation.  Default 30.
     inr_uv_margin     : float
-        (uv_bounds only) Relative margin added to projected UV bounds on each side.
+        Relative margin added to projected UV bounds on each side.
         Default 0.02 (2%).
-    bspline_method    : str
-        How BSpline (INR) faces are constructed.  "uv_bounds" (default) or
-        "explicit_pcurve".
 
     Returns
     -------
@@ -1190,9 +1246,7 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
                   face_idx < len(surface_ids) and
                   surface_ids[face_idx] == SURFACE_INR)
 
-        # Shared INR setup: geometric closure detection and periodisation.
-        # Runs before both bspline_method branches so that the surface is
-        # already periodic (if applicable) when either branch builds its face.
+        # INR setup: geometric closure detection and periodisation.
         closed_u = closed_v = False
         nu1 = nu2 = nv1 = nv2 = None
         if is_inr:
@@ -1226,70 +1280,6 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
             except Exception as exc:
                 print(f"[brep] face {face_idx}: SetPeriodic failed: {exc}")
                 closed_u = closed_v = False
-
-        # BSpline (INR) face — explicit pcurve method:
-        # Build the face from assembled intersection-curve wires (same as
-        # analytical faces) on the already-periodic surface.  Then for every
-        # edge in the resulting face, extract its 3D curve via BRep_Tool.Curve,
-        # compute a pcurve by sampling + Newton projection onto the BSpline UV
-        # domain + Geom2d BSpline fit (_build_pcurve_on_bspline), and attach
-        # it via BRep_Builder.UpdateEdge.
-        if is_inr and bspline_method == "explicit_pcurve":
-            if not occ_wires:
-                print(f"[brep] face {face_idx}: BSpline explicit-pcurve "
-                      f"— no wires assembled, skipping")
-                continue
-            try:
-                face_maker = BRepBuilderAPI_MakeFace(surface, occ_wires[0])
-                for inner in occ_wires[1:]:
-                    face_maker.Add(inner)
-                if not face_maker.IsDone():
-                    print(f"[brep] face {face_idx}: BSpline explicit-pcurve "
-                          f"MakeFace failed (error {face_maker.Error()})")
-                    continue
-                face = face_maker.Face()
-                brep_builder = BRep_Builder()
-                n_ok, n_fail = 0, 0
-                seen_edges = set()
-                explorer = TopExp_Explorer(face, TopAbs_EDGE)
-                while explorer.More():
-                    edge = topods.Edge(explorer.Current())
-                    eid = edge.__hash__()
-                    if eid not in seen_edges:
-                        seen_edges.add(eid)
-                        try:
-                            crv, t0, t1 = BRep_Tool.Curve(edge)
-                            if crv is None:
-                                n_fail += 1
-                            else:
-                                pcurve = _build_pcurve_on_bspline(
-                                    crv, t0, t1, surface,
-                                    n_samples=50, tolerance=tolerance,
-                                )
-                                if pcurve is not None:
-                                    brep_builder.UpdateEdge(
-                                        edge, pcurve, face, tolerance
-                                    )
-                                    n_ok += 1
-                                else:
-                                    print(
-                                        f"[brep] face {face_idx}: "
-                                        f"_build_pcurve_on_bspline returned "
-                                        f"None for an edge"
-                                    )
-                                    n_fail += 1
-                        except Exception as exc:
-                            print(f"[brep] face {face_idx}: pcurve "
-                                  f"computation failed: {exc}")
-                            n_fail += 1
-                    explorer.Next()
-                print(f"[brep] face {face_idx}: BSpline explicit-pcurve "
-                      f"pcurves ok={n_ok} fail={n_fail}")
-                sewing.Add(face)
-            except Exception as exc:
-                print(f"[brep] face {face_idx}: BSpline explicit-pcurve "
-                      f"exception: {exc}")
-            continue
 
         # BSpline (INR) face — UV-bounds method:
         # Build a parameter-bounded face from the BSpline's (now possibly
@@ -1438,6 +1428,8 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
         face_exp.Next()
 
     print(f"[brep] Results of BRep correctness analyzer: {eval_results}")
+    if not eval_results:
+        _print_brep_check_details(analyzer, shape)
     print(f"[brep] Output faces: {n_output_faces}/{n_input_faces}")
 
     result_info = {
@@ -1446,6 +1438,316 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
         "n_input_faces": n_input_faces,
     }
     return shape, result_info
+
+
+def build_brep_shape_builderface(face_arcs, occ_surfaces, vertices,
+                                  surface_ids=None, tolerance=1e-3,
+                                  inr_geom_close_tol=0.05, inr_arc_samples=30,
+                                  inr_uv_margin=0.02,
+                                  same_parameter=True, orient_solid=True):
+    """
+    Build a TopoDS_Shape using BOPAlgo_BuilderFace for wire assembly.
+
+    Drop-in replacement for build_brep_shape.  Instead of manual angular
+    ordering (assemble_wires), each face's edges are passed to OCC's
+    BOPAlgo_BuilderFace, which internally:
+      - connects edges into wires
+      - classifies outer vs inner (hole) wires
+      - builds the bounded face(s)
+
+    Parameters and return value match build_brep_shape exactly.
+    """
+    # 1. Create shared TopoDS_Vertex instances so edges can be connected.
+    vtx_to_topo = {}  # vertex_index → TopoDS_Vertex
+    for arcs in face_arcs.values():
+        for arc in arcs:
+            for vi_key in ("v_start", "v_end"):
+                vi = arc.get(vi_key)
+                if vi is not None and vi not in vtx_to_topo:
+                    pos = vertices[vi]
+                    vtx = BRepBuilderAPI_MakeVertex(
+                        gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
+                    ).Vertex()
+                    bb = BRep_Builder()
+                    bb.UpdateVertex(vtx, tolerance)
+                    vtx_to_topo[vi] = vtx
+
+    # 2. Build faces using BOPAlgo_BuilderFace.
+    sewing = BRepBuilderAPI_Sewing(tolerance)
+    n_input_faces = len(face_arcs)
+
+    for face_idx, arcs in face_arcs.items():
+        if face_idx >= len(occ_surfaces) or occ_surfaces[face_idx] is None:
+            continue
+        surface = occ_surfaces[face_idx]
+
+        is_inr = (surface_ids is not None and
+                  face_idx < len(surface_ids) and
+                  surface_ids[face_idx] == SURFACE_INR)
+
+        # --- BSpline (INR) face: same UV-bounds / explicit-pcurve logic
+        # as build_brep_shape (INR surfaces don't go through BuilderFace) ---
+        if is_inr:
+            # Geometric closure detection and periodisation
+            nu1, nu2, nv1, nv2 = surface.Bounds()
+            v_mid = (nv1 + nv2) / 2.0
+            u_mid = (nu1 + nu2) / 2.0
+            closed_u = closed_v = False
+            try:
+                pu1 = surface.Value(nu1, v_mid)
+                pu2 = surface.Value(nu2, v_mid)
+                d_u = math.sqrt((pu1.X()-pu2.X())**2 +
+                                (pu1.Y()-pu2.Y())**2 +
+                                (pu1.Z()-pu2.Z())**2)
+                pv1 = surface.Value(u_mid, nv1)
+                pv2 = surface.Value(u_mid, nv2)
+                d_v = math.sqrt((pv1.X()-pv2.X())**2 +
+                                (pv1.Y()-pv2.Y())**2 +
+                                (pv1.Z()-pv2.Z())**2)
+            except Exception:
+                d_u, d_v = 1.0, 1.0
+            closed_u = d_u < inr_geom_close_tol
+            closed_v = d_v < inr_geom_close_tol
+            print(f"[builderface] face {face_idx}: BSpline seam check "
+                  f"d_u={d_u:.4f} d_v={d_v:.4f} "
+                  f"closed_u={closed_u} closed_v={closed_v}")
+            try:
+                if closed_u:
+                    surface.SetUPeriodic()
+                if closed_v:
+                    surface.SetVPeriodic()
+                nu1, nu2, nv1, nv2 = surface.Bounds()
+            except Exception as exc:
+                print(f"[builderface] face {face_idx}: SetPeriodic failed: {exc}")
+                closed_u = closed_v = False
+
+            # UV-bounds method for INR
+            u_min, u_max = nu1, nu2
+            v_min, v_max = nv1, nv2
+            if not closed_u or not closed_v:
+                sample_pts = []
+                for arc in arcs:
+                    t0, t1 = arc["t_start"], arc["t_end"]
+                    for k in range(inr_arc_samples):
+                        t = t0 + (t1 - t0) * k / max(inr_arc_samples - 1, 1)
+                        try:
+                            p = arc["curve"].Value(t)
+                            sample_pts.append([p.X(), p.Y(), p.Z()])
+                        except Exception:
+                            pass
+                if sample_pts:
+                    sample_arr = np.array(sample_pts, dtype=np.float32)
+                    bounds = _cluster_uv_bounds(surface, sample_arr,
+                                                rel_margin=inr_uv_margin)
+                    if bounds is not None:
+                        bu_min, bu_max, bv_min, bv_max = bounds
+                        if not closed_u:
+                            u_min = max(bu_min, nu1)
+                            u_max = min(bu_max, nu2)
+                        if not closed_v:
+                            v_min = max(bv_min, nv1)
+                            v_max = min(bv_max, nv2)
+
+            face_added = False
+            try:
+                face_maker = BRepBuilderAPI_MakeFace(
+                    surface, u_min, u_max, v_min, v_max, tolerance)
+                if face_maker.IsDone():
+                    print(f"[builderface] face {face_idx}: BSpline UV "
+                          f"[{u_min:.3f},{u_max:.3f}]×[{v_min:.3f},{v_max:.3f}]")
+                    sewing.Add(face_maker.Face())
+                    face_added = True
+                else:
+                    print(f"[builderface] face {face_idx}: BSpline MakeFace failed")
+            except Exception as exc:
+                print(f"[builderface] face {face_idx}: BSpline MakeFace exception: {exc}")
+            if not face_added:
+                try:
+                    face_maker = BRepBuilderAPI_MakeFace(surface, tolerance)
+                    if face_maker.IsDone():
+                        print(f"[builderface] face {face_idx}: BSpline natural domain fallback")
+                        sewing.Add(face_maker.Face())
+                    else:
+                        print(f"[builderface] face {face_idx}: BSpline natural domain failed")
+                except Exception as exc:
+                    print(f"[builderface] face {face_idx}: BSpline fallback exception: {exc}")
+            continue
+
+        # --- Analytical faces: use BOPAlgo_BuilderFace ---
+        # Create fresh edges per face to avoid orientation conflicts
+        # when the same arc is shared between two faces.  Sewing will
+        # merge coincident edges afterward.
+        edge_list = TopTools_ListOfShape()
+        n_edges = 0
+        for arc in arcs:
+            try:
+                v_start = arc.get("v_start")
+                v_end = arc.get("v_end")
+                curve = arc["curve"]
+                t0 = arc["t_start"]
+                t1 = arc["t_end"]
+
+                if v_start is not None and v_end is not None:
+                    edge_maker = BRepBuilderAPI_MakeEdge(
+                        curve, vtx_to_topo[v_start], vtx_to_topo[v_end],
+                        t0, t1)
+                elif arc.get("closed", False):
+                    edge_maker = BRepBuilderAPI_MakeEdge(curve)
+                else:
+                    edge_maker = BRepBuilderAPI_MakeEdge(curve, t0, t1)
+
+                if not edge_maker.IsDone():
+                    err = edge_maker.Error()
+                    # Compute diagnostic distances
+                    diag = ""
+                    if v_start is not None and v_end is not None:
+                        try:
+                            p0 = curve.Value(t0)
+                            p1 = curve.Value(t1)
+                            vs = vertices[v_start]
+                            ve = vertices[v_end]
+                            d0 = ((p0.X()-vs[0])**2 + (p0.Y()-vs[1])**2 + (p0.Z()-vs[2])**2)**0.5
+                            d1 = ((p1.X()-ve[0])**2 + (p1.Y()-ve[1])**2 + (p1.Z()-ve[2])**2)**0.5
+                            diag = f" d(v_start,C(t0))={d0:.6f} d(v_end,C(t1))={d1:.6f}"
+                        except Exception:
+                            pass
+                    print(f"[builderface] face {face_idx}: MakeEdge error={err} "
+                          f"for arc {arc.get('edge_key')} t=[{t0:.4f},{t1:.4f}]{diag}")
+                    continue
+
+                edge_list.Append(edge_maker.Edge())
+                n_edges += 1
+            except Exception as exc:
+                print(f"[builderface] face {face_idx}: MakeEdge exception "
+                      f"for arc {arc.get('edge_key')}: {exc}")
+
+        if n_edges == 0:
+            print(f"[builderface] face {face_idx}: no edges — skipping")
+            continue
+
+        # Create a reference face for BuilderFace (unbounded face on the surface)
+        try:
+            ref_face_maker = BRepBuilderAPI_MakeFace(surface, tolerance)
+            if not ref_face_maker.IsDone():
+                print(f"[builderface] face {face_idx}: MakeFace for reference failed")
+                continue
+            ref_face = ref_face_maker.Face()
+        except Exception as exc:
+            print(f"[builderface] face {face_idx}: reference face exception: {exc}")
+            continue
+
+        try:
+            builder = BOPAlgo_BuilderFace()
+            builder.SetFace(ref_face)
+            builder.SetShapes(edge_list)
+            builder.SetFuzzyValue(tolerance)
+            builder.Perform()
+
+            if builder.HasErrors():
+                print(f"[builderface] face {face_idx}: BuilderFace failed with errors")
+                continue
+
+            # Areas() returns the list of bounded faces built by the algorithm
+            from OCC.Core.TopTools import TopTools_ListIteratorOfListOfShape
+            areas = builder.Areas()
+            n_areas = areas.Size()
+            print(f"[builderface] face {face_idx}: {n_edges} edges → "
+                  f"{n_areas} face(s)")
+
+            it = TopTools_ListIteratorOfListOfShape(areas)
+            while it.More():
+                sewing.Add(it.Value())
+                it.Next()
+
+        except Exception as exc:
+            print(f"[builderface] face {face_idx}: BuilderFace exception: {exc}")
+
+    # 3. Sew all faces into a shell.
+    print("[builderface] Sewing faces ...")
+    sewing.Perform()
+    shape = sewing.SewedShape()
+
+    if shape is None or shape.IsNull():
+        print("[builderface] sewing produced no shape")
+        return shape, {"valid": False, "n_faces": 0,
+                       "n_input_faces": n_input_faces}
+
+    # 4. Fix face orientations within the shell.
+    try:
+        stype = shape.ShapeType()
+        if stype == TopAbs_SHELL:
+            shell_fix = ShapeFix_Shell(topods.Shell(shape))
+            shell_fix.SetPrecision(tolerance)
+            shell_fix.FixFaceOrientation(topods.Shell(shape))
+            shell_fix.Perform()
+            shape = shell_fix.Shape()
+            n_err = shell_fix.NbShells()
+            print(f"[builderface] ShapeFix_Shell: FixFaceOrientation done "
+                  f"({n_err} shell(s))")
+        else:
+            print(f"[builderface] ShapeFix_Shell skipped "
+                  f"(shape type {stype}, not shell)")
+    except Exception as exc:
+        print(f"[builderface] ShapeFix_Shell failed: {exc}")
+
+    # 5. Heal.
+    print("[builderface] Fixing shape ...")
+    try:
+        breplib.BuildCurves3d(shape)
+    except Exception as exc:
+        print(f"[builderface] BuildCurves3d failed: {exc}")
+    fixer = ShapeFix_Shape(shape)
+    fixer.SetPrecision(tolerance)
+    fixer.Perform()
+    shape = fixer.Shape()
+
+    if same_parameter:
+        try:
+            breplib.SameParameter(shape, True)
+            print("[builderface] SameParameter done")
+        except Exception as exc:
+            print(f"[builderface] SameParameter failed: {exc}")
+
+    if orient_solid:
+        try:
+            stype = shape.ShapeType()
+            if stype == TopAbs_SOLID:
+                solid = topods.Solid(shape)
+                breplib.OrientClosedSolid(solid)
+                shape = solid
+                print("[builderface] OrientClosedSolid done (solid)")
+            elif stype == TopAbs_SHELL:
+                solid_maker = BRepBuilderAPI_MakeSolid(topods.Shell(shape))
+                if solid_maker.IsDone():
+                    solid = solid_maker.Solid()
+                    breplib.OrientClosedSolid(solid)
+                    shape = solid
+                    print("[builderface] OrientClosedSolid done (shell → solid)")
+                else:
+                    print("[builderface] OrientClosedSolid: MakeSolid from shell failed")
+            else:
+                print(f"[builderface] OrientClosedSolid: skipped "
+                      f"(shape type {stype}, expected shell or solid)")
+        except Exception as exc:
+            print(f"[builderface] OrientClosedSolid failed: {exc}")
+
+    analyzer = BRepCheck_Analyzer(shape)
+    eval_results = analyzer.IsValid()
+
+    n_output_faces = 0
+    face_exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while face_exp.More():
+        n_output_faces += 1
+        face_exp.Next()
+
+    print(f"[builderface] Results of BRep correctness analyzer: {eval_results}")
+    if not eval_results:
+        _print_brep_check_details(analyzer, shape)
+    print(f"[builderface] Output faces: {n_output_faces}/{n_input_faces}")
+
+    return shape, {"valid": eval_results, "n_faces": n_output_faces,
+                   "n_input_faces": n_input_faces}
+
 
 def export_step(shape, path):
     """Export a TopoDS_Shape to a STEP file."""
@@ -1822,6 +2124,8 @@ def build_brep_shape_bop(occ_surfaces, clusters, surface_ids=None,
     analyzer = BRepCheck_Analyzer(shape)
     valid = analyzer.IsValid()
     print(f"[bop] BRep correctness: {valid}")
+    if not valid:
+        _print_brep_check_details(analyzer, shape)
     print(f"[bop] done — {n_output} faces, "
           f"shape type: {shape.ShapeType()}")
     return shape

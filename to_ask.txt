@@ -32,8 +32,25 @@
     the algorithm breaks... With mesh intersections, works fine when reducing spacing_factor to 0.1, but still FreeCAD rejects it because of 
     "Invalid tolerance values". Try to catch these cases?
   - 00000121 (default, default). Good showcase of the algorithm for tomorrow's presentation.
+  - 00000078 - Solver fails to compute the intersection between a cylinder and a plane that should be intersecting. When using mesh intersections,
+    these pairs are still problematic. With mesh intersections in particular, this could be sidesteped by increasing cylinder radii for the purpose
+    of mesh generation only, but there are more problems with the mesh pathway (merging gaps in polylines, reliable vertex computation, ...). 
 
+    python main.py --output_dir output_p2cad --visualize --visualize_id 0 - Demonstrate that even mesh-derived intersections produce noisy results.
 ------------------------------
 Experiments:
 - Inflation after grid trimming, try to replace grid trimming with triangle-level filtering on a mesh.
 - OCC as main engine, fallback to mesh intersection if it fails. How to merge multiple close mesh polylines into a single curve?
+
+- For next presentation:
+  - Outline cases where the algorithm might fail: tangent geometries, showcase on 00000078. Abandoning analytical pathway completely,
+    deriving topology from meshes purely.
+  - Use ideas from papers like ComplexGen and PolyFit for optimal face selection: replace the greedy oracle filter with ILP which
+    GUARANTEES a correct model.
+  - If everything fails, use PolyFiy pipeline to obtain linear approximation model instead.
+  - For ILP, both ComplexGen and PolyFit use the Gurobi solver, which requires a licence but is free for academic use-cases.
+    For the future, discuss how to obtain this licence.
+  - ComplexGen is actually a full pipeline, from unsegmented point cloud to BRep!
+  - Will try to resolve tangent geometries with mesh operations.
+
+- Done today: Previous paragraph + trying to remove manual wire builder and rely purely on OCC.

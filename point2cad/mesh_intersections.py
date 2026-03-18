@@ -263,6 +263,217 @@ def compute_mesh_intersections(adj, surface_ids, results, fit_meshes,
 
 
 # ---------------------------------------------------------------------------
+# Segment-segment closest-point computation
+# ---------------------------------------------------------------------------
+
+def _closest_point_segments(p0, p1, q0, q1):
+    """
+    Find the closest points between segments p0–p1 and q0–q1.
+
+    Returns (point_on_p, point_on_q, distance).
+    """
+    d1 = p1 - p0   # direction of segment P
+    d2 = q1 - q0   # direction of segment Q
+    r  = p0 - q0
+
+    a = float(np.dot(d1, d1))  # |d1|^2
+    e = float(np.dot(d2, d2))  # |d2|^2
+    f = float(np.dot(d2, r))
+
+    EPS = 1e-12
+
+    if a < EPS and e < EPS:
+        # Both segments degenerate to points
+        return p0.copy(), q0.copy(), float(np.linalg.norm(r))
+
+    if a < EPS:
+        s = 0.0
+        t = np.clip(f / e, 0.0, 1.0)
+    else:
+        c = float(np.dot(d1, r))
+        if e < EPS:
+            t = 0.0
+            s = np.clip(-c / a, 0.0, 1.0)
+        else:
+            b = float(np.dot(d1, d2))
+            denom = a * e - b * b
+            if abs(denom) > EPS:
+                s = np.clip((b * f - c * e) / denom, 0.0, 1.0)
+            else:
+                s = 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = np.clip(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = np.clip((b - c) / a, 0.0, 1.0)
+
+    pt_p = p0 + s * d1
+    pt_q = q0 + t * d2
+    dist = float(np.linalg.norm(pt_p - pt_q))
+    return pt_p, pt_q, dist
+
+
+def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
+                                                cluster_radius=5e-3,
+                                                bbox_margin=None):
+    """
+    Find B-Rep vertices by intersecting polyline segments pairwise.
+
+    For each pair of edges (i,j) and (i,k) sharing exactly one face,
+    test all segment pairs from their respective polylines and find the
+    closest approach.  If the minimum distance is below `threshold`, a
+    vertex candidate is generated at the midpoint.
+
+    A bounding-box pre-filter discards segment pairs whose axis-aligned
+    bounding boxes are separated by more than `bbox_margin` (defaults to
+    `threshold`).
+
+    Parameters
+    ----------
+    polyline_map   : dict (i, j) → list of (N, 3) arrays
+    threshold      : max distance between segments to generate a candidate
+    cluster_radius : greedy deduplication radius for final vertices
+    bbox_margin    : bounding-box pre-filter margin (default: threshold)
+
+    Returns
+    -------
+    vertices     : (M, 3) float64 array
+    vertex_edges : list[set] of length M
+    """
+    if bbox_margin is None:
+        bbox_margin = threshold
+
+    edge_keys = list(polyline_map.keys())
+    candidates = []  # (position, distance, edge_a, edge_b)
+
+    n_pairs_tested = 0
+    n_segments_tested = 0
+    n_segments_skipped = 0
+
+    for a_idx in range(len(edge_keys)):
+        for b_idx in range(a_idx + 1, len(edge_keys)):
+            edge_a = edge_keys[a_idx]
+            edge_b = edge_keys[b_idx]
+            # Only consider edges sharing exactly one face
+            shared = set(edge_a) & set(edge_b)
+            if len(shared) != 1:
+                continue
+
+            n_pairs_tested += 1
+            best_dist = float("inf")
+            best_pos = None
+
+            for poly_a in polyline_map[edge_a]:
+                if len(poly_a) < 2:
+                    continue
+                for poly_b in polyline_map[edge_b]:
+                    if len(poly_b) < 2:
+                        continue
+
+                    # KDTree pre-filter: find point pairs within reach,
+                    # then only test segments adjacent to those points.
+                    max_seg_a = float(np.max(np.linalg.norm(
+                        np.diff(poly_a, axis=0), axis=1)))
+                    max_seg_b = float(np.max(np.linalg.norm(
+                        np.diff(poly_b, axis=0), axis=1)))
+                    search_r = threshold + max_seg_a + max_seg_b
+
+                    tree_b = cKDTree(poly_b)
+                    # Query all points of poly_a against poly_b
+                    close_b_indices = tree_b.query_ball_point(
+                        poly_a, r=search_r)
+
+                    # Collect candidate segment index pairs (si, sj)
+                    seg_pairs = set()
+                    for ai, b_indices in enumerate(close_b_indices):
+                        if not b_indices:
+                            continue
+                        # Segments adjacent to point ai: (ai-1, ai) and (ai, ai+1)
+                        segs_a = set()
+                        if ai > 0:
+                            segs_a.add(ai - 1)
+                        if ai < len(poly_a) - 1:
+                            segs_a.add(ai)
+                        for bi in b_indices:
+                            segs_b = set()
+                            if bi > 0:
+                                segs_b.add(bi - 1)
+                            if bi < len(poly_b) - 1:
+                                segs_b.add(bi)
+                            for sa in segs_a:
+                                for sb in segs_b:
+                                    seg_pairs.add((sa, sb))
+
+                    n_segments_skipped += (
+                        (len(poly_a) - 1) * (len(poly_b) - 1)
+                        - len(seg_pairs))
+
+                    for si, sj in seg_pairs:
+                        n_segments_tested += 1
+                        pt_p, pt_q, dist = _closest_point_segments(
+                            poly_a[si], poly_a[si + 1],
+                            poly_b[sj], poly_b[sj + 1])
+
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_pos = 0.5 * (pt_p + pt_q)
+
+            if best_pos is not None and best_dist < threshold:
+                candidates.append((best_pos, best_dist, edge_a, edge_b))
+
+    print(f"[seg-intersect] {n_pairs_tested} edge pairs, "
+          f"{n_segments_tested} segment pairs tested, "
+          f"{n_segments_skipped} skipped by bbox filter")
+    print(f"[seg-intersect] {len(candidates)} raw candidates")
+
+    if not candidates:
+        return np.empty((0, 3), dtype=np.float64), []
+
+    # Sort by distance (best first)
+    candidates.sort(key=lambda c: c[1])
+
+    # Greedy clustering
+    positions = np.array([c[0] for c in candidates], dtype=np.float64)
+    used = np.zeros(len(positions), dtype=bool)
+    vertices = []
+    vertex_edges = []
+
+    for idx in range(len(positions)):
+        if used[idx]:
+            continue
+        dists_arr = np.linalg.norm(positions - positions[idx], axis=1)
+        close = (dists_arr < cluster_radius) & ~used
+        close_indices = np.where(close)[0]
+
+        edges = set()
+        for ci in close_indices:
+            _, _, ea, eb = candidates[ci]
+            edges.add(ea)
+            edges.add(eb)
+
+        if len(edges) < 2:
+            used[close] = True
+            continue
+
+        pos = positions[close].mean(axis=0)
+        best_score = candidates[close_indices[0]][1]
+        v_idx = len(vertices)
+        print(f"  v{v_idx}: ({pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f})  "
+              f"dist={best_score:.6e}  "
+              f"edges={sorted(edges)}  merged={len(close_indices)}")
+        vertices.append(pos)
+        vertex_edges.append(edges)
+        used[close] = True
+
+    print(f"[seg-intersect] {len(vertices)} vertices after clustering")
+    verts_arr = (np.array(vertices, dtype=np.float64) if vertices
+                 else np.empty((0, 3), dtype=np.float64))
+    return verts_arr, vertex_edges
+
+
+# ---------------------------------------------------------------------------
 # Public API — vertex detection from polyline endpoints
 # ---------------------------------------------------------------------------
 
@@ -695,7 +906,9 @@ def build_arcs_from_polylines(polyline_map, vertices, vertex_edges,
                 })
                 continue
 
-            # k >= 2: trim polyline to outermost vertices
+            # k >= 2: trim polyline to outermost vertices and snap
+            # ALL incident vertex positions into the polyline so the
+            # fitted BSpline passes exactly through every vertex.
             first_pi, first_vi = incident[0]
             last_pi, last_vi = incident[-1]
 
@@ -703,9 +916,12 @@ def build_arcs_from_polylines(polyline_map, vertices, vertex_edges,
             if len(trimmed) < 2:
                 continue
 
-            # Snap endpoints to exact vertex positions
-            trimmed[0] = vertices[first_vi]
-            trimmed[-1] = vertices[last_vi]
+            # Snap all incident vertices into the trimmed polyline
+            # (indices shifted by -first_pi after trimming)
+            for pi, vi in incident:
+                local_idx = pi - first_pi
+                if 0 <= local_idx < len(trimmed):
+                    trimmed[local_idx] = vertices[vi]
 
             curve = _fit_bspline(trimmed)
             if curve is None:
@@ -727,7 +943,9 @@ def build_arcs_from_polylines(polyline_map, vertices, vertex_edges,
                 })
                 continue
 
-            # k > 2: project interior vertices onto BSpline, split into arcs
+            # k > 2: project interior vertices onto BSpline, split into arcs.
+            # Since the vertex positions were snapped into the polyline before
+            # fitting, projection lands exactly on the interpolation point.
             interior = incident[1:-1]
             arc_params = [(t_min, first_vi)]
             for _, v_idx in interior:

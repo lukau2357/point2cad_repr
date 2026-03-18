@@ -180,6 +180,7 @@ def run_visualize(args):
     meta         = np.load(os.path.join(out_dir, "metadata.npz"), allow_pickle=True)
     n_clusters   = int(meta["n_clusters"])
     clust_colors = meta["cluster_colors"]
+    surf_names   = meta["surface_names"] if "surface_names" in meta else [None] * n_clusters
 
     # Point clouds
     cluster_pcds = []
@@ -304,6 +305,7 @@ def run_visualize(args):
 
     # Fitted surface meshes (all surface types)
     surface_meshes = []
+    surface_mesh_cids = []   # cluster id for each mesh (parallel to surface_meshes)
     for mesh_path in sorted(_glob.glob(os.path.join(out_dir, "surface_mesh_*.npz"))):
         ci   = int(os.path.basename(mesh_path).replace("surface_mesh_", "").replace(".npz", ""))
         d    = np.load(mesh_path)
@@ -313,6 +315,46 @@ def run_visualize(args):
         mesh.compute_vertex_normals()
         mesh.paint_uniform_color(clust_colors[ci].tolist())
         surface_meshes.append(mesh)
+        surface_mesh_cids.append(ci)
+
+    # Highlight state for cycling through clusters with N/P keys
+    _highlight = {"idx": -1}  # -1 = show all normally
+
+    def _update_highlight(vis_obj):
+        idx = _highlight["idx"]
+        for k, mesh in enumerate(surface_meshes):
+            ci = surface_mesh_cids[k]
+            if idx == -1:
+                mesh.paint_uniform_color(clust_colors[ci].tolist())
+            elif k == idx:
+                mesh.paint_uniform_color(clust_colors[ci].tolist())
+            else:
+                mesh.paint_uniform_color([0.3, 0.3, 0.3])
+            mesh.compute_vertex_normals()
+            vis_obj.update_geometry(mesh)
+        vis_obj.update_renderer()
+        if idx == -1:
+            print("[surfaces] showing ALL clusters")
+        else:
+            ci = surface_mesh_cids[idx]
+            sname = str(surf_names[ci]) if ci < len(surf_names) else "?"
+            print(f"[surfaces] highlighting cluster {ci} ({sname})")
+
+    def _on_key_next(vis_obj):
+        n = len(surface_meshes)
+        _highlight["idx"] = (_highlight["idx"] + 1) % (n + 1)
+        if _highlight["idx"] == n:
+            _highlight["idx"] = -1
+        _update_highlight(vis_obj)
+        return False
+
+    def _on_key_prev(vis_obj):
+        n = len(surface_meshes)
+        _highlight["idx"] = (_highlight["idx"] - 1)
+        if _highlight["idx"] < -1:
+            _highlight["idx"] = n - 1
+        _update_highlight(vis_obj)
+        return False
 
     # Vertices (post-filter: after greedy oracle filter)
     vertex_pcd  = None
@@ -390,11 +432,16 @@ def run_visualize(args):
             vis6.add_geometry(bpcd)
         vis6.get_render_option().point_size = 10.0
 
-    vis5 = o3d.visualization.Visualizer()
-    vis5.create_window("Fitted surfaces", width=W, height=H,
+    vis5 = o3d.visualization.VisualizerWithKeyCallback()
+    vis5.create_window("Fitted surfaces (N/P to cycle clusters)",
+                       width=W, height=H,
                        left=W if args.boundary_mesh else 2 * W, top=50 + H + 40)
     for mesh in surface_meshes:
         vis5.add_geometry(mesh)
+    # N = next cluster, P = previous cluster
+    vis5.register_key_callback(ord("N"), _on_key_next)
+    vis5.register_key_callback(ord("P"), _on_key_prev)
+    print("[surfaces] Press N/P in 'Fitted surfaces' window to cycle clusters")
 
     vis4.get_render_option().mesh_show_back_face = True
     vis5.get_render_option().mesh_show_back_face = True
@@ -576,6 +623,7 @@ def run_compute(args):
     )
     from point2cad.mesh_intersections import (
         compute_mesh_intersections,
+        compute_vertices_from_segment_intersection,
     )
     from point2cad.topology import (
         build_edge_arcs,
@@ -584,7 +632,8 @@ def run_compute(args):
         print_edge_arcs_summary,
         face_arc_incidence, print_face_arcs_summary,
         assemble_wires, print_face_wires_summary,
-        build_brep_shape, export_step, merge_step_files,
+        build_brep_shape, build_brep_shape_builderface,
+        export_step, merge_step_files,
         apply_inverse_normalization,
     )
     import point2cad.primitive_fitting_utils as pfu
@@ -817,13 +866,19 @@ def run_compute(args):
             )
 
         # ------------------------------------------------------------------
-        # Vertex detection (shared by all methods)
+        # Vertex detection
         # ------------------------------------------------------------------
-        vertices, vertex_edges = compute_vertices_intcs(
-            inter_adj, raw_intersections, occ_surfaces=occ_surfs,
-            threshold=threshold_vertex,
-        )
-        print(f"[vertices] found {len(vertices)} vertices (IntCS)")
+        if args.intersection_method == "mesh" and polyline_map:
+            vertices, vertex_edges = compute_vertices_from_segment_intersection(
+                polyline_map, threshold=5e-3, cluster_radius=5e-3,
+            )
+            print(f"[vertices] found {len(vertices)} vertices (segment intersection)")
+        else:
+            vertices, vertex_edges = compute_vertices_intcs(
+                inter_adj, raw_intersections, occ_surfaces=occ_surfs,
+                threshold=threshold_vertex,
+            )
+            print(f"[vertices] found {len(vertices)} vertices (IntCS)")
 
         # Score-cap filter: remove vertices too far from their clusters.
         vertex_scores = []
@@ -954,16 +1009,18 @@ def run_compute(args):
             edge_arcs, vertices, vertex_edges,
             clusters, cluster_trees, cluster_nn_percentiles,
             occ_surfaces=occ_surfs, surface_ids=surface_ids,
-            bspline_method=args.bspline_method, tolerance=1e-3,
+            tolerance=1e-3,
             cluster_bboxes=cluster_bboxes,
+            wire_method=args.wire_method,
         )
         if shape is not None and not shape.IsNull():
             print_edge_arcs_summary(edge_arcs)
             face_arcs = face_arc_incidence(edge_arcs)
             print_face_arcs_summary(face_arcs)
-            face_wires = assemble_wires(face_arcs, occ_surfs, vertices,
-                                         surface_ids=surface_ids)
-            print_face_wires_summary(face_wires)
+            if args.wire_method == "manual":
+                face_wires = assemble_wires(face_arcs, occ_surfs, vertices,
+                                             surface_ids=surface_ids)
+                print_face_wires_summary(face_wires)
 
         # Save vertices AFTER filtering so --visualize shows only final vertices
         np.savez(os.path.join(out_dir, "vertices.npz"),
@@ -1061,13 +1118,13 @@ if __name__ == "__main__":
                              "'analytical': OCC GeomAPI_IntSS with analytical "
                              "fallbacks. 'mesh': PyVista mesh intersection "
                              "with BSpline fitting.")
-    parser.add_argument("--bspline_method", type=str, default="uv_bounds",
-                        choices=["uv_bounds", "explicit_pcurve"],
-                        help="How BSpline (INR) faces are constructed. "
-                             "'uv_bounds': rectangular UV-bounds face, sewing "
-                             "bridges the gap to adjacent analytical faces. "
-                             "'explicit_pcurve': wire-based face with pcurves "
-                             "computed by breplib.BuildCurve2d for each edge.")
+    parser.add_argument("--wire_method", type=str, default="builderface",
+                        choices=["builderface", "manual"],
+                        help="Wire assembly method. "
+                             "'builderface': OCC BOPAlgo_BuilderFace assembles "
+                             "wires and faces from edges automatically. "
+                             "'manual': angular ordering + manual cycle detection "
+                             "(original method).")
     args = parser.parse_args()
 
     if args.model_id is None:
