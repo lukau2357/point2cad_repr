@@ -870,7 +870,8 @@ def run_compute(args):
         # ------------------------------------------------------------------
         if args.intersection_method == "mesh" and polyline_map:
             vertices, vertex_edges = compute_vertices_from_segment_intersection(
-                polyline_map, threshold=5e-3, cluster_radius=5e-3,
+                polyline_map, threshold=5e-3, crossing_threshold=1e-4,
+                cluster_radius=5e-3,
             )
             print(f"[vertices] found {len(vertices)} vertices (segment intersection)")
         else:

@@ -84,12 +84,12 @@ def _o3d_to_pyvista(o3d_mesh):
 
 def _extract_polylines(intersection_polydata):
     """
-    Parse connectivity into ordered polyline point arrays.
+    Parse VTK intersection segments into ordered polyline point arrays.
 
-    The intersection result contains line segments as VTK cells.  We build
-    an adjacency graph from point indices, find connected components, and
-    walk each component from an endpoint (degree-1 node) to produce an
-    ordered (N, 3) array per polyline.
+    vtkIntersectionPolyDataFilter returns 2-point line segments [2, p0, p1],
+    one per triangle-triangle intersection.  Adjacent segments share point
+    indices, forming a path graph (every node has degree <= 2).  We parse
+    these into an adjacency list and walk each connected chain.
     """
     points = np.array(intersection_polydata.points)
     if intersection_polydata.n_cells == 0:
@@ -97,7 +97,7 @@ def _extract_polylines(intersection_polydata):
 
     lines = intersection_polydata.lines
 
-    # Parse VTK connectivity: [npts, p0, p1, ..., npts, p0, p1, ...]
+    # Parse VTK connectivity: [2, p0, p1, 2, p0, p1, ...]
     graph = defaultdict(set)
     idx = 0
     while idx < len(lines):
@@ -108,47 +108,46 @@ def _extract_polylines(intersection_polydata):
             graph[seg[k + 1]].add(seg[k])
         idx += 1 + npts
 
-    # Find connected components and order each into a polyline
+    # Check path graph assumption (all degrees <= 2)
+    high_degree = {n: len(nb) for n, nb in graph.items() if len(nb) > 2}
+    if high_degree:
+        print(f"[polyline] WARNING: {len(high_degree)} node(s) with degree > 2 "
+              f"(max {max(high_degree.values())})")
+
+    # Walk open chains (start from degree-1 endpoints)
     visited = set()
     polylines = []
 
-    for seed in graph:
-        if seed in visited:
+    for start in graph:
+        if start in visited or len(graph[start]) != 1:
             continue
-
-        # BFS to find connected component
-        component = set()
-        stack = [seed]
-        while stack:
-            node = stack.pop()
-            if node in component:
-                continue
-            component.add(node)
-            stack.extend(graph[node] - component)
-        visited |= component
-
-        # Start from an endpoint (degree 1) if one exists, else arbitrary
-        endpoints = [n for n in component if len(graph[n]) == 1]
-        start = endpoints[0] if endpoints else min(component)
-
-        # Walk the chain
         ordered = [start]
-        prev = None
+        visited.add(start)
         current = start
         while True:
-            neighbors = graph[current] - {prev}
+            neighbors = graph[current] - visited
             if not neighbors:
                 break
-            next_node = min(neighbors)   # deterministic tie-breaking
-            if next_node == ordered[0] and len(ordered) > 2:
-                ordered.append(next_node)   # close the loop
-                break
-            if next_node in set(ordered):
-                break
-            ordered.append(next_node)
-            prev = current
-            current = next_node
+            current = neighbors.pop()
+            visited.add(current)
+            ordered.append(current)
+        polylines.append(points[ordered])
 
+    # Walk closed loops (all remaining nodes have degree 2)
+    for start in graph:
+        if start in visited:
+            continue
+        ordered = [start]
+        visited.add(start)
+        current = start
+        while True:
+            neighbors = graph[current] - visited
+            if not neighbors:
+                break
+            current = neighbors.pop()
+            visited.add(current)
+            ordered.append(current)
+        ordered.append(start)  # close the loop
         polylines.append(points[ordered])
 
     return polylines
@@ -165,11 +164,14 @@ def _fit_bspline(pts):
     """Fit a BSpline curve to an ordered point array via GeomAPI_PointsToBSpline.
 
     If the polyline is closed (first ≈ last point), the last point is snapped
-    to exactly the first point before fitting so that the resulting BSpline
-    has coincident endpoints and passes the downstream closure check.
+    to exactly the first point before fitting, and the resulting BSpline is
+    made periodic so that downstream arc splitting can use wrap-around
+    parameters instead of introducing artificial seam vertices.
     """
+    is_closed = len(pts) >= 3 and np.linalg.norm(pts[0] - pts[-1]) < _CLOSURE_TOL
+
     # Snap closed polylines: replace last point with exact copy of first
-    if len(pts) >= 3 and np.linalg.norm(pts[0] - pts[-1]) < _CLOSURE_TOL:
+    if is_closed:
         pts = pts.copy()
         pts[-1] = pts[0]
 
@@ -180,7 +182,15 @@ def _fit_bspline(pts):
     approx = GeomAPI_PointsToBSpline(arr, 3, 8, GeomAbs_C2, 1e-4)
     if not approx.IsDone():
         return None
-    return approx.Curve()
+    curve = approx.Curve()
+
+    if is_closed:
+        try:
+            curve.SetPeriodic()
+        except Exception:
+            pass  # non-critical: seam-split fallback still works
+
+    return curve
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +326,7 @@ def _closest_point_segments(p0, p1, q0, q1):
 
 
 def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
+                                                crossing_threshold=None,
                                                 cluster_radius=5e-3,
                                                 bbox_margin=None):
     """
@@ -323,27 +334,25 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
 
     For each pair of edges (i,j) and (i,k) sharing exactly one face,
     test all segment pairs from their respective polylines and find the
-    closest approach.  If the minimum distance is below `threshold`, a
-    vertex candidate is generated at the midpoint.
-
-    A bounding-box pre-filter discards segment pairs whose axis-aligned
-    bounding boxes are separated by more than `bbox_margin` (defaults to
-    `threshold`).
+    closest approach.  If the minimum distance is below `crossing_threshold`,
+    a vertex candidate is generated at the midpoint.
 
     Parameters
     ----------
-    polyline_map   : dict (i, j) → list of (N, 3) arrays
-    threshold      : max distance between segments to generate a candidate
-    cluster_radius : greedy deduplication radius for final vertices
-    bbox_margin    : bounding-box pre-filter margin (default: threshold)
+    polyline_map        : dict (i, j) → list of (N, 3) arrays
+    threshold           : KDTree search radius for pre-filtering segment pairs
+    crossing_threshold  : max segment distance to accept a crossing candidate
+                          (default: threshold)
+    cluster_radius      : greedy deduplication radius for final vertices
+    bbox_margin         : deprecated, unused
 
     Returns
     -------
     vertices     : (M, 3) float64 array
     vertex_edges : list[set] of length M
     """
-    if bbox_margin is None:
-        bbox_margin = threshold
+    if crossing_threshold is None:
+        crossing_threshold = threshold
 
     edge_keys = list(polyline_map.keys())
     candidates = []  # (position, distance, edge_a, edge_b)
@@ -362,8 +371,6 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
                 continue
 
             n_pairs_tested += 1
-            best_dist = float("inf")
-            best_pos = None
 
             for poly_a in polyline_map[edge_a]:
                 if len(poly_a) < 2:
@@ -416,17 +423,15 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
                             poly_a[si], poly_a[si + 1],
                             poly_b[sj], poly_b[sj + 1])
 
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_pos = 0.5 * (pt_p + pt_q)
-
-            if best_pos is not None and best_dist < threshold:
-                candidates.append((best_pos, best_dist, edge_a, edge_b))
+                        if dist < crossing_threshold:
+                            candidates.append(
+                                (0.5 * (pt_p + pt_q), dist, edge_a, edge_b))
 
     print(f"[seg-intersect] {n_pairs_tested} edge pairs, "
           f"{n_segments_tested} segment pairs tested, "
-          f"{n_segments_skipped} skipped by bbox filter")
-    print(f"[seg-intersect] {len(candidates)} raw candidates")
+          f"{n_segments_skipped} skipped by KDTree filter")
+    print(f"[seg-intersect] {len(candidates)} raw candidates "
+          f"(crossing_threshold={crossing_threshold:.1e})")
 
     if not candidates:
         return np.empty((0, 3), dtype=np.float64), []
@@ -468,337 +473,6 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
         used[close] = True
 
     print(f"[seg-intersect] {len(vertices)} vertices after clustering")
-    verts_arr = (np.array(vertices, dtype=np.float64) if vertices
-                 else np.empty((0, 3), dtype=np.float64))
-    return verts_arr, vertex_edges
-
-
-# ---------------------------------------------------------------------------
-# Public API — vertex detection from polyline endpoints
-# ---------------------------------------------------------------------------
-
-def compute_vertices_from_polylines(polyline_map, threshold=1e-3):
-    """
-    Find B-Rep vertices from polyline endpoint coincidence.
-
-    A vertex exists where endpoints from 2+ different edges (surface pairs)
-    cluster within `threshold` distance.  Each vertex is attributed to the
-    set of edges whose endpoints contributed to the cluster.
-
-    Parameters
-    ----------
-    polyline_map : dict (i, j) → list of (N, 3) arrays
-    threshold    : clustering radius for endpoint matching
-
-    Returns
-    -------
-    vertices     : (M, 3) float64 array
-    vertex_edges : list[set] of length M; vertex_edges[v] is the set of
-                   edge tuples (i, j) incident to vertex v
-    """
-    # Collect all polyline endpoints tagged with their edge key
-    ep_positions = []
-    ep_edge_keys = []
-
-    for (i, j), polylines in polyline_map.items():
-        for poly in polylines:
-            if len(poly) < 2:
-                continue
-            ep_positions.append(poly[0])
-            ep_edge_keys.append((i, j))
-            # Add the other endpoint only if the polyline is open
-            if np.linalg.norm(poly[0] - poly[-1]) > threshold:
-                ep_positions.append(poly[-1])
-                ep_edge_keys.append((i, j))
-
-    if not ep_positions:
-        print("[mesh-vertices] no polyline endpoints found")
-        return np.empty((0, 3), dtype=np.float64), []
-
-    positions = np.array(ep_positions, dtype=np.float64)
-
-    print(f"[mesh-vertices] {len(positions)} polyline endpoints "
-          f"from {len(polyline_map)} edges")
-
-    # Greedy clustering
-    used = np.zeros(len(positions), dtype=bool)
-    vertices = []
-    vertex_edges = []
-
-    for idx in range(len(positions)):
-        if used[idx]:
-            continue
-        dists = np.linalg.norm(positions - positions[idx], axis=1)
-        close = (dists < threshold) & ~used
-        close_indices = np.where(close)[0]
-
-        # Collect distinct edge keys in this cluster
-        edges = set()
-        for ci in close_indices:
-            edges.add(ep_edge_keys[ci])
-
-        # A vertex must be incident to at least 2 distinct edges
-        if len(edges) < 2:
-            used[close] = True
-            continue
-
-        pos = positions[close].mean(axis=0)
-        v_idx = len(vertices)
-        print(f"  v{v_idx}: ({pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f})  "
-              f"edges={sorted(edges)}  merged={len(close_indices)} endpoints")
-        vertices.append(pos)
-        vertex_edges.append(edges)
-        used[close] = True
-
-    print(f"[mesh-vertices] {len(vertices)} vertices after clustering")
-    return (np.array(vertices, dtype=np.float64) if vertices
-            else np.empty((0, 3), dtype=np.float64)), vertex_edges
-
-
-# ---------------------------------------------------------------------------
-# Vertex detection from polyline proximity (edges sharing exactly one face)
-# ---------------------------------------------------------------------------
-
-def compute_vertices_from_polyline_proximity(polyline_map, threshold=1e-3):
-    """
-    Find B-Rep vertices where polylines from edges sharing exactly one
-    cluster index intersect.
-
-    Uses KDTree point-to-point proximity between polyline point arrays.
-
-    Parameters
-    ----------
-    polyline_map : dict (i, j) → list of (N, 3) arrays
-    threshold    : proximity radius for polyline intersection detection
-
-    Returns
-    -------
-    vertices       : (M, 3) float64 array
-    vertex_edges   : list[set] of length M
-    """
-    edge_keys = list(polyline_map.keys())
-
-    candidates = []  # (position, edge_key_a, edge_key_b)
-
-    for a_idx in range(len(edge_keys)):
-        for b_idx in range(a_idx + 1, len(edge_keys)):
-            edge_a = edge_keys[a_idx]
-            edge_b = edge_keys[b_idx]
-            shared = set(edge_a) & set(edge_b)
-            if len(shared) != 1:
-                continue
-
-            polys_a = polyline_map[edge_a]
-            polys_b = polyline_map[edge_b]
-            for poly_a in polys_a:
-                if len(poly_a) < 2:
-                    continue
-                for poly_b in polys_b:
-                    if len(poly_b) < 2:
-                        continue
-                    tree_b = cKDTree(poly_b)
-                    dists, indices = tree_b.query(poly_a)
-                    min_dist = float(dists.min())
-                    print(f"  [proximity] {edge_a}∩{edge_b}: "
-                          f"min_dist={min_dist:.6e}  "
-                          f"pts_a={len(poly_a)} pts_b={len(poly_b)}")
-                    close_mask = dists < threshold
-                    if not np.any(close_mask):
-                        continue
-                    best = np.argmin(dists)
-                    pos = 0.5 * (poly_a[best] + poly_b[indices[best]])
-                    candidates.append((pos, edge_a, edge_b))
-
-    if not candidates:
-        print("[polyline-vertices] no proximity candidates found")
-        return np.empty((0, 3), dtype=np.float64), []
-
-    # Greedy clustering
-    positions = np.array([c[0] for c in candidates], dtype=np.float64)
-    used = np.zeros(len(positions), dtype=bool)
-    vertices = []
-    vertex_edges = []
-
-    print(f"[polyline-vertices] {len(candidates)} raw candidates "
-          f"from {len(polyline_map)} edges")
-
-    for idx in range(len(positions)):
-        if used[idx]:
-            continue
-        dists_arr = np.linalg.norm(positions - positions[idx], axis=1)
-        close = (dists_arr < threshold) & ~used
-        close_indices = np.where(close)[0]
-
-        edges = set()
-        for ci in close_indices:
-            _, ea, eb = candidates[ci]
-            edges.add(ea)
-            edges.add(eb)
-
-        if len(edges) < 2:
-            used[close] = True
-            continue
-
-        pos = positions[close].mean(axis=0)
-        v_idx = len(vertices)
-        print(f"  v{v_idx}: ({pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f})  "
-              f"edges={sorted(edges)}  merged={len(close_indices)} candidates")
-        vertices.append(pos)
-        vertex_edges.append(edges)
-        used[close] = True
-
-    print(f"[polyline-vertices] {len(vertices)} vertices after clustering")
-    verts_arr = (np.array(vertices, dtype=np.float64) if vertices
-                 else np.empty((0, 3), dtype=np.float64))
-    return verts_arr, vertex_edges
-
-
-# ---------------------------------------------------------------------------
-# Vertex detection: tripoint (triple-face convergence)
-# ---------------------------------------------------------------------------
-
-def _get_edge_key(i, j):
-    """Canonical edge key with i < j."""
-    return (min(i, j), max(i, j))
-
-
-def compute_vertices_tripoint(polyline_map, threshold=0.01,
-                               cluster_radius=5e-3):
-    """
-    Find B-Rep vertices from face triples using polyline proximity.
-
-    A vertex is where 3 faces (i, j, k) meet. For each such triple where
-    all three edge polylines exist, we sweep points on polyline (i,j) and
-    find the point that minimizes max(dist_to_(i,k), dist_to_(j,k)).
-    We repeat using each of the 3 polylines as the base and keep the best.
-
-    Each edge (i,j) may have multiple polylines; all combinations are tried.
-
-    Parameters
-    ----------
-    polyline_map   : dict (i, j) → list of (N, 3) arrays
-    threshold      : max acceptable min-max-distance for a vertex candidate
-    cluster_radius : greedy deduplication radius
-    """
-    from itertools import combinations
-
-    # Collect all face indices that appear in any edge
-    faces = set()
-    for (i, j) in polyline_map:
-        faces.add(i)
-        faces.add(j)
-    faces = sorted(faces)
-
-    # Build set of edges with non-empty polylines for fast lookup
-    active_edges = set()
-    for key, polys in polyline_map.items():
-        if any(len(p) >= 2 for p in polys):
-            active_edges.add(key)
-
-    # Pre-build KDTrees for each (edge, polyline_index)
-    kdtrees = {}  # (edge_key, poly_idx) → (cKDTree, poly_array)
-    for key, polys in polyline_map.items():
-        for pi, poly in enumerate(polys):
-            if len(poly) >= 2:
-                kdtrees[(key, pi)] = (cKDTree(poly), poly)
-
-    candidates = []  # (position, score, edge_ij, edge_ik, edge_jk)
-
-    for i, j, k in combinations(faces, 3):
-        e_ij = _get_edge_key(i, j)
-        e_ik = _get_edge_key(i, k)
-        e_jk = _get_edge_key(j, k)
-
-        if not (e_ij in active_edges and e_ik in active_edges
-                and e_jk in active_edges):
-            continue
-
-        best_triple_score = float("inf")
-
-        # Try each of the 3 edges as the base polyline
-        for base_edge, other1, other2 in [
-            (e_ij, e_ik, e_jk),
-            (e_ik, e_ij, e_jk),
-            (e_jk, e_ij, e_ik),
-        ]:
-            base_polys = polyline_map[base_edge]
-            for bp_idx, base_poly in enumerate(base_polys):
-                if len(base_poly) < 2:
-                    continue
-
-                # Query base points against all polylines of other1 and other2
-                for o1_idx, o1_poly in enumerate(polyline_map[other1]):
-                    if len(o1_poly) < 2:
-                        continue
-                    tree1, _ = kdtrees[(other1, o1_idx)]
-
-                    for o2_idx, o2_poly in enumerate(polyline_map[other2]):
-                        if len(o2_poly) < 2:
-                            continue
-                        tree2, _ = kdtrees[(other2, o2_idx)]
-
-                        d1, _ = tree1.query(base_poly)
-                        d2, _ = tree2.query(base_poly)
-                        max_d = np.maximum(d1, d2)
-                        best_idx = np.argmin(max_d)
-                        score = float(max_d[best_idx])
-                        best_triple_score = min(best_triple_score, score)
-
-                        if score < threshold:
-                            candidates.append((
-                                base_poly[best_idx].copy(),
-                                score, e_ij, e_ik, e_jk,
-                            ))
-
-        if best_triple_score >= threshold:
-            print(f"  [tripoint] REJECTED triple ({i},{j},{k})  "
-                  f"best_score={best_triple_score:.6e}  "
-                  f"edges={e_ij},{e_ik},{e_jk}")
-
-    if not candidates:
-        print("[tripoint] no vertex candidates found")
-        return np.empty((0, 3), dtype=np.float64), []
-
-    # Sort by score (best first) for greedy clustering
-    candidates.sort(key=lambda c: c[1])
-
-    positions = np.array([c[0] for c in candidates], dtype=np.float64)
-    used = np.zeros(len(positions), dtype=bool)
-    vertices = []
-    vertex_edges = []
-
-    print(f"[tripoint] {len(candidates)} raw candidates "
-          f"from {len(polyline_map)} edges")
-
-    for idx in range(len(positions)):
-        if used[idx]:
-            continue
-        dists_arr = np.linalg.norm(positions - positions[idx], axis=1)
-        close = (dists_arr < cluster_radius) & ~used
-        close_indices = np.where(close)[0]
-
-        edges = set()
-        for ci in close_indices:
-            _, _, e1, e2, e3 = candidates[ci]
-            edges.add(e1)
-            edges.add(e2)
-            edges.add(e3)
-
-        if len(edges) < 2:
-            used[close] = True
-            continue
-
-        pos = positions[close].mean(axis=0)
-        best_score = min(candidates[ci][1] for ci in close_indices)
-        v_idx = len(vertices)
-        print(f"  v{v_idx}: ({pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f})  "
-              f"score={best_score:.6e}  "
-              f"edges={sorted(edges)}  merged={len(close_indices)}")
-        vertices.append(pos)
-        vertex_edges.append(edges)
-        used[close] = True
-
-    print(f"[tripoint] {len(vertices)} vertices after clustering")
     verts_arr = (np.array(vertices, dtype=np.float64) if vertices
                  else np.empty((0, 3), dtype=np.float64))
     return verts_arr, vertex_edges

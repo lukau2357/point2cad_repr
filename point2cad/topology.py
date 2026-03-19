@@ -45,7 +45,7 @@ try:
         BRepBuilderAPI_Sewing,
         BRepBuilderAPI_GTransform,
     )
-    from OCC.Core.ShapeFix       import ShapeFix_Wire, ShapeFix_Shape, ShapeFix_Shell
+    from OCC.Core.ShapeFix       import ShapeFix_Wire, ShapeFix_Shape, ShapeFix_Shell, ShapeFix_Face
     from OCC.Core.BRepLib        import breplib
     from OCC.Core.STEPControl    import (STEPControl_Writer, STEPControl_AsIs,
                                           STEPControl_Reader)
@@ -1615,7 +1615,15 @@ def build_brep_shape_builderface(face_arcs, occ_surfaces, vertices,
                           f"for arc {arc.get('edge_key')} t=[{t0:.4f},{t1:.4f}]{diag}")
                     continue
 
-                edge_list.Append(edge_maker.Edge())
+                edge = edge_maker.Edge()
+                # Improve pcurve/3D-curve consistency before BuilderFace
+                # uses pcurves for region detection.
+                try:
+                    breplib.SameParameter(edge, tolerance)
+                except Exception as sp_exc:
+                    print(f"[builderface] face {face_idx}: SameParameter failed "
+                          f"for arc {arc.get('edge_key')}: {sp_exc}")
+                edge_list.Append(edge)
                 n_edges += 1
             except Exception as exc:
                 print(f"[builderface] face {face_idx}: MakeEdge exception "
@@ -1656,7 +1664,18 @@ def build_brep_shape_builderface(face_arcs, occ_surfaces, vertices,
 
             it = TopTools_ListIteratorOfListOfShape(areas)
             while it.More():
-                sewing.Add(it.Value())
+                face_shape = it.Value()
+                # Heal pcurve self-intersections caused by mesh BSpline
+                # fitting noise before adding to sewing.
+                try:
+                    ff = ShapeFix_Face(topods.Face(face_shape))
+                    ff.SetPrecision(tolerance)
+                    ff.FixIntersectingWires()
+                    ff.Perform()
+                    face_shape = ff.Face()
+                except Exception as fix_exc:
+                    print(f"[builderface] face {face_idx}: ShapeFix_Face failed: {fix_exc}")
+                sewing.Add(face_shape)
                 it.Next()
 
         except Exception as exc:

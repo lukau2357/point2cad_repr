@@ -24,7 +24,7 @@
   - 00000019 (default, default)
   - 00000009 (default, default). Fitted 2 INRs instead of 2 cones, but the result was geometrically correct, and it visually matched the input reasonabl well.  
   - 00000017 (default, default)
-  - 00009998 - Does not work, BSpline INR produced error seems to be causing the main problems.
+  - 00000239 - Does not work, BSpline INR produced error seems to be causing the main problems.
   - 00000073 - Does not work, cylinder/plane issues.... Actually, the issue seems to be genuine surface patches being split into multiple segments. Can you filter out such models entirely?
   - 00000077 (default, default)
   - 00000104 - Does not work, 0 vertices, simple model in that regard. Lowering the spacing factor to as low as 0.1 did produce better curves,
@@ -54,3 +54,6 @@ Experiments:
   - Will try to resolve tangent geometries with mesh operations.
 
 - Done today: Previous paragraph + trying to remove manual wire builder and rely purely on OCC.
+
+- 2 (vertical plane), 9 (tilted cylinder), 10 (straight cylinder), 13 (horizontal plane)
+- 2 vertices in intersection of (2, 9), (2, 13)
