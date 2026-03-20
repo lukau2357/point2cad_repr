@@ -297,12 +297,8 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-4):
                     verts[v_idx], curve, t_min, t_max
                 )
                 if t_star is None:
-                    print(f"  [arc-split] edge {edge_key} v{v_idx}: "
-                          f"projection failed (outside parameter range)")
                     continue
                 if dist > threshold:
-                    print(f"  [arc-split] edge {edge_key} v{v_idx}: "
-                          f"projection dist={dist:.6e} > threshold={threshold:.1e}")
                     continue
                 incident_params.append((t_star, v_idx))
 

@@ -625,6 +625,7 @@ def run_compute(args):
     from point2cad.mesh_intersections import (
         compute_mesh_intersections,
         compute_vertices_from_segment_intersection,
+        build_arcs_from_polylines,
         tangent_fallback,
     )
     from point2cad.topology import (
@@ -876,7 +877,7 @@ def run_compute(args):
         # Vertex detection
         # ------------------------------------------------------------------
         if args.intersection_method == "mesh" and polyline_map:
-            vertices, vertex_edges = compute_vertices_from_segment_intersection(
+            vertices, vertex_edges, vertex_polys = compute_vertices_from_segment_intersection(
                 polyline_map, threshold=5e-3, crossing_threshold=1e-4,
                 cluster_radius=5e-3,
             )
@@ -996,12 +997,15 @@ def run_compute(args):
         # ------------------------------------------------------------------
         # Step 1: arc splitting
         # ------------------------------------------------------------------
-        trim_curves_dict = {k: v["curves"] for k, v in trim_intersections_.items()}
-        # For mesh pathway, threshold must match cluster_radius from vertex computation
-        arc_threshold = 5e-3 if args.intersection_method == "mesh" else 1e-3
-        edge_arcs, vertices, vertex_edges = build_edge_arcs(
-            trim_curves_dict, vertices, vertex_edges, threshold=arc_threshold
-        )
+        if args.intersection_method == "mesh":
+            edge_arcs, vertices, vertex_edges = build_arcs_from_polylines(
+                polyline_map, vertices, vertex_edges, vertex_polys,
+            )
+        else:
+            trim_curves_dict = {k: v["curves"] for k, v in trim_intersections_.items()}
+            edge_arcs, vertices, vertex_edges = build_edge_arcs(
+                trim_curves_dict, vertices, vertex_edges, threshold=1e-3
+            )
         print_edge_arcs_summary(edge_arcs)
 
         # Save pre-filter vertices and arcs for visualization

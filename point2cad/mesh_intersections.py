@@ -311,23 +311,14 @@ def compute_mesh_intersections(adj, surface_ids, results, fit_meshes,
         polylines = _extract_polylines(intersection)
         polyline_map[(i, j)] = polylines
 
-        # Fit BSpline to each polyline
-        curves = []
-        for poly in polylines:
-            if len(poly) < 2:
-                continue
-            curve = _fit_bspline(poly)
-            if curve is not None:
-                curves.append(curve)
-
-        if curves:
-            result = _result(curves, [], "bspline", "mesh")
+        n_valid = sum(1 for p in polylines if len(p) >= 2)
+        if n_valid > 0:
+            out[(i, j)] = _result([], [], "polyline", "mesh")
         else:
-            result = _result([], [], "failed", "mesh")
-        out[(i, j)] = result
+            out[(i, j)] = _result([], [], "failed", "mesh")
 
-        print(f"  [mesh-intersect] {label}: {result['type']}  "
-              f"polylines={len(polylines)}  curves={len(result['curves'])}")
+        print(f"  [mesh-intersect] {label}: {out[(i, j)]['type']}  "
+              f"polylines={len(polylines)}  valid={n_valid}")
 
     return out, polyline_map
 
@@ -394,12 +385,7 @@ def tangent_fallback(raw_intersections, polyline_map, boundary_strips,
         p1 = centroid + t_max * direction
         polyline = np.array([p0, p1], dtype=np.float64)
 
-        # Fit BSpline (trivial for 2 points — degree 1 line)
-        curve = _fit_bspline(polyline)
-        if curve is None:
-            continue
-
-        raw_intersections[(i, j)] = _result([curve], [], "line", "tangent")
+        raw_intersections[(i, j)] = _result([], [], "line", "tangent")
         polyline_map[(i, j)] = [polyline]
         print(f"  [tangent] ({i}, {j}): line from {len(bpts)} boundary pts  "
               f"variance_ratio={variance_ratio:.4f}  span={span:.4f}")
@@ -470,9 +456,13 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
     closest approach.  If the minimum distance is below `crossing_threshold`,
     a vertex candidate is generated at the midpoint.
 
+    Tracks which specific polyline (by index within the edge's polyline list)
+    produced each crossing.  During greedy clustering, the merged vertex
+    inherits the union of all (edge, poly_idx) pairs from its constituents.
+
     Parameters
     ----------
-    polyline_map        : dict (i, j) → list of (N, 3) arrays
+    polyline_map        : dict (i, j) -> list of (N, 3) arrays
     threshold           : KDTree search radius for pre-filtering segment pairs
     crossing_threshold  : max segment distance to accept a crossing candidate
                           (default: threshold)
@@ -481,14 +471,16 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
 
     Returns
     -------
-    vertices     : (M, 3) float64 array
-    vertex_edges : list[set] of length M
+    vertices      : (M, 3) float64 array
+    vertex_edges  : list[set] of length M — set of (edge_key) tuples
+    vertex_polys  : list[set] of length M — set of (edge_key, poly_idx) tuples
     """
     if crossing_threshold is None:
         crossing_threshold = threshold
 
     edge_keys = list(polyline_map.keys())
-    candidates = []  # (position, distance, edge_a, edge_b)
+    # Each candidate: (position, distance, edge_a, poly_idx_a, edge_b, poly_idx_b)
+    candidates = []
 
     n_pairs_tested = 0
     n_segments_tested = 0
@@ -505,10 +497,10 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
 
             n_pairs_tested += 1
 
-            for poly_a in polyline_map[edge_a]:
+            for pa_idx, poly_a in enumerate(polyline_map[edge_a]):
                 if len(poly_a) < 2:
                     continue
-                for poly_b in polyline_map[edge_b]:
+                for pb_idx, poly_b in enumerate(polyline_map[edge_b]):
                     if len(poly_b) < 2:
                         continue
 
@@ -521,16 +513,13 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
                     search_r = threshold + max_seg_a + max_seg_b
 
                     tree_b = cKDTree(poly_b)
-                    # Query all points of poly_a against poly_b
                     close_b_indices = tree_b.query_ball_point(
                         poly_a, r=search_r)
 
-                    # Collect candidate segment index pairs (si, sj)
                     seg_pairs = set()
                     for ai, b_indices in enumerate(close_b_indices):
                         if not b_indices:
                             continue
-                        # Segments adjacent to point ai: (ai-1, ai) and (ai, ai+1)
                         segs_a = set()
                         if ai > 0:
                             segs_a.add(ai - 1)
@@ -557,8 +546,10 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
                             poly_b[sj], poly_b[sj + 1])
 
                         if dist < crossing_threshold:
-                            candidates.append(
-                                (0.5 * (pt_p + pt_q), dist, edge_a, edge_b))
+                            candidates.append((
+                                0.5 * (pt_p + pt_q), dist,
+                                edge_a, pa_idx, edge_b, pb_idx,
+                            ))
 
     print(f"[seg-intersect] {n_pairs_tested} edge pairs, "
           f"{n_segments_tested} segment pairs tested, "
@@ -567,7 +558,7 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
           f"(crossing_threshold={crossing_threshold:.1e})")
 
     if not candidates:
-        return np.empty((0, 3), dtype=np.float64), []
+        return np.empty((0, 3), dtype=np.float64), [], []
 
     # Sort by distance (best first)
     candidates.sort(key=lambda c: c[1])
@@ -577,6 +568,7 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
     used = np.zeros(len(positions), dtype=bool)
     vertices = []
     vertex_edges = []
+    vertex_polys = []
 
     for idx in range(len(positions)):
         if used[idx]:
@@ -586,10 +578,13 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
         close_indices = np.where(close)[0]
 
         edges = set()
+        polys = set()
         for ci in close_indices:
-            _, _, ea, eb = candidates[ci]
+            _, _, ea, pa, eb, pb = candidates[ci]
             edges.add(ea)
             edges.add(eb)
+            polys.add((ea, pa))
+            polys.add((eb, pb))
 
         if len(edges) < 2:
             used[close] = True
@@ -600,212 +595,234 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
         v_idx = len(vertices)
         print(f"  v{v_idx}: ({pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f})  "
               f"dist={best_score:.6e}  "
-              f"edges={sorted(edges)}  merged={len(close_indices)}")
+              f"edges={sorted(edges)}  polys={sorted(polys)}  "
+              f"merged={len(close_indices)}")
         vertices.append(pos)
         vertex_edges.append(edges)
+        vertex_polys.append(polys)
         used[close] = True
 
     print(f"[seg-intersect] {len(vertices)} vertices after clustering")
 
-    # Post-clustering attribution: for each vertex, check if nearby
-    # polylines (sharing a face with an existing edge) pass through it.
-    # This catches edges missed by the segment crossing test (e.g. when
-    # the crossing distance was slightly above crossing_threshold).
+    # Post-clustering attribution: for each vertex, check if compatible
+    # polylines pass close to it (point-to-segment distance).  This catches
+    # edges missed by crossing_threshold when 3+ surfaces meet at a point
+    # but one pairwise crossing is slightly above threshold.
     for v_idx in range(len(vertices)):
         pos = vertices[v_idx]
         existing_faces = set()
         for ea in vertex_edges[v_idx]:
             existing_faces.update(ea)
 
-        for edge_key, polys in polyline_map.items():
+        for edge_key, polys_list in polyline_map.items():
             if edge_key in vertex_edges[v_idx]:
                 continue
-            # Edge must share at least one face with the vertex
             if not existing_faces & set(edge_key):
                 continue
-            for poly in polys:
+            for pi, poly in enumerate(polys_list):
                 if len(poly) < 2:
                     continue
-                dists = np.linalg.norm(poly - pos, axis=1)
-                min_dist = float(np.min(dists))
-                if min_dist < cluster_radius:
+                _, _, dist = _nearest_segment_index(pos, poly)
+                if dist < cluster_radius:
                     vertex_edges[v_idx].add(edge_key)
-                    print(f"  v{v_idx}: attributed edge {edge_key} "
-                          f"(polyline dist={min_dist:.6e})")
+                    vertex_polys[v_idx].add((edge_key, pi))
+                    print(f"  v{v_idx}: post-attributed edge {edge_key} "
+                          f"poly {pi} (seg dist={dist:.6e})")
                     break
 
     verts_arr = (np.array(vertices, dtype=np.float64) if vertices
                  else np.empty((0, 3), dtype=np.float64))
-    return verts_arr, vertex_edges
+    return verts_arr, vertex_edges, vertex_polys
 
 
 # ---------------------------------------------------------------------------
 # Arc construction from polylines + vertices
 # ---------------------------------------------------------------------------
 
-def _find_polyline_index(vertex_pos, poly, threshold=5e-3):
-    """Find the index in poly closest to vertex_pos, or None if too far."""
-    dists = np.linalg.norm(poly - vertex_pos, axis=1)
-    best = np.argmin(dists)
-    if dists[best] > threshold:
-        return None
-    return int(best)
+def _nearest_segment_index(vertex_pos, poly):
+    """Find the segment index in poly closest to vertex_pos.
+
+    Returns (seg_idx, t, dist) where t in [0,1] is the parameter along
+    segment poly[seg_idx] -> poly[seg_idx+1], and dist is the distance.
+    """
+    best_seg = 0
+    best_t = 0.0
+    best_dist = float("inf")
+    for k in range(len(poly) - 1):
+        d = poly[k + 1] - poly[k]
+        seg_len_sq = float(np.dot(d, d))
+        if seg_len_sq < 1e-30:
+            t = 0.0
+        else:
+            t = float(np.clip(np.dot(vertex_pos - poly[k], d) / seg_len_sq,
+                              0.0, 1.0))
+        proj = poly[k] + t * d
+        dist = float(np.linalg.norm(vertex_pos - proj))
+        if dist < best_dist:
+            best_seg = k
+            best_t = t
+            best_dist = dist
+    return best_seg, best_t, best_dist
 
 
 def build_arcs_from_polylines(polyline_map, vertices, vertex_edges,
-                              threshold=1e-3):
+                              vertex_polys):
     """
-    Build B-Rep arcs by fitting BSplines to polyline segments between vertices.
+    Build B-Rep arcs by splitting polylines at vertices and fitting B-splines.
 
-    For each edge's polyline:
-    1. Find incident vertices and their positions along the polyline.
-    2. Take the two outermost as endpoint vertices; trim polyline to them,
-       snap endpoints to exact vertex positions.
-    3. Fit one BSpline to the trimmed polyline.
-    4. Split the BSpline at interior vertex parameters to produce arcs.
+    Uses polyline-level vertex attribution (vertex_polys) to know exactly
+    which vertices are incident to which polyline.
 
-    Closed polylines with 0 incident vertices get a full closed BSpline.
-    Open polylines with 0 incident vertices get a full open BSpline.
+    For each edge, for each polyline:
+    1. Collect incident vertices from vertex_polys.
+    2. Discard if fewer than 2 incident vertices.
+    3. For each incident vertex, find nearest segment and insert the exact
+       vertex position into the polyline point sequence.
+    4. Sort incident vertices by arc-length along the polyline.
+    5. Trim polyline to outermost vertices.
+    6. Split into sub-polylines between consecutive vertices.
+    7. Fit a B-spline to each sub-polyline.
 
     Parameters
     ----------
-    polyline_map  : dict (i, j) → list of (N, 3) arrays
+    polyline_map  : dict (i, j) -> list of (N, 3) arrays
     vertices      : (M, 3) float64 array
-    vertex_edges  : list[set] of length M
-    threshold     : max distance for vertex-to-polyline attribution
+    vertex_edges  : list[set] of length M — set of edge_key tuples
+    vertex_polys  : list[set] of length M — set of (edge_key, poly_idx) tuples
 
     Returns
     -------
-    edge_arcs     : dict (i,j) → list[arc_dict]
-    vertices      : (M', 3) array (unchanged)
-    vertex_edges  : list[set] of length M'
+    edge_arcs     : dict (i,j) -> list[arc_dict]
+    vertices      : (M, 3) array (unchanged)
+    vertex_edges  : list[set] of length M
     """
     edge_arcs = {}
 
     for edge_key, polylines in polyline_map.items():
         arcs_for_edge = []
 
-        for poly in polylines:
+        for poly_idx, poly in enumerate(polylines):
             if len(poly) < 2:
                 continue
 
-            is_closed = np.linalg.norm(poly[0] - poly[-1]) < _CLOSURE_TOL
+            is_closed = (len(poly) >= 3 and
+                         np.linalg.norm(poly[0] - poly[-1]) < _CLOSURE_TOL)
 
-            # Find incident vertices for this edge + polyline
-            incident = []  # (polyline_index, vertex_index)
-            for v_idx, v_edges in enumerate(vertex_edges):
-                if edge_key not in v_edges:
-                    continue
-                pi = _find_polyline_index(vertices[v_idx], poly, threshold)
-                if pi is not None:
-                    incident.append((pi, v_idx))
+            # Collect incident vertices for this specific polyline
+            incident = []  # (v_idx,)
+            for v_idx in range(len(vertices)):
+                if (edge_key, poly_idx) in vertex_polys[v_idx]:
+                    incident.append(v_idx)
+
+            if not is_closed and len(incident) < 2:
+                # Open polyline with 0 or 1 vertices — discard
+                continue
+
+            if is_closed and len(incident) == 0:
+                # Closed polyline with 0 vertices — keep as full B-spline
+                curve = _fit_bspline(poly)
+                if curve is not None:
+                    arcs_for_edge.append({
+                        "curve": curve,
+                        "v_start": None,
+                        "v_end": None,
+                        "t_start": curve.FirstParameter(),
+                        "t_end": curve.LastParameter(),
+                        "closed": True,
+                        "edge_key": edge_key,
+                    })
+                continue
+
+            # For each incident vertex, find its position along the polyline
+            # (segment index + parameter within that segment)
+            vertex_positions = []  # (seg_idx, t, v_idx)
+            for v_idx in incident:
+                seg_idx, t, dist = _nearest_segment_index(
+                    vertices[v_idx], poly)
+                vertex_positions.append((seg_idx, t, v_idx))
+
+            # Sort by position along polyline
+            vertex_positions.sort(key=lambda x: (x[0], x[1]))
+
+            # Insert vertex positions into polyline, working from last to
+            # first to keep indices stable.
+            # Build insertion list: (insert_after_index, vertex_position)
+            insertions = []  # (insert_point, v_idx, vertex_pos)
+            for seg_idx, t, v_idx in vertex_positions:
+                if t < 1e-6:
+                    # Snap to existing point at seg_idx
+                    insertions.append(("snap", seg_idx, v_idx))
+                elif t > 1 - 1e-6:
+                    # Snap to existing point at seg_idx + 1
+                    insertions.append(("snap", seg_idx + 1, v_idx))
                 else:
-                    d = float(np.linalg.norm(
-                        poly - vertices[v_idx], axis=1).min())
-                    print(f"    [arcs] WARNING: v{v_idx} claimed by edge "
-                          f"{edge_key} but min_dist={d:.6e} > {threshold}")
+                    # Insert new point after seg_idx
+                    insertions.append(("insert", seg_idx, v_idx))
 
-            incident.sort(key=lambda x: x[0])
-            k = len(incident)
+            # Apply insertions to build modified polyline
+            # Process in reverse order to keep indices stable
+            mod_poly = poly.copy()
+            # Track where each vertex ends up in the modified polyline
+            vertex_mod_indices = {}  # v_idx -> index in mod_poly
 
-            if k == 0:
-                # No incident vertices: fit full BSpline
-                curve = _fit_bspline(poly)
+            # First pass: snaps (no index shifting)
+            for action, idx, v_idx in insertions:
+                if action == "snap":
+                    mod_poly[idx] = vertices[v_idx]
+                    vertex_mod_indices[v_idx] = idx
+
+            # Second pass: inserts (process in reverse order)
+            # Collect inserts sorted by position descending
+            insert_ops = [(idx, v_idx) for action, idx, v_idx in insertions
+                          if action == "insert"]
+            insert_ops.sort(key=lambda x: x[0], reverse=True)
+
+            for seg_idx, v_idx in insert_ops:
+                insert_pos = seg_idx + 1
+                mod_poly = np.insert(mod_poly, insert_pos,
+                                     vertices[v_idx], axis=0)
+                # Shift indices of previously placed vertices
+                for vk in vertex_mod_indices:
+                    if vertex_mod_indices[vk] >= insert_pos:
+                        vertex_mod_indices[vk] += 1
+                vertex_mod_indices[v_idx] = insert_pos
+
+            # Sort vertices by their position in the modified polyline
+            sorted_verts = sorted(vertex_mod_indices.items(),
+                                  key=lambda x: x[1])
+
+            # Trim to outermost vertices
+            first_v, first_idx = sorted_verts[0]
+            last_v, last_idx = sorted_verts[-1]
+            trimmed = mod_poly[first_idx:last_idx + 1]
+
+            # Recompute vertex indices relative to trimmed polyline
+            trimmed_verts = []  # (local_idx, v_idx)
+            for v_idx, mod_idx in sorted_verts:
+                local_idx = mod_idx - first_idx
+                trimmed_verts.append((local_idx, v_idx))
+
+            # Split into sub-polylines between consecutive vertices
+            for m in range(len(trimmed_verts) - 1):
+                idx_a, v_a = trimmed_verts[m]
+                idx_b, v_b = trimmed_verts[m + 1]
+                sub_poly = trimmed[idx_a:idx_b + 1]
+
+                if len(sub_poly) < 2:
+                    continue
+
+                curve = _fit_bspline(sub_poly)
                 if curve is None:
                     continue
-                arcs_for_edge.append({
-                    "curve": curve,
-                    "v_start": None,
-                    "v_end": None,
-                    "t_start": curve.FirstParameter(),
-                    "t_end": curve.LastParameter(),
-                    "closed": is_closed,
-                    "edge_key": edge_key,
-                })
-                continue
 
-            if k == 1:
-                # Single vertex — shouldn't produce useful arcs, fit full
-                curve = _fit_bspline(poly)
-                if curve is None:
-                    continue
-                _, v0 = incident[0]
-                arcs_for_edge.append({
-                    "curve": curve,
-                    "v_start": v0,
-                    "v_end": v0,
-                    "t_start": curve.FirstParameter(),
-                    "t_end": curve.LastParameter(),
-                    "closed": True,
-                    "edge_key": edge_key,
-                })
-                continue
-
-            # k >= 2: trim polyline to outermost vertices and snap
-            # ALL incident vertex positions into the polyline so the
-            # fitted BSpline passes exactly through every vertex.
-            first_pi, first_vi = incident[0]
-            last_pi, last_vi = incident[-1]
-
-            trimmed = poly[first_pi:last_pi + 1].copy()
-            if len(trimmed) < 2:
-                continue
-
-            # Snap all incident vertices into the trimmed polyline
-            # (indices shifted by -first_pi after trimming)
-            for pi, vi in incident:
-                local_idx = pi - first_pi
-                if 0 <= local_idx < len(trimmed):
-                    trimmed[local_idx] = vertices[vi]
-
-            curve = _fit_bspline(trimmed)
-            if curve is None:
-                continue
-
-            t_min = curve.FirstParameter()
-            t_max = curve.LastParameter()
-
-            if k == 2:
-                # No interior vertices — single arc
+                t_min = curve.FirstParameter()
+                t_max = curve.LastParameter()
                 arcs_for_edge.append({
                     "curve": Geom_TrimmedCurve(curve, t_min, t_max),
-                    "v_start": first_vi,
-                    "v_end": last_vi,
-                    "t_start": t_min,
-                    "t_end": t_max,
-                    "closed": False,
-                    "edge_key": edge_key,
-                })
-                continue
-
-            # k > 2: project interior vertices onto BSpline, split into arcs.
-            # Since the vertex positions were snapped into the polyline before
-            # fitting, projection lands exactly on the interpolation point.
-            interior = incident[1:-1]
-            arc_params = [(t_min, first_vi)]
-            for _, v_idx in interior:
-                vpos = vertices[v_idx]
-                proj = GeomAPI_ProjectPointOnCurve(
-                    gp_Pnt(float(vpos[0]), float(vpos[1]), float(vpos[2])),
-                    curve, t_min, t_max,
-                )
-                if proj.NbPoints() > 0:
-                    arc_params.append(
-                        (float(proj.LowerDistanceParameter()), v_idx))
-            arc_params.append((t_max, last_vi))
-            arc_params.sort(key=lambda x: x[0])
-
-            for m in range(len(arc_params) - 1):
-                t_a, v_a = arc_params[m]
-                t_b, v_b = arc_params[m + 1]
-                if t_b <= t_a + 1e-10:
-                    continue
-                arcs_for_edge.append({
-                    "curve": Geom_TrimmedCurve(curve, t_a, t_b),
                     "v_start": v_a,
                     "v_end": v_b,
-                    "t_start": t_a,
-                    "t_end": t_b,
+                    "t_start": t_min,
+                    "t_end": t_max,
                     "closed": False,
                     "edge_key": edge_key,
                 })
