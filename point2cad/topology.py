@@ -31,7 +31,7 @@ try:
     from OCC.Core.Geom           import Geom_TrimmedCurve
     from OCC.Core.GeomAPI        import GeomAPI_ProjectPointOnCurve, GeomAPI_ProjectPointOnSurf
     from OCC.Core.GeomLProp      import GeomLProp_SLProps
-    from OCC.Core.gp             import gp_Pnt, gp_GTrsf
+    from OCC.Core.gp             import gp_Pnt, gp_GTrsf, gp_Trsf, gp_Mat, gp_Vec, gp_Quaternion
     from OCC.Core.BRep           import BRep_Builder, BRep_Tool
     from OCC.Core.TopExp         import TopExp_Explorer
     from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_WIRE, TopAbs_SHELL, TopAbs_SOLID
@@ -44,6 +44,7 @@ try:
         BRepBuilderAPI_MakeSolid,
         BRepBuilderAPI_Sewing,
         BRepBuilderAPI_GTransform,
+        BRepBuilderAPI_Transform,
     )
     from OCC.Core.ShapeFix       import ShapeFix_Wire, ShapeFix_Shape, ShapeFix_Shell, ShapeFix_Face
     from OCC.Core.BRepLib        import breplib
@@ -295,7 +296,13 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-4):
                 t_star, dist = _project_vertex_on_curve(
                     verts[v_idx], curve, t_min, t_max
                 )
-                if t_star is None or dist > threshold:
+                if t_star is None:
+                    print(f"  [arc-split] edge {edge_key} v{v_idx}: "
+                          f"projection failed (outside parameter range)")
+                    continue
+                if dist > threshold:
+                    print(f"  [arc-split] edge {edge_key} v{v_idx}: "
+                          f"projection dist={dist:.6e} > threshold={threshold:.1e}")
                     continue
                 incident_params.append((t_star, v_idx))
 
@@ -1655,28 +1662,69 @@ def build_brep_shape_builderface(face_arcs, occ_surfaces, vertices,
                 print(f"[builderface] face {face_idx}: BuilderFace failed with errors")
                 continue
 
-            # Areas() returns the list of bounded faces built by the algorithm
+            # BuilderFace partitions the surface into bounded regions.
+            # When multiple regions exist, hole fillings (single-wire
+            # regions) overlap with adjacent surfaces.  The actual
+            # BRep face is the region with the most wires (outer +
+            # inner hole wires).  When only one region exists, use it
+            # directly.
             from OCC.Core.TopTools import TopTools_ListIteratorOfListOfShape
             areas = builder.Areas()
             n_areas = areas.Size()
-            print(f"[builderface] face {face_idx}: {n_edges} edges → "
-                  f"{n_areas} face(s)")
 
+            if n_areas == 0:
+                print(f"[builderface] face {face_idx}: {n_edges} edges → "
+                      f"0 regions")
+                continue
+
+            # Count wires per region and pick the one with most wires.
+            best_face = None
+            best_n_wires = -1
             it = TopTools_ListIteratorOfListOfShape(areas)
             while it.More():
-                face_shape = it.Value()
-                # Heal pcurve self-intersections caused by mesh BSpline
-                # fitting noise before adding to sewing.
-                try:
-                    ff = ShapeFix_Face(topods.Face(face_shape))
-                    ff.SetPrecision(tolerance)
-                    ff.FixIntersectingWires()
-                    ff.Perform()
-                    face_shape = ff.Face()
-                except Exception as fix_exc:
-                    print(f"[builderface] face {face_idx}: ShapeFix_Face failed: {fix_exc}")
-                sewing.Add(face_shape)
+                region = it.Value()
+                n_wires = 0
+                wexp = TopExp_Explorer(region, TopAbs_WIRE)
+                while wexp.More():
+                    n_wires += 1
+                    wexp.Next()
+                if n_wires > best_n_wires:
+                    best_n_wires = n_wires
+                    best_face = region
                 it.Next()
+
+            if n_areas > 1:
+                print(f"[builderface] face {face_idx}: {n_edges} edges → "
+                      f"{n_areas} region(s), keeping region with "
+                      f"{best_n_wires} wire(s), discarding "
+                      f"{n_areas - 1} hole filling(s)")
+            else:
+                print(f"[builderface] face {face_idx}: {n_edges} edges → "
+                      f"1 region, {best_n_wires} wire(s)")
+
+            # Heal wire orientation and pcurve issues before sewing.
+            # FixOrientation corrects outer/inner wire classification
+            # but can crash with "Bnd_Box is void" on some surfaces,
+            # so it's wrapped in try/except.
+            try:
+                face_shape = best_face
+                ff = ShapeFix_Face(topods.Face(face_shape))
+                ff.SetPrecision(tolerance)
+                try:
+                    result = ff.FixOrientation()
+                    print(f"[builderface] face {face_idx}: FixOrientation "
+                          f"returned {result}")
+                except Exception as fo_exc:
+                    print(f"[builderface] face {face_idx}: FixOrientation "
+                          f"crashed: {fo_exc}")
+                ff.FixIntersectingWires()
+                ff.Perform()
+                face_shape = ff.Face()
+                sewing.Add(face_shape)
+            except Exception as fix_exc:
+                print(f"[builderface] face {face_idx}: ShapeFix_Face "
+                      f"failed: {fix_exc}")
+                sewing.Add(best_face)
 
         except Exception as exc:
             print(f"[builderface] face {face_idx}: BuilderFace exception: {exc}")
@@ -1834,16 +1882,28 @@ def apply_inverse_normalization(shape, mean, R, scale):
     if shape is None or shape.IsNull():
         return shape
 
-    mat = float(scale) * np.asarray(R, dtype=np.float64).T  # 3x3: scale * R^T
+    Rt = np.asarray(R, dtype=np.float64).T          # 3x3 rotation
     mean = np.asarray(mean, dtype=np.float64)
+    s = float(scale)
 
-    trsf = gp_GTrsf()
-    for i in range(3):
-        for j in range(3):
-            trsf.SetValue(i + 1, j + 1, mat[i, j])
-        trsf.SetValue(i + 1, 4, mean[i])
+    # Build gp_Trsf (uniform scale + rotation + translation).
+    # gp_Trsf represents  p' = ScaleFactor * RotationMatrix * p + Translation
+    # Our inverse normalization is  p' = scale * R^T * p + mean
+    rot_mat = gp_Mat(
+        Rt[0, 0], Rt[0, 1], Rt[0, 2],
+        Rt[1, 0], Rt[1, 1], Rt[1, 2],
+        Rt[2, 0], Rt[2, 1], Rt[2, 2],
+    )
+    quat = gp_Quaternion(rot_mat)
 
-    result = BRepBuilderAPI_GTransform(shape, trsf, True)
+    trsf = gp_Trsf()
+    trsf.SetRotation(quat)
+    trsf.SetScaleFactor(s)
+    trsf.SetTranslationPart(gp_Vec(float(mean[0]), float(mean[1]), float(mean[2])))
+
+    # BRepBuilderAPI_Transform (not GTransform) handles BSpline curves
+    # by transforming control points only — knot vectors stay unchanged.
+    result = BRepBuilderAPI_Transform(shape, trsf, True)
     if not result.IsDone():
         print("[brep] apply_inverse_normalization: transform failed, returning shape as-is")
         return shape

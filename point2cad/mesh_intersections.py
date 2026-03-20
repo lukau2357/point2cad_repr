@@ -150,6 +150,65 @@ def _extract_polylines(intersection_polydata):
         ordered.append(start)  # close the loop
         polylines.append(points[ordered])
 
+    polylines = _merge_nearby_polylines(polylines, points)
+    return polylines
+
+
+def _merge_nearby_polylines(polylines, points, tol_factor=3.0):
+    """
+    Merge polylines whose endpoints are within a few median segment lengths.
+
+    VTK mesh intersection can produce gaps where triangle–triangle segments
+    are spatially adjacent but have distinct point indices.  This stitches
+    them back into a single continuous polyline.
+
+    The tolerance is tol_factor × median segment length across all polylines
+    of this intersection pair, adapting to mesh resolution automatically.
+    """
+    if len(polylines) <= 1:
+        return polylines
+
+    all_seg_lengths = []
+    for poly in polylines:
+        if len(poly) >= 2:
+            all_seg_lengths.append(np.linalg.norm(np.diff(poly, axis=0), axis=1))
+    if not all_seg_lengths:
+        return polylines
+    tol = tol_factor * float(np.median(np.concatenate(all_seg_lengths)))
+
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(polylines)):
+            for j in range(i + 1, len(polylines)):
+                pi = polylines[i]
+                pj = polylines[j]
+                # Try all four endpoint pairings
+                pairs = [
+                    ("end_start",   pi[-1], pj[0]),   # A_end   ↔ B_start
+                    ("end_end",     pi[-1], pj[-1]),   # A_end   ↔ B_end
+                    ("start_start", pi[0],  pj[0]),    # A_start ↔ B_start
+                    ("start_end",   pi[0],  pj[-1]),   # A_start ↔ B_end
+                ]
+                for tag, pa, pb in pairs:
+                    if np.linalg.norm(pa - pb) < tol:
+                        if tag == "end_start":
+                            combined = np.concatenate([pi, pj], axis=0)
+                        elif tag == "end_end":
+                            combined = np.concatenate([pi, pj[::-1]], axis=0)
+                        elif tag == "start_start":
+                            combined = np.concatenate([pi[::-1], pj], axis=0)
+                        elif tag == "start_end":
+                            combined = np.concatenate([pj, pi], axis=0)
+                        polylines[i] = combined
+                        polylines.pop(j)
+                        merged = True
+                        break
+                if merged:
+                    break
+            if merged:
+                break
+
     return polylines
 
 
@@ -179,7 +238,8 @@ def _fit_bspline(pts):
     for k, p in enumerate(pts):
         arr.SetValue(k + 1, gp_Pnt(float(p[0]), float(p[1]), float(p[2])))
 
-    approx = GeomAPI_PointsToBSpline(arr, 3, 8, GeomAbs_C2, 1e-4)
+    deg_min = 1 if len(pts) <= 3 else 3
+    approx = GeomAPI_PointsToBSpline(arr, deg_min, 8, GeomAbs_C2, 1e-4)
     if not approx.IsDone():
         return None
     curve = approx.Curve()
@@ -270,6 +330,79 @@ def compute_mesh_intersections(adj, surface_ids, results, fit_meshes,
               f"polylines={len(polylines)}  curves={len(result['curves'])}")
 
     return out, polyline_map
+
+
+def tangent_fallback(raw_intersections, polyline_map, boundary_strips,
+                     min_count, min_variance_ratio=0.9, extension=0.5):
+    """
+    For adjacent pairs with empty mesh intersections, attempt to recover a
+    tangent contact line from boundary strip points.
+
+    Fits a PCA line to the boundary strip, guarded by two gates:
+    1. Point count ≥ *min_count* (precomputed percentile of all boundary
+       strip sizes, filters false positive adjacencies).
+    2. PCA explained variance ratio ≥ *min_variance_ratio* (confirms
+       points are collinear, i.e. the tangency is a line).
+
+    Produces a 2-point polyline (single line segment) extended by
+    *extension* × span on each side, in the same format as mesh
+    intersection polylines.
+    """
+    for (i, j), result in list(raw_intersections.items()):
+        if result["type"] != "empty":
+            continue
+
+        bpts = boundary_strips.get((i, j))
+        if bpts is None or len(bpts) < max(3, min_count):
+            print(f"  [tangent] ({i}, {j}): {0 if bpts is None else len(bpts)} "
+                  f"boundary pts < {max(3, min_count)} — skipping")
+            continue
+
+        # PCA
+        centroid = bpts.mean(axis=0)
+        centered = bpts - centroid
+        cov = centered.T @ centered
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        # eigh returns ascending order; largest eigenvalue is last
+        eigenvalues = eigenvalues[::-1]
+        eigenvectors = eigenvectors[:, ::-1]
+
+        total = eigenvalues.sum()
+        if total < 1e-15:
+            continue
+        variance_ratio = eigenvalues[0] / total
+
+        if variance_ratio < min_variance_ratio:
+            print(f"  [tangent] ({i}, {j}): variance ratio {variance_ratio:.4f} "
+                  f"< {min_variance_ratio} — skipping")
+            continue
+
+        # Fit line: centroid + t * direction
+        direction = eigenvectors[:, 0]
+        projections = centered @ direction
+        t_min, t_max = float(projections.min()), float(projections.max())
+        span = t_max - t_min
+        if span < 1e-10:
+            continue
+
+        # Extend
+        t_min -= extension * span
+        t_max += extension * span
+
+        # 2-point polyline
+        p0 = centroid + t_min * direction
+        p1 = centroid + t_max * direction
+        polyline = np.array([p0, p1], dtype=np.float64)
+
+        # Fit BSpline (trivial for 2 points — degree 1 line)
+        curve = _fit_bspline(polyline)
+        if curve is None:
+            continue
+
+        raw_intersections[(i, j)] = _result([curve], [], "line", "tangent")
+        polyline_map[(i, j)] = [polyline]
+        print(f"  [tangent] ({i}, {j}): line from {len(bpts)} boundary pts  "
+              f"variance_ratio={variance_ratio:.4f}  span={span:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +606,34 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
         used[close] = True
 
     print(f"[seg-intersect] {len(vertices)} vertices after clustering")
+
+    # Post-clustering attribution: for each vertex, check if nearby
+    # polylines (sharing a face with an existing edge) pass through it.
+    # This catches edges missed by the segment crossing test (e.g. when
+    # the crossing distance was slightly above crossing_threshold).
+    for v_idx in range(len(vertices)):
+        pos = vertices[v_idx]
+        existing_faces = set()
+        for ea in vertex_edges[v_idx]:
+            existing_faces.update(ea)
+
+        for edge_key, polys in polyline_map.items():
+            if edge_key in vertex_edges[v_idx]:
+                continue
+            # Edge must share at least one face with the vertex
+            if not existing_faces & set(edge_key):
+                continue
+            for poly in polys:
+                if len(poly) < 2:
+                    continue
+                dists = np.linalg.norm(poly - pos, axis=1)
+                min_dist = float(np.min(dists))
+                if min_dist < cluster_radius:
+                    vertex_edges[v_idx].add(edge_key)
+                    print(f"  v{v_idx}: attributed edge {edge_key} "
+                          f"(polyline dist={min_dist:.6e})")
+                    break
+
     verts_arr = (np.array(vertices, dtype=np.float64) if vertices
                  else np.empty((0, 3), dtype=np.float64))
     return verts_arr, vertex_edges

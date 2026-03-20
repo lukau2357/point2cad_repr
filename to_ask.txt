@@ -57,3 +57,22 @@ Experiments:
 
 - 2 (vertical plane), 9 (tilted cylinder), 10 (straight cylinder), 13 (horizontal plane)
 - 2 vertices in intersection of (2, 9), (2, 13)
+
+❯ The manual pathaway works, I've already established that. Are there any references to this algorithm in the literature, where it is explained in detail?                              
+
+Yes, this is a well-known algorithm in computational geometry. The core idea — at each vertex, pick the next edge by angular ordering (first CCW from the incoming direction) to trace
+  face boundaries — is the standard algorithm for computing faces of a planar subdivision. It's equivalent to traversing a DCEL (Doubly-Connected Edge List) or half-edge data
+structure.
+
+Key references:
+
+1. de Berg, van Kreveld, Overmars, Schwarzkopf — "Computational Geometry: Algorithms and Applications" (Springer). Chapter 2 covers the DCEL and how face traversal works by following
+  "twin" and "next" half-edges. The angular ordering at vertices is exactly how the DCEL's next-pointers are defined.
+2. Mäntylä — "An Introduction to Solid Modeling" (Computer Science Press, 1988). Directly about BRep construction. Covers Euler operators and how face loops (wires) are assembled
+from edges, including the distinction between outer and inner loops.
+3. Hoffmann — "Geometric and Solid Modeling" (Morgan Kaufmann, 1989). Chapter on boundary representations, including wire assembly from edge graphs on surfaces.
+4. Preparata & Shamos — "Computational Geometry: An Introduction". Covers planar subdivisions and face enumeration.
+
+The most directly applicable is Mäntylä for the BRep context, and de Berg et al. for the algorithmic foundations. Your implementation is essentially: embed the edge graph on the
+surface, compute angular ordering at each vertex using the surface tangent plane, then extract face cycles by always following the first CCW neighbor — which is the textbook DCEL
+face traversal adapted to curved surfaces.

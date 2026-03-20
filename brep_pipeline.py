@@ -620,10 +620,12 @@ def run_compute(args):
         trim_by_vertices,
         compute_vertices_intcs,
         sample_curve,
+        _as_safe_curve,
     )
     from point2cad.mesh_intersections import (
         compute_mesh_intersections,
         compute_vertices_from_segment_intersection,
+        tangent_fallback,
     )
     from point2cad.topology import (
         build_edge_arcs,
@@ -859,6 +861,11 @@ def run_compute(args):
             raw_intersections, polyline_map = compute_mesh_intersections(
                 inter_adj, surface_ids, fit_results, fit_meshes,
             )
+            # Tangent fallback: fit PCA line to boundary strip for empty pairs
+            boundary_counts = np.array([len(b) for b in boundary_strips.values()])
+            tangent_min_count = float(np.percentile(boundary_counts, 10)) if len(boundary_counts) > 0 else 0
+            tangent_fallback(raw_intersections, polyline_map, boundary_strips,
+                             min_count=tangent_min_count)
         else:
             # Analytical pathway (OCC)
             raw_intersections = compute_all_intersections(
@@ -962,14 +969,16 @@ def run_compute(args):
                       f"  endpoint_dist={endpoint_dist:.6e}")
                 kw[f"curve_points_{k}"] = _denorm(
                     sample_curve(curve, n_points=200), part_mean, part_R, part_scale)
-            # Save raw curves, skipping infinite ones (they distort the visualizer).
+            # Save raw curves, wrapping infinite ones so they can be sampled.
             raw_saved = 0
             for k, curve in enumerate(inter_raw["curves"]):
                 t0_raw, t1_raw = curve.FirstParameter(), curve.LastParameter()
                 if abs(t0_raw) > 1e50 or abs(t1_raw) > 1e50:
-                    print(f"  raw      curve[{k}] [infinite] — skipped")
-                    continue
-                print(f"  raw      curve[{k}] [{t0_raw:.6f}, {t1_raw:.6f}]")
+                    curve = _as_safe_curve(curve)
+                    t0_raw, t1_raw = curve.FirstParameter(), curve.LastParameter()
+                    print(f"  raw      curve[{k}] [trimmed to {t0_raw:.6f}, {t1_raw:.6f}]")
+                else:
+                    print(f"  raw      curve[{k}] [{t0_raw:.6f}, {t1_raw:.6f}]")
                 kw[f"untrimmed_curve_points_{raw_saved}"] = _denorm(
                     sample_curve(curve, n_points=200),
                     part_mean, part_R, part_scale)
@@ -988,8 +997,10 @@ def run_compute(args):
         # Step 1: arc splitting
         # ------------------------------------------------------------------
         trim_curves_dict = {k: v["curves"] for k, v in trim_intersections_.items()}
+        # For mesh pathway, threshold must match cluster_radius from vertex computation
+        arc_threshold = 5e-3 if args.intersection_method == "mesh" else 1e-3
         edge_arcs, vertices, vertex_edges = build_edge_arcs(
-            trim_curves_dict, vertices, vertex_edges, threshold=1e-3
+            trim_curves_dict, vertices, vertex_edges, threshold=arc_threshold
         )
         print_edge_arcs_summary(edge_arcs)
 
