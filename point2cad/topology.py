@@ -1284,10 +1284,9 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
                 print(f"[brep] face {face_idx}: SetPeriodic failed: {exc}")
                 closed_u = closed_v = False
 
-        # BSpline (INR) face — UV-bounds method:
-        # Build a parameter-bounded face from the BSpline's (now possibly
-        # periodic) UV domain, clipped to the extent of incident arcs.
-        if is_inr:
+        # BSpline (INR) face — UV-bounds method (DISABLED: using wire-based
+        # construction for all faces, same as planes/cylinders/etc.)
+        if False and is_inr:
             # Start from full natural domain; constrain OPEN direction(s) by
             # projecting arc sample points onto the surface.  Sampling and
             # projection are skipped entirely when both directions are closed.

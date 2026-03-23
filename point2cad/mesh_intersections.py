@@ -338,7 +338,16 @@ def tangent_fallback(raw_intersections, polyline_map, boundary_strips,
     Produces a 2-point polyline (single line segment) extended by
     *extension* × span on each side, in the same format as mesh
     intersection polylines.
+
+    Returns
+    -------
+    tangent_spreads : dict (i, j) → float
+        Perpendicular spread (sqrt of second eigenvalue) for each tangent
+        edge.  Used as a data-derived attribution threshold in
+        post-clustering vertex attribution.
     """
+    tangent_spreads = {}
+
     for (i, j), result in list(raw_intersections.items()):
         if result["type"] != "empty":
             continue
@@ -368,6 +377,9 @@ def tangent_fallback(raw_intersections, polyline_map, boundary_strips,
                   f"< {min_variance_ratio} — skipping")
             continue
 
+        # Perpendicular spread: sqrt of second eigenvalue
+        spread = float(np.sqrt(eigenvalues[1])) if eigenvalues[1] > 0 else 0.0
+
         # Fit line: centroid + t * direction
         direction = eigenvectors[:, 0]
         projections = centered @ direction
@@ -387,8 +399,12 @@ def tangent_fallback(raw_intersections, polyline_map, boundary_strips,
 
         raw_intersections[(i, j)] = _result([], [], "line", "tangent")
         polyline_map[(i, j)] = [polyline]
+        tangent_spreads[(i, j)] = spread
         print(f"  [tangent] ({i}, {j}): line from {len(bpts)} boundary pts  "
-              f"variance_ratio={variance_ratio:.4f}  span={span:.4f}")
+              f"variance_ratio={variance_ratio:.4f}  span={span:.4f}  "
+              f"spread={spread:.4f}")
+
+    return tangent_spreads
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +463,9 @@ def _closest_point_segments(p0, p1, q0, q1):
 def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
                                                 crossing_threshold=None,
                                                 cluster_radius=5e-3,
-                                                bbox_margin=None):
+                                                bbox_margin=None,
+                                                tangent_edges=None,
+                                                tangent_threshold=1e-2):
     """
     Find B-Rep vertices by intersecting polyline segments pairwise.
 
@@ -604,30 +622,37 @@ def compute_vertices_from_segment_intersection(polyline_map, threshold=5e-3,
 
     print(f"[seg-intersect] {len(vertices)} vertices after clustering")
 
-    # Post-clustering attribution: for each vertex, check if compatible
-    # polylines pass close to it (point-to-segment distance).  This catches
-    # edges missed by crossing_threshold when 3+ surfaces meet at a point
-    # but one pairwise crossing is slightly above threshold.
+    # Post-clustering attribution: for each vertex, check all 2-combinations
+    # of its incident surfaces for missing edges.  Use distance-based
+    # attribution with cluster_radius for mesh polylines and a wider
+    # tangent_threshold for tangent-generated polylines.
+    if tangent_edges is None:
+        tangent_edges = set()
+    from itertools import combinations
     for v_idx in range(len(vertices)):
         pos = vertices[v_idx]
-        existing_faces = set()
+        incident_faces = set()
         for ea in vertex_edges[v_idx]:
-            existing_faces.update(ea)
+            incident_faces.update(ea)
 
-        for edge_key, polys_list in polyline_map.items():
+        for fi, fj in combinations(sorted(incident_faces), 2):
+            edge_key = (fi, fj)
             if edge_key in vertex_edges[v_idx]:
                 continue
-            if not existing_faces & set(edge_key):
+            if edge_key not in polyline_map:
                 continue
-            for pi, poly in enumerate(polys_list):
-                if len(poly) < 2:
-                    continue
+            polys_list = polyline_map[edge_key]
+            valid_polys = [(pi, p) for pi, p in enumerate(polys_list)
+                           if len(p) >= 2]
+
+            thr = tangent_threshold if edge_key in tangent_edges else cluster_radius
+            for pi, poly in valid_polys:
                 _, _, dist = _nearest_segment_index(pos, poly)
-                if dist < cluster_radius:
+                if dist < thr:
                     vertex_edges[v_idx].add(edge_key)
                     vertex_polys[v_idx].add((edge_key, pi))
                     print(f"  v{v_idx}: post-attributed edge {edge_key} "
-                          f"poly {pi} (seg dist={dist:.6e})")
+                          f"poly {pi} (dist={dist:.6e}, thr={thr:.1e})")
                     break
 
     verts_arr = (np.array(vertices, dtype=np.float64) if vertices

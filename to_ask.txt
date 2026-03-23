@@ -21,7 +21,8 @@
   - 00000008 (0.7, default)
   - 00000061 (default, default)
   - 00000007 (default, default)
-  - 00000019 (default, default)
+  - 00000019 (default, default). Mesh intersection algorithm does not work well for Part 4 of this model - neighboring clusters, but actually
+    it's a cylindrical surface split into two clusters for which the underlying primitive is the same.
   - 00000009 (default, default). Fitted 2 INRs instead of 2 cones, but the result was geometrically correct, and it visually matched the input reasonabl well.  
   - 00000017 (default, default)
   - 00000239 - Does not work, BSpline INR produced error seems to be causing the main problems.

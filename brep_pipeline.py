@@ -677,8 +677,8 @@ def run_compute(args):
     cluster_offset = 0
 
     for part_idx, sample_path in enumerate(part_files):
-        # if part_idx not in [0]:
-        #      continue
+        if args.part is not None and part_idx != args.part:
+            continue
         step_stem = f"part_{part_idx}"
         out_dir   = os.path.join(model_out_dir, f"part_{part_idx}")
 
@@ -726,18 +726,18 @@ def run_compute(args):
             _spacing = cluster_nn_percentiles[idx]
             _plane_kw    = {"mesh_dim": 100, "plane_sampling_deviation": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 5}
+                            "threshold_multiplier": 2}
             _sphere_kw   = {"dim_theta": 100, "dim_lambda": 100,
                             "spacing": _spacing,
-                            "threshold_multiplier": 5}
+                            "threshold_multiplier": 2}
             _cylinder_kw = {"dim_theta": 100, "dim_height": 50,
                             "cylinder_height_margin": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 5}
+                            "threshold_multiplier": 2}
             _cone_kw     = {"dim_theta": 100, "dim_height": 100,
                             "cone_height_margin": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 5}
+                            "threshold_multiplier": 2}
 
             res = fit_surface(
                 cluster,
@@ -863,10 +863,10 @@ def run_compute(args):
                 inter_adj, surface_ids, fit_results, fit_meshes,
             )
             # Tangent fallback: fit PCA line to boundary strip for empty pairs
-            boundary_counts = np.array([len(b) for b in boundary_strips.values()])
-            tangent_min_count = float(np.percentile(boundary_counts, 10)) if len(boundary_counts) > 0 else 0
-            tangent_fallback(raw_intersections, polyline_map, boundary_strips,
-                             min_count=tangent_min_count)
+            tangent_spreads = tangent_fallback(
+                raw_intersections, polyline_map, boundary_strips,
+                min_count=20)
+            tangent_edge_keys = set(tangent_spreads.keys())
         else:
             # Analytical pathway (OCC)
             raw_intersections = compute_all_intersections(
@@ -878,8 +878,10 @@ def run_compute(args):
         # ------------------------------------------------------------------
         if args.intersection_method == "mesh" and polyline_map:
             vertices, vertex_edges, vertex_polys = compute_vertices_from_segment_intersection(
-                polyline_map, threshold=5e-3, crossing_threshold=1e-4,
+                polyline_map, threshold=5e-3, crossing_threshold=5e-4,
                 cluster_radius=5e-3,
+                tangent_edges=tangent_edge_keys,
+                tangent_threshold=1e-2,
             )
             print(f"[vertices] found {len(vertices)} vertices (segment intersection)")
         else:
@@ -1134,6 +1136,9 @@ if __name__ == "__main__":
                              "'analytical': OCC GeomAPI_IntSS with analytical "
                              "fallbacks. 'mesh': PyVista mesh intersection "
                              "with BSpline fitting.")
+    parser.add_argument("--part", type=int, default=None,
+                        help="Process only this part index (0-based). "
+                             "Default: process all parts.")
     parser.add_argument("--wire_method", type=str, default="builderface",
                         choices=["builderface", "manual"],
                         help="Wire assembly method. "
