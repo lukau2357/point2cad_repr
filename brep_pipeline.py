@@ -625,6 +625,8 @@ def run_compute(args):
     from point2cad.mesh_intersections import (
         compute_mesh_intersections,
         compute_vertices_from_segment_intersection,
+        compute_vertices_from_point_matching,
+        merge_nearby_vertices,
         build_arcs_from_polylines,
         tangent_fallback,
     )
@@ -679,6 +681,12 @@ def run_compute(args):
     for part_idx, sample_path in enumerate(part_files):
         if args.part is not None and part_idx != args.part:
             continue
+        # Re-seed per part for deterministic results regardless of
+        # which other parts were processed before this one.
+        part_seed = args.seed + part_idx
+        np_rng = np.random.default_rng(part_seed)
+        torch.manual_seed(part_seed)
+        torch.cuda.manual_seed(part_seed)
         step_stem = f"part_{part_idx}"
         out_dir   = os.path.join(model_out_dir, f"part_{part_idx}")
 
@@ -877,13 +885,23 @@ def run_compute(args):
         # Vertex detection
         # ------------------------------------------------------------------
         if args.intersection_method == "mesh" and polyline_map:
-            vertices, vertex_edges, vertex_polys = compute_vertices_from_segment_intersection(
-                polyline_map, threshold=5e-3, crossing_threshold=5e-4,
+            # Point-matching vertex detection (more robust than segment crossing)
+            # To revert to segment crossing, replace with:
+            #   compute_vertices_from_segment_intersection(
+            #       polyline_map, threshold=5e-3, crossing_threshold=5e-4,
+            #       cluster_radius=5e-3, tangent_edges=tangent_edge_keys,
+            #       tangent_threshold=1e-2)
+            vertices, vertex_edges, vertex_polys = compute_vertices_from_point_matching(
+                polyline_map, match_threshold=5e-3,
                 cluster_radius=5e-3,
                 tangent_edges=tangent_edge_keys,
                 tangent_threshold=1e-2,
             )
-            print(f"[vertices] found {len(vertices)} vertices (segment intersection)")
+            print(f"[vertices] found {len(vertices)} vertices (point matching)")
+            # Second-pass merge: collapse nearby vertices sharing edges
+            vertices, vertex_edges, vertex_polys, _ = merge_nearby_vertices(
+                vertices, vertex_edges, vertex_polys, merge_radius=1.5e-2,
+            )
         else:
             vertices, vertex_edges = compute_vertices_intcs(
                 inter_adj, raw_intersections, occ_surfaces=occ_surfs,
