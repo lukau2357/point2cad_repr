@@ -791,41 +791,78 @@ def build_arcs_from_polylines(polyline_map, vertices, vertex_edges,
             sorted_verts = sorted(vertex_mod_indices.items(),
                                   key=lambda x: x[1])
 
-            # Trim to outermost vertices
-            first_v, first_idx = sorted_verts[0]
-            last_v, last_idx = sorted_verts[-1]
-            trimmed = mod_poly[first_idx:last_idx + 1]
+            if is_closed:
+                # Closed polyline: no trimming, split at all vertices
+                # including wrap-around arc from last vertex back to first.
+                n_sv = len(sorted_verts)
+                for m in range(n_sv):
+                    v_a, idx_a = sorted_verts[m]
+                    v_b, idx_b = sorted_verts[(m + 1) % n_sv]
 
-            # Recompute vertex indices relative to trimmed polyline
-            trimmed_verts = []  # (local_idx, v_idx)
-            for v_idx, mod_idx in sorted_verts:
-                local_idx = mod_idx - first_idx
-                trimmed_verts.append((local_idx, v_idx))
+                    if idx_b > idx_a:
+                        sub_poly = mod_poly[idx_a:idx_b + 1]
+                    else:
+                        # Wrap-around: end of polyline + start of polyline
+                        # Skip the duplicated closure point (last == first)
+                        sub_poly = np.concatenate([
+                            mod_poly[idx_a:],
+                            mod_poly[1:idx_b + 1],
+                        ], axis=0)
 
-            # Split into sub-polylines between consecutive vertices
-            for m in range(len(trimmed_verts) - 1):
-                idx_a, v_a = trimmed_verts[m]
-                idx_b, v_b = trimmed_verts[m + 1]
-                sub_poly = trimmed[idx_a:idx_b + 1]
+                    if len(sub_poly) < 2:
+                        continue
 
-                if len(sub_poly) < 2:
-                    continue
+                    curve = _fit_bspline(sub_poly)
+                    if curve is None:
+                        continue
 
-                curve = _fit_bspline(sub_poly)
-                if curve is None:
-                    continue
+                    t_min = curve.FirstParameter()
+                    t_max = curve.LastParameter()
+                    arcs_for_edge.append({
+                        "curve": Geom_TrimmedCurve(curve, t_min, t_max),
+                        "v_start": v_a,
+                        "v_end": v_b,
+                        "t_start": t_min,
+                        "t_end": t_max,
+                        "closed": False,
+                        "edge_key": edge_key,
+                    })
+            else:
+                # Open polyline: trim to outermost vertices
+                first_v, first_idx = sorted_verts[0]
+                last_v, last_idx = sorted_verts[-1]
+                trimmed = mod_poly[first_idx:last_idx + 1]
 
-                t_min = curve.FirstParameter()
-                t_max = curve.LastParameter()
-                arcs_for_edge.append({
-                    "curve": Geom_TrimmedCurve(curve, t_min, t_max),
-                    "v_start": v_a,
-                    "v_end": v_b,
-                    "t_start": t_min,
-                    "t_end": t_max,
-                    "closed": False,
-                    "edge_key": edge_key,
-                })
+                # Recompute vertex indices relative to trimmed polyline
+                trimmed_verts = []  # (local_idx, v_idx)
+                for v_idx, mod_idx in sorted_verts:
+                    local_idx = mod_idx - first_idx
+                    trimmed_verts.append((local_idx, v_idx))
+
+                # Split into sub-polylines between consecutive vertices
+                for m in range(len(trimmed_verts) - 1):
+                    idx_a, v_a = trimmed_verts[m]
+                    idx_b, v_b = trimmed_verts[m + 1]
+                    sub_poly = trimmed[idx_a:idx_b + 1]
+
+                    if len(sub_poly) < 2:
+                        continue
+
+                    curve = _fit_bspline(sub_poly)
+                    if curve is None:
+                        continue
+
+                    t_min = curve.FirstParameter()
+                    t_max = curve.LastParameter()
+                    arcs_for_edge.append({
+                        "curve": Geom_TrimmedCurve(curve, t_min, t_max),
+                        "v_start": v_a,
+                        "v_end": v_b,
+                        "t_start": t_min,
+                        "t_end": t_max,
+                        "closed": False,
+                        "edge_key": edge_key,
+                    })
 
         for arc_i, arc in enumerate(arcs_for_edge):
             arc["arc_idx"] = arc_i
