@@ -262,6 +262,7 @@ def run_visualize(args):
     trimmed_linesets   = []
     untrimmed_linesets = []
     polyline_linesets  = []
+    detected_method    = None  # will be set from inter_*.npz files
     boundary_pcds      = []
     for inter_path in sorted(_glob.glob(os.path.join(out_dir, "inter_*.npz"))):
         d          = np.load(inter_path, allow_pickle=True)
@@ -270,10 +271,12 @@ def run_visualize(args):
         n_raw      = int(d["n_untrimmed_curves"])
         ci, cj     = int(d["cluster_i"]), int(d["cluster_j"])
         method     = str(d["method"]) if "method" in d else "analytical"
+        if detected_method is None:
+            detected_method = method
         print(f"({ci}, {cj})  {d['surface_i_name']} ∩ {d['surface_j_name']}"
               f"  type={curve_type}  method={method}  trimmed={n_curves}  raw={n_raw}")
-        # OCC curves: color by curve type; mesh curves: magenta
-        if method == "mesh":
+        # OCC curves: color by curve type; mesh/topology curves: magenta
+        if method in ("mesh", "msi"):
             color = [1.0, 0.0, 0.8]  # magenta for mesh-derived curves
         else:
             color = CURVE_TYPE_COLORS.get(curve_type, [0.8, 0.8, 0.8])
@@ -383,7 +386,8 @@ def run_visualize(args):
 
     vis1 = o3d.visualization.Visualizer()
     if polyline_linesets:
-        vis1.create_window("Raw polylines (mesh)", width=W, height=H, left=0, top=50)
+        polyline_title = "Raw polylines (MSI)" if detected_method == "msi" else "Raw polylines (mesh)"
+        vis1.create_window(polyline_title, width=W, height=H, left=0, top=50)
         for ls in polyline_linesets:
             vis1.add_geometry(ls)
     else:
@@ -630,6 +634,9 @@ def run_compute(args):
         build_arcs_from_polylines,
         tangent_fallback,
     )
+    from point2cad.msi_extraction import (
+        extract_topology_msi, o3d_mesh_to_numpy,
+    )
     from point2cad.topology import (
         build_edge_arcs,
         greedy_oracle_filter,
@@ -734,18 +741,18 @@ def run_compute(args):
             _spacing = cluster_nn_percentiles[idx]
             _plane_kw    = {"mesh_dim": 100, "plane_sampling_deviation": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 2}
+                            "threshold_multiplier": 4}
             _sphere_kw   = {"dim_theta": 100, "dim_lambda": 100,
                             "spacing": _spacing,
-                            "threshold_multiplier": 2}
+                            "threshold_multiplier": 4}
             _cylinder_kw = {"dim_theta": 100, "dim_height": 50,
                             "cylinder_height_margin": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 2}
+                            "threshold_multiplier": 4}
             _cone_kw     = {"dim_theta": 100, "dim_height": 100,
                             "cone_height_margin": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 2}
+                            "threshold_multiplier": 4}
 
             res = fit_surface(
                 cluster,
@@ -866,7 +873,30 @@ def run_compute(args):
         # ------------------------------------------------------------------
         # Compute raw intersection curves
         # ------------------------------------------------------------------
-        if args.intersection_method == "mesh":
+        if args.intersection_method == "msi":
+            # --- libigl MSI pathway: topology + arcs computed together ---
+            mesh_list = [o3d_mesh_to_numpy(m) for m in fit_meshes]
+            edge_arcs, vertices, vertex_edges, msi_polyline_map = \
+                extract_topology_msi(
+                    mesh_list, min_polyline_points=3, adj=inter_adj,
+                )
+            polyline_map = msi_polyline_map  # for visualization/metadata
+            print(f"[vertices] found {len(vertices)} vertices (MSI extraction)")
+            # Build a minimal raw_intersections dict for downstream metadata
+            raw_intersections = {}
+            for (i, j) in polyline_map:
+                raw_intersections[(i, j)] = {
+                    "curves": [], "points": [],
+                    "type": "polyline", "method": "msi",
+                }
+            from point2cad.cluster_adjacency import adjacency_pairs
+            for i, j in adjacency_pairs(inter_adj):
+                if (i, j) not in raw_intersections:
+                    raw_intersections[(i, j)] = {
+                        "curves": [], "points": [],
+                        "type": "empty", "method": "msi",
+                    }
+        elif args.intersection_method == "mesh":
             raw_intersections, polyline_map = compute_mesh_intersections(
                 inter_adj, surface_ids, fit_results, fit_meshes,
             )
@@ -884,13 +914,11 @@ def run_compute(args):
         # ------------------------------------------------------------------
         # Vertex detection
         # ------------------------------------------------------------------
-        if args.intersection_method == "mesh" and polyline_map:
+        if args.intersection_method == "msi":
+            # Vertices already computed by extract_topology above
+            pass
+        elif args.intersection_method == "mesh" and polyline_map:
             # Point-matching vertex detection (more robust than segment crossing)
-            # To revert to segment crossing, replace with:
-            #   compute_vertices_from_segment_intersection(
-            #       polyline_map, threshold=5e-3, crossing_threshold=5e-4,
-            #       cluster_radius=5e-3, tangent_edges=tangent_edge_keys,
-            #       tangent_threshold=1e-2)
             vertices, vertex_edges, vertex_polys = compute_vertices_from_point_matching(
                 polyline_map, match_threshold=5e-3,
                 cluster_radius=5e-3,
@@ -910,46 +938,53 @@ def run_compute(args):
             print(f"[vertices] found {len(vertices)} vertices (IntCS)")
 
         # Score-cap filter: remove vertices too far from their clusters.
-        vertex_scores = []
-        for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
-            involved = set()
-            for edge in edges:
-                involved.update(edge)
-            score = _score_vertex(vpos, involved, cluster_trees,
-                                  cluster_nn_percentiles)
-            vertex_scores.append(score)
+        # Skipped for MSI — vertices come from exact mesh topology.
+        if args.intersection_method != "msi":
+            vertex_scores = []
+            for v_idx, (vpos, edges) in enumerate(zip(vertices, vertex_edges)):
+                involved = set()
+                for edge in edges:
+                    involved.update(edge)
+                score = _score_vertex(vpos, involved, cluster_trees,
+                                      cluster_nn_percentiles)
+                vertex_scores.append(score)
 
-        score_cap = args.score_cap
-        scores_arr = np.array(vertex_scores)
+            score_cap = args.score_cap
+            scores_arr = np.array(vertex_scores)
 
-        sorted_indices = np.argsort(scores_arr)
-        print(f"[vertex scores] {len(scores_arr)} vertices, "
-              f"range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, "
-              f"{0 if scores_arr.size == 0 else scores_arr.max():.4f}]")
-        for rank, idx in enumerate(sorted_indices):
-            edges_str = " ".join(
-                f"({min(e)}, {max(e)})" for e in vertex_edges[idx])
-            print(f"  v{idx:3d}  score={scores_arr[idx]:10.4f}  "
-                  f"edges=[{edges_str}]")
+            sorted_indices = np.argsort(scores_arr)
+            print(f"[vertex scores] {len(scores_arr)} vertices, "
+                  f"range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, "
+                  f"{0 if scores_arr.size == 0 else scores_arr.max():.4f}]")
+            for rank, idx in enumerate(sorted_indices):
+                edges_str = " ".join(
+                    f"({min(e)}, {max(e)})" for e in vertex_edges[idx])
+                print(f"  v{idx:3d}  score={scores_arr[idx]:10.4f}  "
+                      f"edges=[{edges_str}]")
 
-        keep_v = scores_arr <= score_cap
-        n_drop = int(np.sum(~keep_v))
-        n_keep = int(np.sum(keep_v))
-        if n_drop > 0 and n_keep >= 2:
-            print(f"[score-cap filter] threshold: {score_cap:.2f}  "
-                  f"keeping {n_keep}, dropping {n_drop}/{len(scores_arr)} vertices")
-            vertices = vertices[keep_v]
-            vertex_edges = [vertex_edges[i]
-                            for i in range(len(keep_v)) if keep_v[i]]
+            keep_v = scores_arr <= score_cap
+            n_drop = int(np.sum(~keep_v))
+            n_keep = int(np.sum(keep_v))
+            if n_drop > 0 and n_keep >= 2:
+                print(f"[score-cap filter] threshold: {score_cap:.2f}  "
+                      f"keeping {n_keep}, dropping {n_drop}/{len(scores_arr)} vertices")
+                vertices = vertices[keep_v]
+                vertex_edges = [vertex_edges[i]
+                                for i in range(len(keep_v)) if keep_v[i]]
+                if args.intersection_method == "mesh":
+                    vertex_polys = [vertex_polys[i]
+                                    for i in range(len(keep_v)) if keep_v[i]]
+            else:
+                print(f"[score-cap filter] threshold {score_cap:.2f} "
+                      f"would keep {n_keep} / drop {n_drop} — skipping")
+            print(f"[score-cap filter] after filter: {len(vertices)} vertices")
         else:
-            print(f"[score-cap filter] threshold {score_cap:.2f} "
-                  f"would keep {n_keep} / drop {n_drop} — skipping")
-        print(f"[score-cap filter] after filter: {len(vertices)} vertices")
+            print(f"[score-cap filter] skipped for MSI ({len(vertices)} vertices)")
 
         # ------------------------------------------------------------------
         # Trimming
         # ------------------------------------------------------------------
-        if args.intersection_method == "mesh":
+        if args.intersection_method in ("mesh", "msi"):
             trim_intersections_ = raw_intersections  # no separate trimming step
         else:
             trim_intersections_ = trim_by_vertices(
@@ -1017,7 +1052,10 @@ def run_compute(args):
         # ------------------------------------------------------------------
         # Step 1: arc splitting
         # ------------------------------------------------------------------
-        if args.intersection_method == "mesh":
+        if args.intersection_method == "msi":
+            # edge_arcs already computed by extract_topology_msi
+            pass
+        elif args.intersection_method == "mesh":
             edge_arcs, vertices, vertex_edges = build_arcs_from_polylines(
                 polyline_map, vertices, vertex_edges, vertex_polys,
             )
@@ -1027,6 +1065,39 @@ def run_compute(args):
                 trim_curves_dict, vertices, vertex_edges, threshold=1e-3
             )
         print_edge_arcs_summary(edge_arcs)
+
+        # Diagnostic: check how well B-spline curves lie on their surfaces
+        if args.intersection_method == "msi":
+            from OCC.Core.GeomAPI import GeomAPI_ProjectPointOnSurf
+            print("[curve-surface check] measuring arc-to-surface distances:")
+            for (ei, ej), arcs in edge_arcs.items():
+                for arc_idx, arc in enumerate(arcs):
+                    curve = arc["curve"]
+                    t0, t1 = arc["t_start"], arc["t_end"]
+                    n_samples = 20
+                    max_d_i = 0.0
+                    max_d_j = 0.0
+                    for k in range(n_samples):
+                        t = t0 + (t1 - t0) * k / max(n_samples - 1, 1)
+                        p = curve.Value(t)
+                        try:
+                            proj_i = GeomAPI_ProjectPointOnSurf(p, occ_surfs[ei])
+                            if proj_i.NbPoints() > 0:
+                                max_d_i = max(max_d_i, proj_i.LowerDistance())
+                        except Exception:
+                            max_d_i = float('inf')
+                        try:
+                            proj_j = GeomAPI_ProjectPointOnSurf(p, occ_surfs[ej])
+                            if proj_j.NbPoints() > 0:
+                                max_d_j = max(max_d_j, proj_j.LowerDistance())
+                        except Exception:
+                            max_d_j = float('inf')
+                    flag = ""
+                    if max_d_i > 1e-3 or max_d_j > 1e-3:
+                        flag = "  *** HIGH"
+                    print(f"  ({ei},{ej})[{arc_idx}]  "
+                          f"max_dist_to_surf{ei}={max_d_i:.6f}  "
+                          f"max_dist_to_surf{ej}={max_d_j:.6f}{flag}")
 
         # Save pre-filter vertices and arcs for visualization
         np.savez(os.path.join(out_dir, "vertices_pre_filter.npz"),
@@ -1149,11 +1220,12 @@ if __name__ == "__main__":
                         help="Merge adjacent clusters fitted to coincident surfaces "
                              "(e.g. over-segmented planes with identical parameters)")
     parser.add_argument("--intersection_method", type=str, default="analytical",
-                        choices=["analytical", "mesh"],
+                        choices=["analytical", "mesh", "msi"],
                         help="Surface intersection computation method. "
                              "'analytical': OCC GeomAPI_IntSS with analytical "
                              "fallbacks. 'mesh': PyVista mesh intersection "
-                             "with BSpline fitting.")
+                             "with BSpline fitting. 'msi': mesh self-intersection "
+                             "resolution (libigl/CGAL) + graph extraction.")
     parser.add_argument("--part", type=int, default=None,
                         help="Process only this part index (0-based). "
                              "Default: process all parts.")

@@ -122,51 +122,100 @@ def _status_name(code):
         return str(code)
 
 
+def _extract_status_errors(status_list):
+    """Extract error names from a BRepCheck status list (multiple strategies)."""
+    errors = []
+    # Strategy 1: C++ iterator
+    try:
+        it = status_list.begin()
+        end = status_list.end()
+        while it != end:
+            s = it.Value()
+            if s != BRepCheck_NoError:
+                errors.append(_status_name(s))
+            it.Next()
+        return errors
+    except Exception:
+        pass
+    # Strategy 2: Python iteration
+    try:
+        for s in status_list:
+            if s != BRepCheck_NoError:
+                errors.append(_status_name(s))
+        return errors
+    except Exception:
+        pass
+    # Strategy 3: indexing
+    try:
+        for k in range(status_list.Length()):
+            s = status_list.Value(k + 1)
+            if s != BRepCheck_NoError:
+                errors.append(_status_name(s))
+        return errors
+    except Exception:
+        pass
+    return [f"(could not iterate: {type(status_list).__name__})"]
+
+
 def _print_brep_check_details(analyzer, shape):
     """Print per-sub-shape BRepCheck errors when the analyzer reports invalid."""
     _shape_type_names = {
         TopAbs_VERTEX: "Vertex", TopAbs_EDGE: "Edge", TopAbs_WIRE: "Wire",
         TopAbs_FACE: "Face", TopAbs_SHELL: "Shell", TopAbs_SOLID: "Solid",
     }
+    any_errors = False
     for stype in (TopAbs_VERTEX, TopAbs_EDGE, TopAbs_WIRE,
                   TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID):
         exp = TopExp_Explorer(shape, stype)
         idx = 0
         while exp.More():
             sub = exp.Current()
+            name = _shape_type_names.get(stype, str(stype))
             try:
                 result = analyzer.Result(sub)
                 if result is None:
                     idx += 1
                     exp.Next()
                     continue
-                status_list = result.Status()
-                errors = []
-                # Try list-style iteration (works across pythonocc versions)
+                # Standalone status
+                errors = _extract_status_errors(result.Status())
+                # Context-dependent status (checks sub-shape within parent)
+                ctx_errors = []
                 try:
-                    it = status_list.begin()
-                    end = status_list.end()
-                    while it != end:
-                        s = it.Value()
-                        if s != BRepCheck_NoError:
-                            errors.append(_status_name(s))
-                        it.Next()
-                except (AttributeError, TypeError):
-                    # Fallback: try Python-style iteration
-                    try:
-                        for s in status_list:
-                            if s != BRepCheck_NoError:
-                                errors.append(_status_name(s))
-                    except TypeError:
-                        errors.append("(could not iterate status list)")
-                if errors:
-                    name = _shape_type_names.get(stype, str(stype))
-                    print(f"  [BRepCheck] {name} {idx}: {errors}")
+                    ctx_list = result.StatusOnShape(shape)
+                    ctx_errors = _extract_status_errors(ctx_list)
+                except Exception:
+                    pass
+                # Also check StatusOnShape for each parent face/shell
+                for ptype in (TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID):
+                    if ptype == stype:
+                        continue
+                    pexp = TopExp_Explorer(shape, ptype)
+                    pidx = 0
+                    while pexp.More():
+                        try:
+                            pctx = result.StatusOnShape(pexp.Current())
+                            perrs = _extract_status_errors(pctx)
+                            if perrs:
+                                pname = _shape_type_names.get(ptype, str(ptype))
+                                ctx_errors.extend(
+                                    f"{e} (in {pname} {pidx})" for e in perrs)
+                        except Exception:
+                            pass
+                        pidx += 1
+                        pexp.Next()
+
+                all_errors = errors + ctx_errors
+                if all_errors:
+                    any_errors = True
+                    print(f"  [BRepCheck] {name} {idx}: {all_errors}")
             except Exception as exc:
-                name = _shape_type_names.get(stype, str(stype))
+                any_errors = True
                 print(f"  [BRepCheck] {name} {idx}: error reading status: {exc}")
             idx += 1
             exp.Next()
+    if not any_errors:
+        print("  [BRepCheck] analyzer reported invalid but no specific errors found")
 
 
 # ---------------------------------------------------------------------------
@@ -729,10 +778,10 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     with contextlib.redirect_stdout(_captured):
         valid, shape, info, final_ea, final_v, final_ve = _try_build(
             removed_vertices, removed_arc_keys)
-    # Print BRepCheck details if the build failed
-    for _line in _captured.getvalue().splitlines():
-        if "[BRepCheck]" in _line or "[builderface]" in _line:
-            print(_line)
+    # Print build details if the build failed
+    if not valid:
+        for _line in _captured.getvalue().splitlines():
+            print(f"[oracle filter] {_line}")
     # Log arcs silently dropped by _apply_removals (open arcs with
     # v_start=None/v_end=None that can't survive vertex compaction).
     n_in = sum(len(a) for a in edge_arcs.values())
@@ -772,9 +821,9 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
         with contextlib.redirect_stdout(_captured):
             valid, shape, info, ea, verts, ve = _try_build(
                 removed_vertices, removed_arc_keys)
-        for _line in _captured.getvalue().splitlines():
-            if "[BRepCheck]" in _line or "[builderface]" in _line:
-                print(_line)
+        if not valid:
+            for _line in _captured.getvalue().splitlines():
+                print(f"[oracle filter] {_line}")
 
         n_faces = info.get("n_faces", 0)
         if valid:

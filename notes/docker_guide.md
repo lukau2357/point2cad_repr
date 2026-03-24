@@ -237,4 +237,5 @@ python abc_preprocess.py --abc_dir ../../abc_dataset --model_id 00000077 --outpu
 
 # Most useful command
 docker run --rm -it --gpus all -v $(pwd):/work -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix point2cad_occt bash 
+docker run --rm -it --gpus all -v $(pwd):/work -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix point2cad-libigl bash
 ```
