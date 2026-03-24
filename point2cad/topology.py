@@ -26,6 +26,7 @@ import math
 import contextlib
 from collections import defaultdict
 import numpy as np
+from scipy.spatial import cKDTree
 
 try:
     from OCC.Core.Geom           import Geom_TrimmedCurve
@@ -54,6 +55,8 @@ try:
     from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume, BOPAlgo_Builder, BOPAlgo_GlueFull, BOPAlgo_BuilderFace
     from OCC.Core.TopTools       import TopTools_ListOfShape
     from OCC.Core.BRepCheck      import BRepCheck_Analyzer, BRepCheck_NoError
+    from OCC.Core.BRepGProp      import brepgprop
+    from OCC.Core.GProp          import GProp_GProps
     from OCC.Core.Message        import Message_ProgressRange
     OCC_AVAILABLE = True
 except ImportError:
@@ -750,7 +753,7 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
             fa = face_arc_incidence(ea)
             shape, info = build_brep_shape_builderface(
                 fa, occ_surfaces, verts, surface_ids=surface_ids,
-                tolerance=tolerance,
+                tolerance=tolerance, clusters=clusters,
             )
         else:
             # Manual wire assembly (original method)
@@ -1127,18 +1130,16 @@ def assemble_wires(face_arcs, occ_surfaces=None, vertices=None, surface_ids=None
                         broken = True
                         break
 
-                    if len(candidates) > 1 and use_angular:
-                        arc, v_cur, forward = _select_next_arc_angular(
-                            v_cur, prev_arc, candidates,
-                            face_idx, occ_surfaces, vertices,
-                        )
+                    if len(candidates) > 1:
+                        # Edge continuity: prefer arcs from the same edge
+                        prev_edge = prev_arc.get("edge_key")
+                        same_edge = [c for c in candidates
+                                     if c[0].get("edge_key") == prev_edge]
+                        if same_edge:
+                            arc, v_cur, forward = same_edge[0]
+                        else:
+                            arc, v_cur, forward = candidates[0]
                     else:
-                        if len(candidates) > 1:
-                            print(
-                                f"[topology] face {face_idx}: vertex {v_cur}: "
-                                f"{len(candidates)} candidates but angular ordering "
-                                f"unavailable — using greedy first candidate"
-                            )
                         arc, v_cur, forward = candidates[0]
 
                     wire.append((arc, forward))
@@ -1495,7 +1496,8 @@ def build_brep_shape_builderface(face_arcs, occ_surfaces, vertices,
                                   surface_ids=None, tolerance=1e-3,
                                   inr_geom_close_tol=0.05, inr_arc_samples=30,
                                   inr_uv_margin=0.02,
-                                  same_parameter=True, orient_solid=True):
+                                  same_parameter=True, orient_solid=True,
+                                  clusters=None):
     """
     Build a TopoDS_Shape using BOPAlgo_BuilderFace for wire assembly.
 
@@ -1721,30 +1723,99 @@ def build_brep_shape_builderface(face_arcs, occ_surfaces, vertices,
                       f"0 regions")
                 continue
 
-            # Count wires per region and pick the one with most wires.
-            best_face = None
-            best_n_wires = -1
+            # Collect all candidate regions.
+            candidate_regions = []
             it = TopTools_ListIteratorOfListOfShape(areas)
             while it.More():
-                region = it.Value()
+                candidate_regions.append(it.Value())
+                it.Next()
+
+            if n_areas == 1:
+                best_face = candidate_regions[0]
                 n_wires = 0
-                wexp = TopExp_Explorer(region, TopAbs_WIRE)
+                wexp = TopExp_Explorer(best_face, TopAbs_WIRE)
                 while wexp.More():
                     n_wires += 1
                     wexp.Next()
-                if n_wires > best_n_wires:
-                    best_n_wires = n_wires
-                    best_face = region
-                it.Next()
+                print(f"[builderface] face {face_idx}: {n_edges} edges → "
+                      f"1 region, {n_wires} wire(s)")
+            elif clusters is not None and face_idx < len(clusters):
+                # Score each region by meshing it and computing mean NN
+                # distance from cluster points to the mesh vertices.
+                from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+                from OCC.Core.BRep import BRep_Tool
+                from OCC.Core.TopLoc import TopLoc_Location
 
-            if n_areas > 1:
+                cluster_pts = clusters[face_idx]
+                cluster_tree = cKDTree(cluster_pts)
+
+                best_face = None
+                best_score = float("inf")
+                best_ri = -1
+                for ri, region in enumerate(candidate_regions):
+                    # Mesh the candidate region
+                    mesh = BRepMesh_IncrementalMesh(region, tolerance * 10)
+                    mesh.Perform()
+
+                    # Extract mesh vertices
+                    face_shape = topods.Face(region)
+                    loc = TopLoc_Location()
+                    tri = BRep_Tool.Triangulation(face_shape, loc)
+                    if tri is None:
+                        print(f"[builderface] face {face_idx}: region {ri} "
+                              f"meshing failed, skipping")
+                        continue
+
+                    n_nodes = tri.NbNodes()
+                    mesh_pts = np.array(
+                        [[tri.Node(k).X(), tri.Node(k).Y(), tri.Node(k).Z()]
+                         for k in range(1, n_nodes + 1)],
+                        dtype=np.float64,
+                    )
+
+                    # Mean NN distance from cluster points to mesh vertices
+                    mesh_tree = cKDTree(mesh_pts)
+                    dists, _ = mesh_tree.query(cluster_pts, k=1)
+                    score = float(np.mean(dists))
+
+                    n_w = 0
+                    wexp = TopExp_Explorer(region, TopAbs_WIRE)
+                    while wexp.More():
+                        n_w += 1
+                        wexp.Next()
+                    print(f"[builderface] face {face_idx}: region {ri} — "
+                          f"{n_nodes} mesh pts, {n_w} wire(s), "
+                          f"mean NN dist = {score:.6f}")
+
+                    if score < best_score:
+                        best_score = score
+                        best_face = region
+                        best_ri = ri
+
+                if best_face is None:
+                    print(f"[builderface] face {face_idx}: all regions failed "
+                          f"meshing, skipping")
+                    continue
+
+                print(f"[builderface] face {face_idx}: {n_edges} edges → "
+                      f"{n_areas} region(s), selected region {best_ri} "
+                      f"(score {best_score:.6f})")
+            else:
+                # Fallback: pick region with most wires (no cluster data).
+                best_face = None
+                best_n_wires = -1
+                for region in candidate_regions:
+                    n_wires = 0
+                    wexp = TopExp_Explorer(region, TopAbs_WIRE)
+                    while wexp.More():
+                        n_wires += 1
+                        wexp.Next()
+                    if n_wires > best_n_wires:
+                        best_n_wires = n_wires
+                        best_face = region
                 print(f"[builderface] face {face_idx}: {n_edges} edges → "
                       f"{n_areas} region(s), keeping region with "
-                      f"{best_n_wires} wire(s), discarding "
-                      f"{n_areas - 1} hole filling(s)")
-            else:
-                print(f"[builderface] face {face_idx}: {n_edges} edges → "
-                      f"1 region, {best_n_wires} wire(s)")
+                      f"{best_n_wires} wire(s) (no cluster data, fallback)")
 
             # Heal wire orientation and pcurve issues before sewing.
             # FixOrientation corrects outer/inner wire classification

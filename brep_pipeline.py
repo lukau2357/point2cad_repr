@@ -741,18 +741,18 @@ def run_compute(args):
             _spacing = cluster_nn_percentiles[idx]
             _plane_kw    = {"mesh_dim": 100, "plane_sampling_deviation": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 4}
+                            "threshold_multiplier": 5}
             _sphere_kw   = {"dim_theta": 100, "dim_lambda": 100,
                             "spacing": _spacing,
-                            "threshold_multiplier": 4}
+                            "threshold_multiplier": 5}
             _cylinder_kw = {"dim_theta": 100, "dim_height": 50,
                             "cylinder_height_margin": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 4}
+                            "threshold_multiplier": 5}
             _cone_kw     = {"dim_theta": 100, "dim_height": 100,
                             "cone_height_margin": 0.5,
                             "spacing": _spacing,
-                            "threshold_multiplier": 4}
+                            "threshold_multiplier": 5}
 
             res = fit_surface(
                 cluster,
