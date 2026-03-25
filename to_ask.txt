@@ -13,17 +13,17 @@
 - Cluster oversegmentation remains a problem, investigate how to solve it, preferably in the point cloud generation script!
 
 - Parameter choices (spacing_factor = 1.5, score_cap = 10)
-  - 00949 (default, default)
-  - 00470 (default, default)
-  - 00000949 (default, default)
-  - 00000005 (default, default)
-  - 00000006 (defualt, default)
-  - 00000008 (0.7, default)
-  - 00000061 (default, default)
-  - 00000007 (default, default)
+  - 00949 (default, default) (works with MSI)
+  - 00470 (default, default) (freeform) (?)
+  - 00000949 (default, default) (workst with MIS)
+  - 00000005 (default, default) (tangent geometries present)
+  - 00000006 (defualt, default) (works with MSI)
+  - 00000008 (0.7, default) (works with MSI)
+  - 00000061 (default, default) (works with MSI)
+  - 00000007 (default, default) (works with MSI)
   - 00000019 (default, default). Mesh intersection algorithm does not work well for Part 4 of this model - neighboring clusters, but actually
     it's a cylindrical surface split into two clusters for which the underlying primitive is the same. Works well with second round of vertex merging
-    though...
+    though... MSI does not work for tangent geometries, will handle those eventually as well.
   - 00000009 (default, default). Fitted 2 INRs instead of 2 cones, but the result was geometrically correct, and it visually matched the input reasonabl well.  
   - 00000017 (default, default)
   - 00000239 - Does not work, BSpline INR produced error seems to be causing the main problems.
@@ -32,11 +32,16 @@
   - 00000104 - Does not work, 0 vertices, simple model in that regard. Lowering the spacing factor to as low as 0.1 did produce better curves,
     but still not correct results. Sphere/cylinder intersection return 4 BSpline curves that should constitute a single closed curve,
     the algorithm breaks... With mesh intersections, works fine when reducing spacing_factor to 0.1, but still FreeCAD rejects it because of 
-    "Invalid tolerance values". Try to catch these cases?
+    "Invalid tolerance values". Try to catch these cases? Questionable even if such models could appear in practice?
   - 00000121 (default, default). Good showcase of the algorithm for tomorrow's presentation.
   - 00000078 - Solver fails to compute the intersection between a cylinder and a plane that should be intersecting. When using mesh intersections,
     these pairs are still problematic. With mesh intersections in particular, this could be sidesteped by increasing cylinder radii for the purpose
     of mesh generation only, but there are more problems with the mesh pathway (merging gaps in polylines, reliable vertex computation, ...). 
+    With MSI approach, cannot battle with tangent geometries...
+  - 00000105 - Does not work..... Sphere mesh generation flawed somehow????
+  - 00000090 - Does not work.....
+  - 00000359 - Pipeline does not work for single-surface clusters, not that problematic, but irritating nontheless.
+  - 
 
     python main.py --output_dir output_p2cad --visualize --visualize_id 0 - Demonstrate that even mesh-derived intersections produce noisy results.
 ------------------------------
@@ -78,3 +83,5 @@ from edges, including the distinction between outer and inner loops.
 The most directly applicable is Mäntylä for the BRep context, and de Berg et al. for the algorithmic foundations. Your implementation is essentially: embed the edge graph on the
 surface, compute angular ordering at each vertex using the surface tangent plane, then extract face cycles by always following the first CCW neighbor — which is the textbook DCEL
 face traversal adapted to curved surfaces.
+
+BRep vertex is a vertex touching 3+ surfaces - current condition, too strict perhaps?

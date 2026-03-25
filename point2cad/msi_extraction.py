@@ -288,6 +288,8 @@ def _split_polylines_into_arcs(polyline_map, polyline_vindices_map,
         for poly_idx, (poly, vindices) in enumerate(
                 zip(polylines, vindices_list)):
             if len(poly) < 2:
+                print(f"  [arcs] edge {edge_key} poly[{poly_idx}]: "
+                      f"SKIP — too short ({len(poly)} pts)")
                 continue
 
             is_closed = (len(poly) >= 3 and
@@ -313,10 +315,17 @@ def _split_polylines_into_arcs(polyline_map, polyline_vindices_map,
                         "closed": True,
                         "edge_key": edge_key,
                     })
+                else:
+                    print(f"  [arcs] edge {edge_key} poly[{poly_idx}]: "
+                          f"SKIP — closed, no junctions, bspline fit failed "
+                          f"({len(poly)} pts)")
                 continue
 
             if not is_closed and len(junction_positions) < 2:
                 # Open polyline with 0 or 1 junctions — not enough to bound an arc
+                n_junc = len(junction_positions)
+                print(f"  [arcs] edge {edge_key} poly[{poly_idx}]: "
+                      f"SKIP — open, {n_junc} junction(s) ({len(poly)} pts)")
                 continue
 
             # Sort by position along polyline

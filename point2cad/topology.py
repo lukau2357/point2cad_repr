@@ -1558,6 +1558,7 @@ def _wire_uv_signed_area(wire_arcs, surface, n_samples=20):
     return area / 2.0
 
 
+
 def _build_face_with_uv_classification(face_idx, surface, wire_items,
                                         tolerance, sewing):
     """Build a face with correct outer/inner wire classification.
