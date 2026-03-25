@@ -223,39 +223,13 @@ def sample_sphere(dim_theta, dim_lambda, radius, center):
 def generate_sphere_mesh(dim_theta, dim_lambda, radius, center, cluster, device,
                          threshold_multiplier = 3.0,
                          spacing_percentile = 90,
-                         spacing = None,
-                         angular_margin_deg = 5.0):
-    center = center.reshape((1, 3))
-    # Project cluster points onto (theta, phi) on the sphere.
-    rel = cluster - center  # (N, 3)
-    theta_pts = np.arctan2(rel[:, 1], rel[:, 0])  # [-pi, pi]
-    phi_pts = np.arcsin(np.clip(rel[:, 2] / radius, -1.0, 1.0))  # [-pi/2, pi/2]
-
-    # Handle theta wrap-around: if points straddle the +-pi boundary,
-    # shift to [0, 2pi] range to get the correct bounding box.
-    theta_range = theta_pts.max() - theta_pts.min()
-    theta_shifted = (theta_pts + 2 * np.pi) % (2 * np.pi)
-    theta_range_shifted = theta_shifted.max() - theta_shifted.min()
-    if theta_range_shifted < theta_range:
-        theta_pts = theta_shifted
-
-    margin = np.radians(angular_margin_deg)
-    theta_min = theta_pts.min() - margin
-    theta_max = theta_pts.max() + margin
-    phi_min = max(phi_pts.min() - margin, -np.pi / 2 + 1e-7)
-    phi_max = min(phi_pts.max() + margin,  np.pi / 2 - 1e-7)
-
-    theta = np.linspace(theta_min, theta_max, dim_theta)
-    phi = np.linspace(phi_min, phi_max, dim_lambda)
-
-    # Build grid: theta varies along axis 0, phi along axis 1.
-    theta_g, phi_g = np.meshgrid(theta, phi, indexing='ij')  # (dim_theta, dim_lambda)
-    x = radius * np.cos(phi_g) * np.cos(theta_g) + center[0, 0]
-    y = radius * np.cos(phi_g) * np.sin(theta_g) + center[0, 1]
-    z = radius * np.sin(phi_g) + center[0, 2]
-    vertices = np.stack([x, y, z], axis=-1).reshape(-1, 3).astype(np.float32)
-
-    return triangulate_and_mesh(vertices, dim_theta, dim_lambda, "sphere", mask=None)
+                         spacing = None):
+    vertices = sample_sphere(dim_theta, dim_lambda, radius, center)
+    mask = grid_trimming(cluster, vertices, dim_theta, dim_lambda, device,
+                         threshold_multiplier = threshold_multiplier,
+                         spacing_percentile = spacing_percentile,
+                         spacing = spacing)
+    return triangulate_and_mesh(vertices, dim_theta, dim_lambda, "sphere", mask = mask)
 
 def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_margin = 0):
     # Input cluster is needed as points parameter, in order to determine minimum and maximum height for cylinder sampling
