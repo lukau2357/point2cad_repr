@@ -644,7 +644,8 @@ def run_compute(args):
         print_edge_arcs_summary,
         face_arc_incidence, print_face_arcs_summary,
         assemble_wires, print_face_wires_summary,
-        build_brep_shape, build_brep_shape_builderface,
+        build_brep_shape, build_brep_shape_direct,
+        build_brep_shape_builderface, build_brep_shape_cells,
         export_step, merge_step_files,
         apply_inverse_normalization,
     )
@@ -1124,7 +1125,7 @@ def run_compute(args):
             print_edge_arcs_summary(edge_arcs)
             face_arcs = face_arc_incidence(edge_arcs)
             print_face_arcs_summary(face_arcs)
-            if args.wire_method == "manual":
+            if args.wire_method in ("manual", "direct"):
                 face_wires = assemble_wires(face_arcs, occ_surfs, vertices,
                                              surface_ids=surface_ids)
                 print_face_wires_summary(face_wires)
@@ -1230,7 +1231,7 @@ if __name__ == "__main__":
                         help="Process only this part index (0-based). "
                              "Default: process all parts.")
     parser.add_argument("--wire_method", type=str, default="builderface",
-                        choices=["builderface", "manual"],
+                        choices=["builderface", "manual", "cells", "direct"],
                         help="Wire assembly method. "
                              "'builderface': OCC BOPAlgo_BuilderFace assembles "
                              "wires and faces from edges automatically. "

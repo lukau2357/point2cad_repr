@@ -36,7 +36,8 @@ try:
     from OCC.Core.BRep           import BRep_Builder, BRep_Tool
     from OCC.Core.TopExp         import TopExp_Explorer
     from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_WIRE, TopAbs_SHELL, TopAbs_SOLID
-    from OCC.Core.TopoDS         import topods, TopoDS_Wire, TopoDS_Compound
+    from OCC.Core.TopoDS         import (topods, TopoDS_Edge, TopoDS_Wire,
+                                         TopoDS_Face, TopoDS_Shell, TopoDS_Compound)
     from OCC.Core.BRepBuilderAPI import (
         BRepBuilderAPI_MakeVertex,
         BRepBuilderAPI_MakeEdge,
@@ -52,7 +53,7 @@ try:
     from OCC.Core.STEPControl    import (STEPControl_Writer, STEPControl_AsIs,
                                           STEPControl_Reader)
     from OCC.Core.IFSelect       import IFSelect_RetDone
-    from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume, BOPAlgo_Builder, BOPAlgo_GlueFull, BOPAlgo_BuilderFace
+    from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume, BOPAlgo_Builder, BOPAlgo_GlueFull, BOPAlgo_BuilderFace, BOPAlgo_CellsBuilder
     from OCC.Core.TopTools       import TopTools_ListOfShape
     from OCC.Core.BRepCheck      import BRepCheck_Analyzer, BRepCheck_NoError
     from OCC.Core.BRepGProp      import brepgprop
@@ -755,6 +756,24 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
                 fa, occ_surfaces, verts, surface_ids=surface_ids,
                 tolerance=tolerance, clusters=clusters,
             )
+        elif wire_method == "cells":
+            fa = face_arc_incidence(ea)
+            shape, info = build_brep_shape_cells(
+                fa, occ_surfaces, verts, surface_ids=surface_ids,
+                tolerance=tolerance, clusters=clusters,
+            )
+        elif wire_method == "direct":
+            bad_faces = _non_eulerian_faces_direct(ea)
+            if bad_faces:
+                return False, None, {"valid": False, "n_faces": 0,
+                                     "n_input_faces": 0,
+                                     "non_eulerian": sorted(bad_faces)}, ea, verts, ve
+            fa = face_arc_incidence(ea)
+            fw = assemble_wires(fa, occ_surfaces, verts, surface_ids=surface_ids)
+            shape, info = build_brep_shape_direct(
+                fa, occ_surfaces, verts, surface_ids=surface_ids,
+                face_wires=fw, tolerance=tolerance,
+            )
         else:
             # Manual wire assembly (original method)
             # Fast Euler pre-check — if any face is non-Eulerian, wire assembly
@@ -781,10 +800,9 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     with contextlib.redirect_stdout(_captured):
         valid, shape, info, final_ea, final_v, final_ve = _try_build(
             removed_vertices, removed_arc_keys)
-    # Print build details if the build failed
-    if not valid:
-        for _line in _captured.getvalue().splitlines():
-            print(f"[oracle filter] {_line}")
+    # Always print build details (previously suppressed on success).
+    for _line in _captured.getvalue().splitlines():
+        print(f"[oracle filter] {_line}")
     # Log arcs silently dropped by _apply_removals (open arcs with
     # v_start=None/v_end=None that can't survive vertex compaction).
     n_in = sum(len(a) for a in edge_arcs.values())
@@ -824,11 +842,13 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
         with contextlib.redirect_stdout(_captured):
             valid, shape, info, ea, verts, ve = _try_build(
                 removed_vertices, removed_arc_keys)
-        if not valid:
-            for _line in _captured.getvalue().splitlines():
-                print(f"[oracle filter] {_line}")
+        for _line in _captured.getvalue().splitlines():
+            print(f"[oracle filter] {_line}")
 
         n_faces = info.get("n_faces", 0)
+        non_euler = info.get("non_eulerian")
+        if non_euler:
+            print(f"[oracle filter]   non-Eulerian faces: {non_euler}")
         if valid:
             print(f"[oracle filter] valid! {n_faces} faces after "
                   f"{len(removed_arc_keys)} arc removals")
@@ -1492,6 +1512,251 @@ def build_brep_shape(face_arcs, occ_surfaces, vertices, surface_ids=None,
     return shape, result_info
 
 
+def _wire_uv_signed_area(wire_arcs, surface, n_samples=20):
+    """Signed area of a wire projected into surface UV space (shoelace).
+
+    Parameters
+    ----------
+    wire_arcs : list[(arc_dict, bool)]
+        Ordered arc sequence with forward/reverse flags.
+    surface : Geom_Surface
+    n_samples : int
+        Points sampled per arc.
+
+    Returns
+    -------
+    float   Signed area.  |area| is the enclosed UV region; the wire with the
+            largest |area| is the outer boundary.
+    """
+    uv_pts = []
+    for arc, forward in wire_arcs:
+        curve = arc["curve"]
+        t0 = curve.FirstParameter()
+        t1 = curve.LastParameter()
+        if not forward:
+            t0, t1 = t1, t0
+        for k in range(n_samples):
+            t = t0 + (t1 - t0) * k / max(n_samples - 1, 1)
+            try:
+                p = curve.Value(t)
+            except Exception:
+                continue
+            proj = GeomAPI_ProjectPointOnSurf(p, surface)
+            if proj.NbPoints() == 0:
+                continue
+            u, v = proj.LowerDistanceParameters()
+            uv_pts.append((u, v))
+    if len(uv_pts) < 3:
+        return 0.0
+    # Shoelace formula
+    area = 0.0
+    n = len(uv_pts)
+    for i in range(n):
+        j = (i + 1) % n
+        area += uv_pts[i][0] * uv_pts[j][1]
+        area -= uv_pts[j][0] * uv_pts[i][1]
+    return area / 2.0
+
+
+def _build_face_with_uv_classification(face_idx, surface, wire_items,
+                                        tolerance, sewing):
+    """Build a face with correct outer/inner wire classification.
+
+    Uses signed UV area to identify the outer wire, then constructs the
+    face with BRepBuilderAPI_MakeFace(surface, outer_wire) + Add(inner).
+    Falls back to UV-bounds if all wires have near-zero UV area (e.g.
+    full-period circles on a cylinder).
+
+    Parameters
+    ----------
+    wire_items : list[(TopoDS_Wire, wire_arcs_list)]
+    Returns True if a face was added to sewing.
+    """
+    occ_wires = [w for w, _ in wire_items]
+
+    if len(occ_wires) == 1:
+        # Single wire — no classification needed.
+        face_maker = BRepBuilderAPI_MakeFace(surface, occ_wires[0])
+        if not face_maker.IsDone():
+            print(f"[brep-direct] face {face_idx}: MakeFace (1 wire) "
+                  f"not done")
+            return False
+        face = face_maker.Face()
+        print(f"[brep-direct] face {face_idx}: 1 wire → ok")
+        sewing.Add(face)
+        return True
+
+    # Multiple wires — compute signed UV area for each.
+    areas = []
+    for _, wire_arcs in wire_items:
+        a = _wire_uv_signed_area(wire_arcs, surface)
+        areas.append(a)
+
+    abs_areas = [abs(a) for a in areas]
+    max_area = max(abs_areas)
+    area_log = "  ".join(f"w{i}={areas[i]:.4f}" for i in range(len(areas)))
+    print(f"[brep-direct] face {face_idx}: UV areas: {area_log}")
+
+    # Outer wire = largest |area|.
+    outer_idx = max(range(len(abs_areas)), key=lambda i: abs_areas[i])
+    outer_wire = occ_wires[outer_idx]
+
+    face_maker = BRepBuilderAPI_MakeFace(surface, outer_wire)
+    for i, w in enumerate(occ_wires):
+        if i == outer_idx:
+            continue
+        face_maker.Add(w)
+    if not face_maker.IsDone():
+        print(f"[brep-direct] face {face_idx}: MakeFace with "
+              f"outer=w{outer_idx} not done")
+        return False
+
+    face = face_maker.Face()
+    n_wires = sum(1 for _ in _iter_explorer(face, TopAbs_WIRE))
+    print(f"[brep-direct] face {face_idx}: {len(occ_wires)} wires "
+          f"(outer=w{outer_idx}) → {n_wires} after MakeFace")
+    sewing.Add(face)
+    return True
+
+
+def _iter_explorer(shape, shape_type):
+    """Yield sub-shapes from a TopExp_Explorer."""
+    exp = TopExp_Explorer(shape, shape_type)
+    while exp.More():
+        yield exp.Current()
+        exp.Next()
+
+
+def build_brep_shape_direct(face_arcs, occ_surfaces, vertices, surface_ids=None,
+                            face_wires=None, tolerance=1e-3):
+    """
+    Build a TopoDS_Shape with signed-UV-area wire classification.
+
+    For each face, wires are classified as outer/inner by projecting
+    sample points into UV space and computing the signed polygon area
+    (shoelace formula).  The wire with the largest |area| is the outer
+    boundary; the rest are holes.  When all wires have near-zero UV
+    area (full-period circles on a periodic surface), a UV-bounds
+    fallback is used instead.
+
+    Parameters / return value match build_brep_shape for drop-in use.
+    """
+    bb = BRep_Builder()
+
+    # 1. Build one TopoDS_Edge per unique arc.
+    arc_to_edge = {}
+    for arcs in face_arcs.values():
+        for arc in arcs:
+            key = _arc_key(arc)
+            if key in arc_to_edge:
+                continue
+            try:
+                arc_to_edge[key] = BRepBuilderAPI_MakeEdge(
+                    arc["curve"]).Edge()
+            except Exception as exc:
+                print(f"[brep-direct] MakeEdge failed for arc on "
+                      f"{arc.get('edge_key')}: {exc}")
+
+    # 2. Build wires and faces, then sew.
+    sewing = BRepBuilderAPI_Sewing(tolerance)
+
+    for face_idx, arcs in face_arcs.items():
+        if face_idx >= len(occ_surfaces) or occ_surfaces[face_idx] is None:
+            continue
+        surface = occ_surfaces[face_idx]
+
+        # Build OCC wires, keeping the arc-level description alongside
+        # each wire so we can compute UV areas for classification.
+        wire_items = []   # list of (TopoDS_Wire, wire_arcs_list)
+        for wire_arcs in face_wires.get(face_idx, []):
+            wire = TopoDS_Wire()
+            bb.MakeWire(wire)
+            n_added = 0
+            for arc, forward in wire_arcs:
+                key = _arc_key(arc)
+                if key not in arc_to_edge:
+                    continue
+                edge = arc_to_edge[key]
+                bb.Add(wire, edge if forward else edge.Reversed())
+                n_added += 1
+            if n_added == 0:
+                continue
+            fix_w = ShapeFix_Wire()
+            fix_w.Load(wire)
+            fix_w.SetPrecision(tolerance)
+            fix_w.FixConnected()
+            healed = fix_w.Wire()
+            if healed.IsNull():
+                print(f"[brep-direct] face {face_idx}: ShapeFix_Wire "
+                      f"produced null wire — skipping")
+                continue
+            wire_items.append((healed, wire_arcs))
+
+        if not wire_items:
+            print(f"[brep-direct] face {face_idx}: no wires — skipping")
+            continue
+
+        # Classify outer wire via signed UV area.
+        try:
+            face_ok = _build_face_with_uv_classification(
+                face_idx, surface, wire_items, tolerance, sewing)
+        except Exception as exc:
+            print(f"[brep-direct] face {face_idx}: exception: {exc}")
+            face_ok = False
+        if not face_ok:
+            print(f"[brep-direct] face {face_idx}: face construction failed")
+
+    # 3. Sew all faces into a shell.
+    print("[brep-direct] Sewing faces ...")
+    sewing.Perform()
+    shape = sewing.SewedShape()
+
+    n_input_faces = len(face_arcs)
+    if shape is None or shape.IsNull():
+        print("[brep-direct] sewing produced no shape")
+        return shape, {"valid": False, "n_faces": 0,
+                       "n_input_faces": n_input_faces}
+
+    # 4. Ensure consistent 3D curves, then heal.
+    print("[brep-direct] Fixing shape ...")
+    try:
+        breplib.BuildCurves3d(shape)
+    except Exception as exc:
+        print(f"[brep-direct] BuildCurves3d failed: {exc}")
+
+    fixer = ShapeFix_Shape(shape)
+    fixer.SetPrecision(tolerance)
+    fixer.Perform()
+    shape = fixer.Shape()
+
+    try:
+        breplib.SameParameter(shape, True)
+        print("[brep-direct] SameParameter done")
+    except Exception as exc:
+        print(f"[brep-direct] SameParameter failed: {exc}")
+
+    # 5. Check validity.
+    analyzer = BRepCheck_Analyzer(shape)
+    eval_results = analyzer.IsValid()
+
+    n_output_faces = 0
+    face_exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while face_exp.More():
+        n_output_faces += 1
+        face_exp.Next()
+
+    print(f"[brep-direct] BRepCheck valid: {eval_results}")
+    if not eval_results:
+        _print_brep_check_details(analyzer, shape)
+    print(f"[brep-direct] Output faces: {n_output_faces}/{n_input_faces}")
+
+    return shape, {
+        "valid": eval_results,
+        "n_faces": n_output_faces,
+        "n_input_faces": n_input_faces,
+    }
+
+
 def build_brep_shape_builderface(face_arcs, occ_surfaces, vertices,
                                   surface_ids=None, tolerance=1e-3,
                                   inr_geom_close_tol=0.05, inr_arc_samples=30,
@@ -1926,6 +2191,269 @@ def build_brep_shape_builderface(face_arcs, occ_surfaces, vertices,
     if not eval_results:
         _print_brep_check_details(analyzer, shape)
     print(f"[builderface] Output faces: {n_output_faces}/{n_input_faces}")
+
+    return shape, {"valid": eval_results, "n_faces": n_output_faces,
+                   "n_input_faces": n_input_faces}
+
+
+def build_brep_shape_cells(face_arcs, occ_surfaces, vertices,
+                           surface_ids=None, tolerance=1e-3,
+                           clusters=None,
+                           same_parameter=True, orient_solid=True):
+    """
+    Build a TopoDS_Shape using BOPAlgo_CellsBuilder.
+
+    Creates unbounded faces for each surface, edges from all arcs, and
+    feeds them to CellsBuilder which partitions surfaces at edges into
+    cells.  Cells are selected by scoring against cluster point clouds
+    (mean NN distance from cluster points to meshed cell).
+
+    Parameters match build_brep_shape; clusters is a list of numpy arrays
+    (per-face point clouds) used for cell selection.
+    """
+    from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+    from OCC.Core.TopLoc import TopLoc_Location
+    from OCC.Core.TopTools import TopTools_ListIteratorOfListOfShape
+
+    n_input_faces = len(face_arcs)
+
+    # 1. Create unbounded reference faces for each surface.
+    ref_faces = {}
+    for face_idx in face_arcs:
+        if face_idx >= len(occ_surfaces) or occ_surfaces[face_idx] is None:
+            continue
+        surface = occ_surfaces[face_idx]
+        is_inr = (surface_ids is not None and
+                  face_idx < len(surface_ids) and
+                  surface_ids[face_idx] == SURFACE_INR)
+        if is_inr:
+            continue  # skip INR surfaces for now
+        try:
+            fm = BRepBuilderAPI_MakeFace(surface, tolerance)
+            if fm.IsDone():
+                ref_faces[face_idx] = fm.Face()
+            else:
+                print(f"[cells] face {face_idx}: MakeFace for reference failed")
+        except Exception as exc:
+            print(f"[cells] face {face_idx}: MakeFace exception: {exc}")
+
+    print(f"[cells] created {len(ref_faces)} reference faces "
+          f"from {n_input_faces} input faces")
+
+    # 2. Create edges from all arcs.
+    arc_edges = []
+    arc_to_edge = {}
+    for arcs in face_arcs.values():
+        for arc in arcs:
+            key = _arc_key(arc)
+            if key in arc_to_edge:
+                continue
+            try:
+                edge = BRepBuilderAPI_MakeEdge(arc["curve"]).Edge()
+                arc_to_edge[key] = edge
+                arc_edges.append(edge)
+            except Exception as exc:
+                print(f"[cells] MakeEdge failed for arc on "
+                      f"{arc.get('edge_key')}: {exc}")
+
+    print(f"[cells] created {len(arc_edges)} edges from arcs")
+
+    # 3. Run CellsBuilder.
+    cb = BOPAlgo_CellsBuilder()
+    cb.SetFuzzyValue(tolerance)
+
+    # Add reference faces as arguments
+    for face_idx, face in ref_faces.items():
+        cb.AddArgument(face)
+
+    # Add edges as tools (splitting elements)
+    for edge in arc_edges:
+        cb.AddArgument(edge)
+
+    print("[cells] performing split ...")
+    cb.Perform()
+
+    if cb.HasErrors():
+        print("[cells] CellsBuilder failed with errors")
+        return None, {"valid": False, "n_faces": 0,
+                      "n_input_faces": n_input_faces}
+
+    # 4. Get all cells (split faces).
+    cb.MakeContainers()
+    result_shape = cb.Shape()
+
+    # Extract face-type cells from the result compound.
+    cells = []
+    cell_exp = TopExp_Explorer(result_shape, TopAbs_FACE)
+    while cell_exp.More():
+        cells.append(cell_exp.Current())
+        cell_exp.Next()
+
+    n_cells = len(cells)
+    print(f"[cells] split produced {n_cells} face cells")
+
+    if n_cells == 0:
+        return None, {"valid": False, "n_faces": 0,
+                      "n_input_faces": n_input_faces}
+
+    # For each cell, mesh it and find which cluster it belongs to.
+    selected_cells = []
+
+    if clusters is not None:
+        # Build KD-trees for all clusters
+        cluster_trees = [cKDTree(c) for c in clusters]
+
+        for ci, cell in enumerate(cells):
+            face_shape = topods.Face(cell)
+
+            # Mesh the cell
+            mesh = BRepMesh_IncrementalMesh(face_shape, tolerance * 10)
+            mesh.Perform()
+
+            loc = TopLoc_Location()
+            tri = BRep_Tool.Triangulation(face_shape, loc)
+            if tri is None:
+                print(f"[cells] cell {ci}: meshing failed, skipping")
+                continue
+
+            n_nodes = tri.NbNodes()
+            if n_nodes == 0:
+                continue
+
+            mesh_pts = np.array(
+                [[tri.Node(k).X(), tri.Node(k).Y(), tri.Node(k).Z()]
+                 for k in range(1, n_nodes + 1)],
+                dtype=np.float64,
+            )
+
+            # Find the best-matching cluster for this cell
+            best_cluster = -1
+            best_score = float("inf")
+            for cj, ct in enumerate(cluster_trees):
+                dists, _ = ct.query(mesh_pts, k=1)
+                score = float(np.mean(dists))
+                if score < best_score:
+                    best_score = score
+                    best_cluster = cj
+
+            print(f"[cells] cell {ci}: {n_nodes} mesh pts, "
+                  f"best cluster={best_cluster}, score={best_score:.6f}")
+
+            # Accept cell if it matches a cluster well enough
+            selected_cells.append((ci, cell, best_cluster, best_score))
+    else:
+        # No clusters — select all face cells
+        for ci, cell in enumerate(cells):
+            selected_cells.append((ci, cell, -1, 0.0))
+
+    print(f"[cells] {len(selected_cells)} face cells found")
+
+    # 6. For each cluster, pick the best cell (lowest score).
+    #    A cluster may have multiple cells (e.g. a plane split by edges).
+    cluster_to_cells = defaultdict(list)
+    for ci, cell, cj, score in selected_cells:
+        if cj >= 0:
+            cluster_to_cells[cj].append((ci, cell, score))
+
+    # Select: for each cluster, take all cells that match it
+    # (a face may be split into multiple valid sub-faces).
+    sewing = BRepBuilderAPI_Sewing(tolerance)
+    n_selected = 0
+    for cj in sorted(cluster_to_cells.keys()):
+        cells_for_cluster = cluster_to_cells[cj]
+        # Sort by score and take cells with reasonable scores
+        cells_for_cluster.sort(key=lambda x: x[2])
+        best = cells_for_cluster[0][2]
+        for ci, cell, score in cells_for_cluster:
+            # Accept cells within 2x of the best score for this cluster
+            if score <= best * 2.0 or score < tolerance * 10:
+                sewing.Add(cell)
+                n_selected += 1
+                print(f"[cells] selecting cell {ci} for cluster {cj} "
+                      f"(score={score:.6f})")
+
+    print(f"[cells] selected {n_selected} cells for {len(cluster_to_cells)} "
+          f"clusters")
+
+    # 7. Sew selected cells.
+    print("[cells] Sewing ...")
+    sewing.Perform()
+    shape = sewing.SewedShape()
+
+    if shape is None or shape.IsNull():
+        print("[cells] sewing produced no shape")
+        return shape, {"valid": False, "n_faces": 0,
+                       "n_input_faces": n_input_faces}
+
+    # 8. Fix.
+    try:
+        stype = shape.ShapeType()
+        if stype == TopAbs_SHELL:
+            shell_fix = ShapeFix_Shell(topods.Shell(shape))
+            shell_fix.SetPrecision(tolerance)
+            shell_fix.FixFaceOrientation(topods.Shell(shape))
+            shell_fix.Perform()
+            shape = shell_fix.Shape()
+            print("[cells] ShapeFix_Shell done")
+        else:
+            print(f"[cells] ShapeFix_Shell skipped (shape type {stype})")
+    except Exception as exc:
+        print(f"[cells] ShapeFix_Shell failed: {exc}")
+
+    print("[cells] Fixing shape ...")
+    try:
+        breplib.BuildCurves3d(shape)
+    except Exception as exc:
+        print(f"[cells] BuildCurves3d failed: {exc}")
+
+    fixer = ShapeFix_Shape(shape)
+    fixer.SetPrecision(tolerance)
+    fixer.Perform()
+    shape = fixer.Shape()
+
+    if same_parameter:
+        try:
+            breplib.SameParameter(shape, True)
+            print("[cells] SameParameter done")
+        except Exception as exc:
+            print(f"[cells] SameParameter failed: {exc}")
+
+    if orient_solid:
+        try:
+            stype = shape.ShapeType()
+            if stype == TopAbs_SOLID:
+                solid = topods.Solid(shape)
+                breplib.OrientClosedSolid(solid)
+                shape = solid
+                print("[cells] OrientClosedSolid done (solid)")
+            elif stype == TopAbs_SHELL:
+                solid_maker = BRepBuilderAPI_MakeSolid(topods.Shell(shape))
+                if solid_maker.IsDone():
+                    solid = solid_maker.Solid()
+                    breplib.OrientClosedSolid(solid)
+                    shape = solid
+                    print("[cells] OrientClosedSolid done (shell → solid)")
+                else:
+                    print("[cells] MakeSolid from shell failed")
+            else:
+                print(f"[cells] OrientClosedSolid skipped (shape type {stype})")
+        except Exception as exc:
+            print(f"[cells] OrientClosedSolid failed: {exc}")
+
+    # 9. Validate.
+    analyzer = BRepCheck_Analyzer(shape, True)
+    eval_results = analyzer.IsValid()
+
+    n_output_faces = 0
+    face_exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while face_exp.More():
+        n_output_faces += 1
+        face_exp.Next()
+
+    print(f"[cells] Results of BRep correctness analyzer: {eval_results}")
+    if not eval_results:
+        _print_brep_check_details(analyzer, shape)
+    print(f"[cells] Output faces: {n_output_faces}/{n_input_faces}")
 
     return shape, {"valid": eval_results, "n_faces": n_output_faces,
                    "n_input_faces": n_input_faces}
