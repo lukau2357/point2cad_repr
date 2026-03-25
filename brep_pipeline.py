@@ -745,7 +745,7 @@ def run_compute(args):
                             "threshold_multiplier": 5}
             _sphere_kw   = {"dim_theta": 100, "dim_lambda": 100,
                             "spacing": _spacing,
-                            "threshold_multiplier": 10}
+                            "threshold_multiplier": 5}
             _cylinder_kw = {"dim_theta": 100, "dim_height": 50,
                             "cylinder_height_margin": 0.5,
                             "spacing": _spacing,
