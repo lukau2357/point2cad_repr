@@ -253,9 +253,7 @@ def run_visualize(args):
         d      = np.load(arc_path, allow_pickle=True)
         n_arcs = int(d["n_arcs"])
         for k in range(n_arcs):
-            pts = _clip_to_bbox(d[f"arc_points_{k}"])
-            if pts is None:
-                continue
+            pts   = d[f"arc_points_{k}"]
             color = d[f"arc_color_{k}"].tolist()
             pre_filter_arc_linesets.append(_lineset(pts, color))
 
@@ -291,8 +289,11 @@ def run_visualize(args):
         # Raw polylines from mesh intersections (cyan)
         n_polys = int(d["n_polylines"]) if "n_polylines" in d else 0
         for k in range(n_polys):
+            poly_pts = d[f"polyline_points_{k}"]
+            print(f"  polyline ({ci},{cj})[{k}]: {poly_pts.shape} "
+                  f"range=[{poly_pts.min(axis=0)}, {poly_pts.max(axis=0)}]")
             polyline_linesets.append(
-                _lineset(d[f"polyline_points_{k}"], [0.0, 0.9, 0.9]))
+                _lineset(poly_pts, [0.0, 0.9, 0.9]))
         if "boundary_pts" in d:
             bpts = d["boundary_pts"]
             if len(bpts) > 0:

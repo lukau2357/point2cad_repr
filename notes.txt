@@ -14,7 +14,7 @@
 
 - Parameter choices (spacing_factor = 1.5, score_cap = 10)
   - 00949 (default, default) (works with MSI)
-  - 00470 (default, default) (freeform) (?)
+  - 00470 (default, default) (freeform) (works with MSI)
   - 00000949 (default, default) (workst with MIS)
   - 00000005 (default, default) (tangent geometries present)
   - 00000006 (defualt, default) (works with MSI)
@@ -41,8 +41,9 @@
   - 00000105 - Does not work..... Sphere mesh generation flawed somehow????
   - 00000090 - Does not work.....
   - 00000359 - Pipeline does not work for single-surface clusters, not that problematic, but irritating nontheless.
-  - 
-
+  - 00000406 - Works, but sphere is not trimmed properly. Region selection problem, this is relevant to other models.
+  - 00000655 - Works in principle, but also problems with sphere...
+  
     python main.py --output_dir output_p2cad --visualize --visualize_id 0 - Demonstrate that even mesh-derived intersections produce noisy results.
 ------------------------------
 Experiments:
@@ -85,3 +86,38 @@ surface, compute angular ordering at each vertex using the surface tangent plane
 face traversal adapted to curved surfaces.
 
 BRep vertex is a vertex touching 3+ surfaces - current condition, too strict perhaps?
+
+
+-- Overall problesm with the pipeline:
+- Tangency where tangent curve is not a simple line (model 0000655)
+- Sphere meshing seems to be problematic, or is it an artifact of visualization perhaps
+- CGAL self intersection resolution for meshes it non-deterministic...
+- Log files are too was + I'm not that familiar with OCC + BRep exact specifics, so I cannot pinpoint where EXACTLY the pipeline fails,
+  but it fails.
+
+For tomorrow's meeting:
+  - BRep assembly is extremely complicated, out of 21 models tested so far, the algorithm works on 12 out of 22 models, low success rate,
+  it's likely to get even worse as more models are introduced, not paper worthy, I doubt I can make any more improvements. 
+  
+  - MSI seems like the cleanest way to extract topology, but it's not a perfect method either, cannot cope with tangent geometries. 
+  With mesh method, we handler tangent geometries, but there are geometries where tangency curve between two surfaces is not a line - 00000105
+  
+  - Point2CAD's mesh generation could be improved:
+    finer mesh trimming + analytical solution for freeforms instead of INRs. Extend the set of surface primitives.
+
+  - It's unrealistic to expect a fully primitive-segmented point cloud in pratcice, CGAL has RANSAC implementation that fits a lot of 
+    primitives.
+
+  - Towards STEP methods: 
+      -- Primitive fitting (with segmentation or RANSAC), but every face has a single wire: UV bounds derived from the supporting cluster.
+      -- PolyFit pipeline generates only planes, should be simple enough for the current BRep builder. 
+      -- Construct a mesh from the unsegemnted point cloud (Poisson/Bal pivoting), convert to STEP somehow.
+      -- NONE of so-called reverse engineering papers actually produce a STEP. ComplexGen, arguably the most complex algorithm stops
+         at topology. For model visualizations they derive meshes, they do not even bother to construct a BRep...
+
+  - We have to accept that fully automatic reverse engineering is an impossible task (at least with respect to my understanding and current 
+    skill level)! Generate watertight mesh + decent enough STEP 
+    as a starting point for an engineer. Add also the extracted topology, although it could be noisy due to tangent geometries...
+
+  - BRep itself is not relevant for evaluating fidelity: we would sample meshse and compute Chamfer distance, or any other metric between 
+    point cloud sets anyway...

@@ -30,9 +30,11 @@ from scipy.spatial import cKDTree
 
 try:
     from OCC.Core.Geom           import Geom_TrimmedCurve
+    from OCC.Core.Geom2d         import Geom2d_TrimmedCurve
+    from OCC.Core.GCE2d          import GCE2d_MakeSegment
     from OCC.Core.GeomAPI        import GeomAPI_ProjectPointOnCurve, GeomAPI_ProjectPointOnSurf
     from OCC.Core.GeomLProp      import GeomLProp_SLProps
-    from OCC.Core.gp             import gp_Pnt, gp_GTrsf, gp_Trsf, gp_Mat, gp_Vec, gp_Quaternion
+    from OCC.Core.gp             import gp_Pnt, gp_Pnt2d, gp_GTrsf, gp_Trsf, gp_Mat, gp_Vec, gp_Quaternion
     from OCC.Core.BRep           import BRep_Builder, BRep_Tool
     from OCC.Core.TopExp         import TopExp_Explorer
     from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_WIRE, TopAbs_SHELL, TopAbs_SOLID
@@ -2657,12 +2659,64 @@ def _project_to_uv(surface, pts_3d):
     return np.array(uv, dtype=np.float64)
 
 
-def _alpha_shape_boundary(uv_pts, alpha=0.0):
+def _douglas_peucker(pts, epsilon):
+    """Simplify a closed polygon in-place using Douglas-Peucker.
+
+    pts: (N,2) ordered polygon vertices (not closed — first != last).
+    Returns simplified (M,2) array with M <= N.
+    """
+    if len(pts) <= 3:
+        return pts
+
+    # For a closed polygon, find the two farthest points to split
+    n = len(pts)
+    dists = np.linalg.norm(pts - pts[0], axis=1)
+    split = int(np.argmax(dists))
+    if split == 0:
+        return pts
+
+    def _simplify(points, eps):
+        if len(points) <= 2:
+            return points
+        # Find point farthest from line (points[0] -> points[-1])
+        start, end = points[0], points[-1]
+        line_vec = end - start
+        line_len = np.linalg.norm(line_vec)
+        if line_len < 1e-15:
+            return points[[0]]
+        line_dir = line_vec / line_len
+        vecs = points - start
+        proj = vecs @ line_dir
+        perp = vecs - np.outer(proj, line_dir)
+        d = np.linalg.norm(perp, axis=1)
+        idx = int(np.argmax(d))
+        if d[idx] > eps:
+            left = _simplify(points[:idx + 1], eps)
+            right = _simplify(points[idx:], eps)
+            return np.vstack([left[:-1], right])
+        else:
+            return points[[0, -1]]
+
+    # Split closed polygon into two chains and simplify each
+    chain1 = np.vstack([pts[0:split + 1]])
+    chain2 = np.vstack([pts[split:], pts[:1]])
+    s1 = _simplify(chain1, epsilon)
+    s2 = _simplify(chain2, epsilon)
+    # Merge (drop duplicate junction points)
+    result = np.vstack([s1[:-1], s2[:-1]])
+    if len(result) < 3:
+        return pts
+    return result
+
+
+def _alpha_shape_boundary(uv_pts, alpha=0.0, simplify_epsilon=0.0):
     """
     Compute the boundary polygon of a 2D point set using alpha shapes.
 
     alpha=0 uses the convex hull.  alpha>0 uses Delaunay triangulation
     filtered by circumradius < 1/alpha, giving a concave boundary.
+
+    If simplify_epsilon > 0, Douglas-Peucker simplification is applied.
 
     Returns an ordered (M,2) array of boundary UV points, or None on failure.
     """
@@ -2674,7 +2728,10 @@ def _alpha_shape_boundary(uv_pts, alpha=0.0):
     if alpha <= 0:
         try:
             hull = ConvexHull(uv_pts)
-            return uv_pts[hull.vertices]
+            boundary = uv_pts[hull.vertices]
+            if simplify_epsilon > 0:
+                boundary = _douglas_peucker(boundary, simplify_epsilon)
+            return boundary
         except Exception:
             return None
 
@@ -2733,11 +2790,15 @@ def _alpha_shape_boundary(uv_pts, alpha=0.0):
     if len(ordered) < 3:
         return None
 
-    return uv_pts[np.array(ordered)]
+    boundary = uv_pts[np.array(ordered)]
+    if simplify_epsilon > 0:
+        boundary = _douglas_peucker(boundary, simplify_epsilon)
+    return boundary
 
 
 def build_brep_shape_bop(occ_surfaces, clusters, surface_ids=None,
-                          tolerance=1e-3, alpha=0.0):
+                          tolerance=1e-3, alpha=0.0, simplify_epsilon=0.0,
+                          inflate=0.0):
     """
     Build a TopoDS_Shape by creating faces bounded by cluster UV boundaries.
 
@@ -2752,6 +2813,8 @@ def build_brep_shape_bop(occ_surfaces, clusters, surface_ids=None,
     surface_ids    : list[int] or None
     tolerance      : float
     alpha          : float — alpha shape parameter (0 = convex hull)
+    simplify_epsilon : float — Douglas-Peucker tolerance (0 = no simplification)
+    inflate        : float — fractional inflation of UV boundary (0 = none)
     """
     n = len(occ_surfaces)
 
@@ -2773,23 +2836,29 @@ def build_brep_shape_bop(occ_surfaces, clusters, surface_ids=None,
                 continue
 
             # Compute boundary polygon in UV
-            boundary_uv = _alpha_shape_boundary(uv, alpha=alpha)
+            boundary_uv = _alpha_shape_boundary(uv, alpha=alpha,
+                                                    simplify_epsilon=simplify_epsilon)
             if boundary_uv is None or len(boundary_uv) < 3:
                 print(f"[bop] face {i} ({dtype}): boundary extraction failed — skipping")
                 continue
 
-            # Map boundary UV points back to 3D via surface.Value()
-            boundary_3d = []
-            for u, v in boundary_uv:
-                p = surface.Value(float(u), float(v))
-                boundary_3d.append(gp_Pnt(p.X(), p.Y(), p.Z()))
+            # Inflate boundary outward from centroid
+            if inflate > 0:
+                centroid = boundary_uv.mean(axis=0)
+                boundary_uv = centroid + (1.0 + inflate) * (boundary_uv - centroid)
 
-            # Build wire from boundary polygon
+            # Build wire from boundary polygon using UV-space segments on the surface.
+            # Each edge is a straight line in UV mapped onto the surface, so it
+            # follows the surface curvature (e.g., circular arcs on a cylinder).
             wire_builder = BRepBuilderAPI_MakeWire()
-            for k in range(len(boundary_3d)):
-                p0 = boundary_3d[k]
-                p1 = boundary_3d[(k + 1) % len(boundary_3d)]
-                edge = BRepBuilderAPI_MakeEdge(p0, p1).Edge()
+            for k in range(len(boundary_uv)):
+                uv0 = boundary_uv[k]
+                uv1 = boundary_uv[(k + 1) % len(boundary_uv)]
+                p2d_0 = gp_Pnt2d(float(uv0[0]), float(uv0[1]))
+                p2d_1 = gp_Pnt2d(float(uv1[0]), float(uv1[1]))
+                seg2d = GCE2d_MakeSegment(p2d_0, p2d_1).Value()
+                edge = BRepBuilderAPI_MakeEdge(seg2d, surface).Edge()
+                breplib.BuildCurves3d(edge)
                 wire_builder.Add(edge)
 
             if not wire_builder.IsDone():
