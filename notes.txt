@@ -85,39 +85,39 @@ The most directly applicable is Mäntylä for the BRep context, and de Berg et a
 surface, compute angular ordering at each vertex using the surface tangent plane, then extract face cycles by always following the first CCW neighbor — which is the textbook DCEL
 face traversal adapted to curved surfaces.
 
-BRep vertex is a vertex touching 3+ surfaces - current condition, too strict perhaps?
-
-
--- Overall problesm with the pipeline:
-- Tangency where tangent curve is not a simple line (model 0000655)
-- Sphere meshing seems to be problematic, or is it an artifact of visualization perhaps
-- CGAL self intersection resolution for meshes it non-deterministic...
-- Log files are too was + I'm not that familiar with OCC + BRep exact specifics, so I cannot pinpoint where EXACTLY the pipeline fails,
-  but it fails.
-
+-----------------------------------------------------------------------------------------------------------------------------------------------
 For tomorrow's meeting:
-  - BRep assembly is extremely complicated, out of 21 models tested so far, the algorithm works on 12 out of 22 models, low success rate,
-  it's likely to get even worse as more models are introduced, not paper worthy, I doubt I can make any more improvements. 
+  - Mesh-self intersection (MSI) was shown to be more robust for topology extraction that intersecting adjecent meshes.
+
+  - BRep assembly is extremely complicated, out of 22 models tested so far, the algorithm works on 12 (~54 %), 
+    low success rate, it's likely to get even worse as more models are introduced, not paper worthy, 
+    I doubt I can make any more improvements. 
   
   - MSI seems like the cleanest way to extract topology, but it's not a perfect method either, cannot cope with tangent geometries. 
-  With mesh method, we handler tangent geometries, but there are geometries where tangency curve between two surfaces is not a line - 00000105
+    With mesh method, we handler tangent geometries, but there are geometries where tangency curve between two surfaces is not a line 
+    (00000105)
   
   - Point2CAD's mesh generation could be improved:
-    finer mesh trimming + analytical solution for freeforms instead of INRs. Extend the set of surface primitives.
+    finer mesh trimming + analytical solution for freeforms instead of INRs. Extend the set of surface primitives. Also explore the setting
+    of generating a mesh + primitives from a non-segmented point cloud.
 
-  - It's unrealistic to expect a fully primitive-segmented point cloud in pratcice, CGAL has RANSAC implementation that fits a lot of 
+  - It's unrealistic to expect a fully primitive-segmented point cloud in pratcice, CGAL has E-RANSAC implementation that fits a lot of 
     primitives.
 
   - Towards STEP methods: 
-      -- Primitive fitting (with segmentation or RANSAC), but every face has a single wire: UV bounds derived from the supporting cluster.
+      -- Primitive fitting (with segmentation or E-RANSAC), but every face has a single wire: UV bounds derived from the supporting cluster.
       -- PolyFit pipeline generates only planes, should be simple enough for the current BRep builder. 
       -- Construct a mesh from the unsegemnted point cloud (Poisson/Bal pivoting), convert to STEP somehow.
       -- NONE of so-called reverse engineering papers actually produce a STEP. ComplexGen, arguably the most complex algorithm stops
-         at topology. For model visualizations they derive meshes, they do not even bother to construct a BRep...
+         at topology. For model visualizations they derive meshes, they do not even bother to construct a full BRep, even though they produce
+         a toplogy.
 
   - We have to accept that fully automatic reverse engineering is an impossible task (at least with respect to my understanding and current 
-    skill level)! Generate watertight mesh + decent enough STEP 
-    as a starting point for an engineer. Add also the extracted topology, although it could be noisy due to tangent geometries...
+    skill level)! Generate watertight mesh + decent enough STEP as a starting point for an engineer. 
+    Add also the extracted topology, although it could be noisy due to tangent geometries...
 
   - BRep itself is not relevant for evaluating fidelity: we would sample meshse and compute Chamfer distance, or any other metric between 
     point cloud sets anyway...
+
+- Reduce risk of curves not matching surface equations: for polyline in intersection of surfaces (A, B) project each point to UV of 
+  both surfaces, backrpoject and average out.

@@ -13,3 +13,4 @@ sample_clouds_stats/
 .claude
 output_p2cad
 *.png
+output_bfs/
