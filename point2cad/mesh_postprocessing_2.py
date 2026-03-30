@@ -1,7 +1,9 @@
 import numpy as np
 import open3d as o3d
-import pymesh
-from collections import deque
+import igl
+import igl.copyleft.cgal
+import trimesh
+from collections import Counter, deque
 from scipy.spatial import cKDTree
 
 from .color_config import get_surface_color
@@ -73,6 +75,129 @@ def build_cluster_trees(clusters, spacing_percentile=100.0):
     return trees, spacings
 
 
+def _resolve_intersections(o3d_meshes, tag="clip"):
+    """
+    Merge all surface meshes, resolve self-intersections via libigl/CGAL,
+    deduplicate vertices.
+
+    Returns
+    -------
+    VV             : (N, 3) float64 — resolved vertices
+    FF             : (M, 3) int64   — resolved faces
+    face_provenance: (M,)   int32   — original surface index per resolved face
+    """
+    mesh_list = []
+    for m in o3d_meshes:
+        V_i, F_i = o3d_mesh_to_numpy(m)
+        mesh_list.append((V_i.astype(np.float64), F_i.astype(np.int32)))
+    V_merged, F_merged, face_sources_merged = _merge_meshes(mesh_list)
+    print(f"[{tag}] Merged: {len(V_merged)} vertices, {len(F_merged)} faces")
+
+    # J[i] = merged face that resolved face i came from (one-level provenance)
+    # IM[i] = canonical vertex index for vertex i (deduplication map)
+    VV_raw, FF_raw, _IF, J, IM = igl.copyleft.cgal.remesh_self_intersections(
+        V_merged, F_merged.astype(np.int32)
+    )
+    face_provenance = face_sources_merged[J].astype(np.int32)
+
+    FF_dedup = IM[FF_raw]
+    VV, FF_clean, _I, _J2 = igl.remove_unreferenced(VV_raw, FF_dedup)
+    FF = FF_clean.astype(np.int64)
+    print(f"[{tag}] Resolved: {len(VV)} vertices, {len(FF)} faces")
+    return VV, FF, face_provenance
+
+
+def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
+                      area_multiplier=2.0):
+    """
+    Point2CAD-style mesh clipping: connected components of the resolved mesh
+    filtered by area-per-supporting-point ratio.
+
+    For each surface s, the resolved mesh is split into connected components
+    (edge-based adjacency). Each cluster point votes for its nearest component.
+    Components whose area/vote_count is within area_multiplier of the best
+    (lowest) ratio are kept.
+
+    Parameters
+    ----------
+    o3d_meshes     : list of open3d.geometry.TriangleMesh, one per cluster
+    clusters       : list of (N, 3) float arrays — input point clouds
+    surface_types  : list of str — surface type names (for coloring)
+    area_multiplier: keep components with area_per_point < best * area_multiplier
+
+    Returns
+    -------
+    clipped : list of open3d.geometry.TriangleMesh, one per cluster
+    """
+    VV, FF, face_provenance = _resolve_intersections(o3d_meshes, tag="p2cad-clip")
+
+    tri_resolved = trimesh.Trimesh(vertices=VV, faces=FF, process=False)
+    connected_labels = trimesh.graph.connected_component_labels(
+        edges=tri_resolved.face_adjacency,
+        node_count=len(FF)
+    )
+    unique_labels = [item[0] for item in Counter(connected_labels).most_common()]
+    print(f"[p2cad-clip] {len(unique_labels)} connected components")
+
+    # Build submeshes and attribute each to a surface via majority provenance
+    submeshes = []
+    submesh_surface = []
+    for lbl in unique_labels:
+        face_idx = np.where(connected_labels == lbl)[0]
+        if len(face_idx) <= 2:
+            continue
+        sub = trimesh.Trimesh(vertices=VV,
+                              faces=FF[face_idx],
+                              process=False)
+        submeshes.append(sub)
+        submesh_surface.append(int(face_provenance[face_idx[0]]))
+
+    clipped = []
+    for s in range(len(clusters)):
+        cluster_pts = clusters[s].astype(np.float64)
+        subs = [sub for sub, sid in zip(submeshes, submesh_surface) if sid == s]
+
+        if len(subs) == 0:
+            print(f"[p2cad-clip] surface {s} ({surface_types[s]}): no components")
+            clipped.append(o3d.geometry.TriangleMesh())
+            continue
+
+        # For each cluster point, find its nearest submesh
+        nearest = np.argmin(
+            np.array([trimesh.proximity.closest_point(sub, cluster_pts)[1]
+                      for sub in subs]).T,
+            axis=1
+        )
+        counter = Counter(nearest).most_common()
+        area_per_point = np.array([subs[idx].area / count
+                                   for idx, count in counter])
+
+        nonzero = np.nonzero(area_per_point)[0]
+        if len(nonzero) == 0:
+            print(f"[p2cad-clip] surface {s} ({surface_types[s]}): all zero-area components")
+            clipped.append(o3d.geometry.TriangleMesh())
+            continue
+
+        best = area_per_point[nonzero[0]]
+        keep_idx = np.array(counter)[:, 0][
+            (area_per_point < best * area_multiplier) & (area_per_point != 0)
+        ]
+
+        kept = trimesh.util.concatenate([subs[i] for i in keep_idx])
+        print(f"[p2cad-clip] surface {s} ({surface_types[s]}): "
+              f"{len(keep_idx)}/{len(subs)} components kept")
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices  = o3d.utility.Vector3dVector(np.array(kept.vertices))
+        mesh.triangles = o3d.utility.Vector3iVector(np.array(kept.faces))
+        mesh.remove_unreferenced_vertices()
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color(get_surface_color(surface_types[s]))
+        clipped.append(mesh)
+
+    return clipped
+
+
 def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
                     cluster_trees, spacings,
                     post_filter_threshold=1.0):
@@ -86,10 +211,6 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
     The seed face is the one with provenance s whose centroid is closest to any
     cluster point (robust to partially visible surfaces).
 
-    A post-BFS distance filter then discards any remaining faces whose barycenter
-    is farther than post_filter_threshold * spacing[s] from the nearest cluster
-    point, catching spurious triangles that leaked through (e.g. at tangencies).
-
     Parameters
     ----------
     o3d_meshes            : list of open3d.geometry.TriangleMesh, one per cluster
@@ -97,33 +218,30 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
     surface_types         : list of str — surface type names (for coloring)
     cluster_trees         : list[cKDTree] — precomputed, one per cluster
     spacings              : list[float]   — intra-cluster NN spacing per cluster
-    post_filter_threshold : keep faces whose nearest cluster dist ≤ threshold * spacing
+    post_filter_threshold : multiplier for the optional post-BFS distance filter (commented out)
 
     Returns
     -------
     clipped : list of open3d.geometry.TriangleMesh, one per cluster
     """
-    # Build PyMesh meshes from O3D meshes (single-sided faces only)
-    pm_meshes = []
+    # Merge all meshes into one, tracking face provenance
+    mesh_list = []
     for m in o3d_meshes:
         V_i, F_i = o3d_mesh_to_numpy(m)
-        pm_meshes.append(pymesh.form_mesh(V_i.astype(np.float64), F_i.astype(np.int32)))
+        mesh_list.append((V_i.astype(np.float64), F_i.astype(np.int32)))
+    V_merged, F_merged, face_sources_merged = _merge_meshes(mesh_list)
+    print(f"[bfs-clip] Merged: {len(V_merged)} vertices, {len(F_merged)} faces")
 
-    # merge_meshes adds a "face_sources" attribute mapping each face to its source mesh index
-    pm_merged = pymesh.merge_meshes(pm_meshes)
-    face_sources_merged = pm_merged.get_attribute("face_sources").astype(np.int32)
-    print(f"[bfs-clip] Merged: {pm_merged.num_vertices} vertices, {pm_merged.num_faces} faces")
+    # J[i] = merged face that resolved face i came from (one-level provenance)
+    # IM[i] = canonical vertex index for vertex i (deduplication map)
+    VV_raw, FF_raw, _IF, J, IM = igl.copyleft.cgal.remesh_self_intersections(
+        V_merged, F_merged.astype(np.int32)
+    )
+    face_provenance = face_sources_merged[J].astype(np.int32)
 
-    # Resolve self-intersections, then merge duplicate vertices at seam positions
-    pm_resolved_ori = pymesh.resolve_self_intersection(pm_merged)
-    pm_resolved, _ = pymesh.remove_duplicated_vertices(pm_resolved_ori, tol=1e-6)
-
-    # Two-level provenance: resolved face → merged face → surface index
-    face_sources_resolved = pm_resolved_ori.get_attribute("face_sources").astype(np.int32)
-    face_provenance = face_sources_merged[face_sources_resolved].astype(np.int32)
-
-    VV = pm_resolved.vertices.copy()
-    FF = pm_resolved.faces.astype(np.int64)
+    FF_dedup = IM[FF_raw]
+    VV, FF_clean, _I, _J2 = igl.remove_unreferenced(VV_raw, FF_dedup)
+    FF = FF_clean.astype(np.int64)
     print(f"[bfs-clip] Resolved: {len(VV)} vertices, {len(FF)} faces")
 
     # Build edge → [face indices] map on the resolved mesh
@@ -147,7 +265,6 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
     # so BFS naturally cannot cross the seam between surfaces.
     n_faces = len(FF)
     face_adj = [[] for _ in range(n_faces)]
-
     for edge, face_list in edge_to_faces.items():
         if len(face_list) != 2:
             continue
@@ -170,19 +287,12 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
             clipped.append(o3d.geometry.TriangleMesh())
             continue
 
-        # Seed: face with provenance s whose centroid is closest to any cluster
-        # point. Cluster points only exist on the visible/correct side, so this
-        # is robust even when two disconnected components (e.g. sphere cap vs
-        # interior inside a cylinder) would have similar cluster-centroid distances.
+        # Seed: face with provenance s whose centroid is closest to any cluster point.
         prov_centroids = centroids[prov_faces]
         dists, _ = cluster_trees[s].query(prov_centroids)
         seed = prov_faces[np.argmin(dists)]
 
-        # Simple BFS over same-provenance 2-face edges.
-        # The seam edge between surfaces is non-manifold (4 faces) and absent
-        # from face_adj, so BFS cannot cross it — no wall-face logic needed.
-        # Correct-side wall faces are reachable (their non-seam edges connect
-        # to correct-side interior); wrong-side wall faces are not.
+        # BFS over same-provenance 2-face edges.
         visited = set()
         queue = deque([seed])
         visited.add(seed)
@@ -195,17 +305,14 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
 
         kept_faces = FF[list(visited)]
         print(f"[bfs-clip] surface {s} ({surface_types[s]}): "
-              f"{len(visited)}/{len(prov_faces)} faces after BFS+wall")
+              f"{len(visited)}/{len(prov_faces)} faces after BFS")
 
-        # Post-BFS distance filter: remove overflow from partial seams.
-        # thr = post_filter_threshold * spacings[s]
-        # barycenters = VV[kept_faces].mean(axis=1)
-        # bar_dists, _ = cluster_trees[s].query(barycenters)
-        # keep_mask = bar_dists <= thr
-        # kept_faces = kept_faces[keep_mask]
-        # print(f"[bfs-clip] surface {s} ({surface_types[s]}): "
-        #       f"{keep_mask.sum()}/{len(keep_mask)} faces after post-filter "
-        #       f"(thr={thr:.5f})") 
+        # Optional post-BFS distance filter: keep only faces whose barycenter
+        # is within post_filter_threshold * spacings[s] of the nearest cluster point.
+        thr = post_filter_threshold * spacings[s]
+        barycenters = VV[kept_faces].mean(axis=1)
+        bar_dists, _ = cluster_trees[s].query(barycenters)
+        kept_faces = kept_faces[bar_dists <= thr]
 
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices = o3d.utility.Vector3dVector(VV)

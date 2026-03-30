@@ -27,10 +27,11 @@ def run_compute(args):
 
     import point2cad.primitive_fitting_utils as pfu
     from point2cad.color_config import get_surface_color
-    from point2cad.mesh_postprocessing_2 import clip_meshes_bfs, build_cluster_trees
+    from point2cad.mesh_postprocessing_2 import clip_meshes_bfs, clip_meshes_p2cad, build_cluster_trees
     from point2cad.surface_fitter import SURFACE_NAMES, fit_surface
 
     DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+    tm = args.threshold_multiplier
 
     def normalize_points(pts):
         pts = pts - np.mean(pts, axis=0)
@@ -72,13 +73,20 @@ def run_compute(args):
     print(f"[bfs-trim] {n_clusters} clusters")
 
     clusters = []
-    o3d_meshes = []
-    surface_type_names = []
-
     for idx, (cid, c_count) in enumerate(zip(unique_clusters, cluster_counts)):
         cluster = data[data[:, -1] == cid][:, :3].astype(np.float32)
         clusters.append(cluster)
         np.save(os.path.join(out_dir, f"cluster_{idx}.npy"), cluster)
+
+    # Precompute KDTrees and spacings before mesh generation so every surface
+    # uses the same spacing value for grid_trimming and the post-BFS filter.
+    cluster_trees, spacings = build_cluster_trees(clusters, args.spacing_percentile)
+
+    o3d_meshes = []
+    surface_type_names = []
+
+    for idx, (cid, c_count) in enumerate(zip(unique_clusters, cluster_counts)):
+        cluster = clusters[idx]
 
         print(f"[surface fitter] Cluster {cid} ({c_count} pts) fitting ...")
         res = fit_surface(
@@ -91,15 +99,15 @@ def run_compute(args):
                 "noise_magnitude_uv": 0.05,
                 "initial_lr": 1e-1,
             },
-            plane_mesh_kwargs={"mesh_dim": 200, "threshold_multiplier": 1e6,
-                               "plane_sampling_deviation": 0.5},
+            plane_mesh_kwargs={"mesh_dim": 200, "threshold_multiplier": tm,
+                               "plane_sampling_deviation": 0.5, "spacing": spacings[idx]},
             sphere_mesh_kwargs={"dim_theta": 200, "dim_lambda": 200,
-                                "threshold_multiplier": 1e6},
+                                "threshold_multiplier": 3, "spacing": spacings[idx]},
             cylinder_mesh_kwargs={"dim_theta": 200, "dim_height": 100,
-                                  "threshold_multiplier": 1e6, "cylinder_height_margin": 0.5},
+                                  "threshold_multiplier": 3, "cylinder_height_margin": 0.5, "spacing": spacings[idx]},
             cone_mesh_kwargs={"dim_theta": 200, "dim_height": 200,
-                              "threshold_multiplier": 1e6, "cone_height_margin": 0.5},
-            inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": 1e6},
+                              "threshold_multiplier": 3, "cone_height_margin": 0.5, "spacing": spacings[idx]},
+            inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": 3, "spacing": spacings[idx]},
         )
 
         sid = res["surface_id"]
@@ -120,21 +128,40 @@ def run_compute(args):
         np.savez(os.path.join(out_dir, f"surface_mesh_{idx}.npz"),
                  vertices=verts, triangles=tris)
 
-    # Precompute KDTrees and intra-cluster NN spacings
-    print("[bfs-trim] Precomputing cluster KDTrees ...")
-    cluster_trees, spacings = build_cluster_trees(clusters, args.spacing_percentile)
-
-    # BFS flood-fill trimming + post-filter
-    print("[bfs-trim] Running BFS flood-fill trimming ...")
-    clipped_meshes = clip_meshes_bfs(o3d_meshes, clusters, surface_type_names,
-                                     cluster_trees, spacings,
-                                     post_filter_threshold=args.post_filter_threshold)
+    if args.clip_method == "bfs":
+        print("[bfs-trim] Running BFS flood-fill trimming ...")
+        clipped_meshes = clip_meshes_bfs(o3d_meshes, clusters, surface_type_names,
+                                         cluster_trees, spacings,
+                                         post_filter_threshold=args.post_filter_threshold)
+    else:
+        print("[bfs-trim] Running Point2CAD-style trimming ...")
+        clipped_meshes = clip_meshes_p2cad(o3d_meshes, clusters, surface_type_names,
+                                           area_multiplier=args.area_multiplier)
 
     for idx, mesh in enumerate(clipped_meshes):
         verts = np.asarray(mesh.vertices)
         tris  = np.asarray(mesh.triangles)
         np.savez(os.path.join(out_dir, f"trimmed_mesh_{idx}.npz"),
                  vertices=verts, triangles=tris)
+
+    # Screened Poisson reconstruction on the full point cloud
+    # all_pts = np.vstack(clusters).astype(np.float64)
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(all_pts)
+    # pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30))
+    # pcd.orient_normals_consistent_tangent_plane(k=15)
+    # poisson_mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+    #     pcd, depth=args.poisson_depth
+    # )
+    # densities = np.asarray(densities)
+    # keep_mask = densities >= np.quantile(densities, args.poisson_density_quantile)
+    # poisson_mesh.remove_vertices_by_mask(~keep_mask)
+    # poisson_mesh.compute_vertex_normals()
+    # poisson_verts = np.asarray(poisson_mesh.vertices)
+    # poisson_tris  = np.asarray(poisson_mesh.triangles)
+    # np.savez(os.path.join(out_dir, "poisson_mesh.npz"),
+    #          vertices=poisson_verts, triangles=poisson_tris)
+    # print(f"[poisson] {len(poisson_verts)} vertices, {len(poisson_tris)} triangles")
 
     # Metadata — cluster colors derived from fitted surface types
     cluster_colors = np.array([get_surface_color(stype) for stype in surface_type_names])
@@ -264,6 +291,11 @@ def run_visualize(args):
     vis3.add_geometry(clipped_combined)
     vis3.get_render_option().mesh_show_back_face = True
 
+    # vis4 = o3d.visualization.Visualizer()
+    # vis4.create_window("Screened Poisson", width=480, height=720, left=1440, top=50)
+    # vis4.add_geometry(poisson_mesh)
+    # vis4.get_render_option().mesh_show_back_face = True
+
     vises = [vis1, vis2, vis3]
     running = [True, True, True]
     while all(running):
@@ -296,7 +328,7 @@ if __name__ == "__main__":
                         help="Root directory for saved results")
     parser.add_argument("--part", type=int, default=0,
                         help="Index of the .xyzc file to process (0-based)")
-    parser.add_argument("--post_filter_threshold", type=float, default=1.0,
+    parser.add_argument("--post_filter_threshold", type=float, default=2,
                         help="Post-BFS filter: keep faces whose barycenter is within "
                              "threshold * spacing of the nearest cluster point")
     parser.add_argument("--spacing_percentile", type=float, default=100.0,
@@ -304,6 +336,17 @@ if __name__ == "__main__":
                              "for the post-BFS filter (default 100 = max NN distance)")
     parser.add_argument("--seed", type=int, default=41,
                         help="Reproducibility seed")
+    parser.add_argument("--clip_method", type=str, default="bfs",
+                        choices=["bfs", "p2cad"],
+                        help="Mesh trimming method: 'bfs' (BFS flood-fill) or 'p2cad' (Point2CAD-style components)")
+    parser.add_argument("--area_multiplier", type=float, default=2.0,
+                        help="[p2cad only] Keep components with area_per_point < best * area_multiplier")
+    parser.add_argument("--threshold_multiplier", type=float, default=5,
+                        help="Controls untrimmed mesh generation - higher values indicate more tolerace for face selection.")
+    parser.add_argument("--poisson_depth", type=int, default=9,
+                        help="Octree depth for screened Poisson reconstruction (higher = finer detail)")
+    parser.add_argument("--poisson_density_quantile", type=float, default=0.02,
+                        help="Remove Poisson vertices below this density quantile (trims outer artifacts)")
     args = parser.parse_args()
 
     if args.visualize:

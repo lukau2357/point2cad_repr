@@ -121,3 +121,17 @@ For tomorrow's meeting:
 
 - Reduce risk of curves not matching surface equations: for polyline in intersection of surfaces (A, B) project each point to UV of 
   both surfaces, backrpoject and average out.
+
+
+-------------------------------------------------------
+Refining Point2CAD mesh generation:
+- 00470: Both work fine
+- 00000077: BFS is cleaner for the top plane only
+- 00000005: Point2CAD barely improves anything. With BFS-based, using higher threshold multiplier for open surfaces only seems to 
+  produce better results - 5 * tm for planes, tm for other closed surfaces, where tm = 3 for this case. Still issue with tangent 
+  geometries. Reducing the threshold multiplier to 1 for closed surfaces works well also. 
+
+- BFS trimming of the mesh did not yield significant improvements over original Point2CAD logic, although the algorithm
+  is simpler. If BFS becomes problematic, replace it entirely with original Point2CAD mesh trimming logic.
+
+- 

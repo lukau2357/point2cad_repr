@@ -177,8 +177,8 @@ if __name__ == "__main__":
         )
         print(f"Clipped meshes saved to {clipped_path}")
 
-        mesh_postprocessing.save_topology(clipped_meshes, topology_path)
-        print(f"Topology saved to {topology_path}")
+        # mesh_postprocessing.save_topology(clipped_meshes, topology_path)
+        # print(f"Topology saved to {topology_path}")
         print(f"All outputs saved to {out_dir}/")
 
     if args.visualize:
