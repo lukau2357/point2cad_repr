@@ -1008,7 +1008,7 @@ if __name__ == "__main__":
                         choices=["step", "obj"],
                         help="'step': exact OCC parametric surfaces, all 10k models; "
                              "'obj': OBJ mesh barycentric, ~7.1k models with feat annotations")
-    parser.add_argument("--grid_res", type=int, default=50,
+    parser.add_argument("--grid_res", type=int, default=100,
                         help="UV grid resolution for STEP sampler")
     parser.add_argument("--visualize", action="store_true",
                         help="Visualize the sampled point cloud")

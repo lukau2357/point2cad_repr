@@ -12,10 +12,6 @@ from .color_config import get_surface_color
 def o3d_mesh_to_numpy(o3d_mesh):
     vertices = np.asarray(o3d_mesh.vertices, dtype=np.float64)
     triangles = np.asarray(o3d_mesh.triangles, dtype=np.int64)
-    # triangulate_and_mesh stores 4 triangles per grid cell (2 front + 2 back).
-    # Keep only the first 2 (front-facing) for the self-intersection pipeline.
-    mask = np.arange(len(triangles)) % 4 < 2
-    triangles = triangles[mask]
     return vertices, triangles
 
 

@@ -169,7 +169,8 @@ def run_compute(args):
              n_clusters=n_clusters,
              cluster_ids=unique_clusters,
              cluster_colors=cluster_colors,
-             surface_names=np.array(surface_type_names))
+             surface_names=np.array(surface_type_names),
+             clip_method=args.clip_method)
 
     print(f"[bfs-trim] Saved to {out_dir}/")
 
@@ -189,6 +190,7 @@ def run_visualize(args):
     n_clusters     = int(meta["n_clusters"])
     cluster_colors = meta["cluster_colors"]
     surface_names  = meta["surface_names"]
+    clip_method    = str(meta["clip_method"]) if "clip_method" in meta else "unknown"
 
     from point2cad.color_config import get_surface_color
 
@@ -287,7 +289,7 @@ def run_visualize(args):
     print("[surfaces] Press N/P in 'Unclipped' window to cycle clusters")
 
     vis3 = o3d.visualization.Visualizer()
-    vis3.create_window("BFS-clipped", width=640, height=720, left=1280, top=50)
+    vis3.create_window(f"Clipped ({clip_method})", width=640, height=720, left=1280, top=50)
     vis3.add_geometry(clipped_combined)
     vis3.get_render_option().mesh_show_back_face = True
 

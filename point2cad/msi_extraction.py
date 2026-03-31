@@ -71,16 +71,9 @@ def _fit_bspline(pts):
 
 
 def o3d_mesh_to_numpy(o3d_mesh):
-    """Convert an Open3D TriangleMesh to (V, F) numpy arrays.
-
-    Filters double-sided duplicates: triangulate_and_mesh() creates 4 triangles
-    per quad cell (indices 0,1 are original, 2,3 are reversed duplicates).
-    We keep only the original-orientation triangles (i % 4 < 2).
-    """
+    """Convert an Open3D TriangleMesh to (V, F) numpy arrays."""
     vertices = np.asarray(o3d_mesh.vertices, dtype=np.float64)
     triangles = np.asarray(o3d_mesh.triangles, dtype=np.int64)
-    mask = np.arange(len(triangles)) % 4 < 2
-    triangles = triangles[mask]
     return vertices, triangles
 
 

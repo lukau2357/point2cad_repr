@@ -98,25 +98,17 @@ def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
             triangles.append([v0, v1, v2])
             triangles.append([v0, v2, v3])
 
-            # Reverse orientation for back-side rendering
-            # Remove potentially if it harms performance?
-            triangles.append([v0, v2, v1])
-            triangles.append([v0, v3, v2])
+    triangles = np.array(triangles) if triangles else np.zeros((0, 3), dtype=np.int32)
 
     mesh = o3d.geometry.TriangleMesh()
-    mesh.triangles = o3d.utility.Vector3iVector(np.array(triangles))
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
     mesh.remove_unreferenced_vertices()
     mesh.compute_vertex_normals()
     color = get_surface_color(surface_type)
     mesh.paint_uniform_color(color)
 
-    # Trimesh mesh uses only single-sided faces (no reversed duplicates) for post-processing.
-    # PyMesh would choke on overlapping coplanar faces from the double-sided O3D mesh.
-    # If we consider triangle addition order in the previous loop, it suffices to take triangles
-    # with index i % 4 < 2.
-    single_sided = [t for i, t in enumerate(triangles) if i % 4 < 2]
-    trimesh_mesh = trimesh.Trimesh(vertices, np.array(single_sided) if single_sided else np.zeros((0, 3), dtype=np.int32))
+    trimesh_mesh = trimesh.Trimesh(vertices, triangles)
     return mesh, trimesh_mesh
 
 def plane_error(points, a, d):

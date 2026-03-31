@@ -122,16 +122,23 @@ For tomorrow's meeting:
 - Reduce risk of curves not matching surface equations: for polyline in intersection of surfaces (A, B) project each point to UV of 
   both surfaces, backrpoject and average out.
 
-
+- More on alpha-shapes (generalization of the convex hull): https://cgm.cs.mcgill.ca/~godfried/teaching/projects97/belair/alpha.html
 -------------------------------------------------------
-Refining Point2CAD mesh generation:
-- 00470: Both work fine
-- 00000077: BFS is cleaner for the top plane only
-- 00000005: Point2CAD barely improves anything. With BFS-based, using higher threshold multiplier for open surfaces only seems to 
-  produce better results - 5 * tm for planes, tm for other closed surfaces, where tm = 3 for this case. Still issue with tangent 
-  geometries. Reducing the threshold multiplier to 1 for closed surfaces works well also. 
+Mesh generation (test_bfs_trim.py, BFS vs Point2CAD style with libicgal as mesh self intersection resolution engine)
+- 00470: (Freeform, TODO)
+- 00949: Both work fine.
+- 00000949 - Both work fine.
+- 00000077: Both work fine.
+- 00000005: BFS better than libicgal p2cad, but original p2cad produces results similar to BFS.
+- 00000006: BFS better than ligicgal p2cad and faster. BFS compared to original p2cad is a bit better and less jagged.
+- 00000008: p2cad libicgal works much better than BFS. Same holds for original p2cad. The problem is that both p2cad variants are slower.
+            p2cad libicgal produces less jagged mesh than original p2cad.
+- 00000061: Both work fine.
+- 00000007: Both work fine.
+- 00000104: p2cad libicgal actually produces a better mesh than BFS. Original p2cad libicgal produces also some spurious results?
+            Most likely cause: openings in the bottom planar cluster, not something we expect to encounter in practice. Increasing UV grid
+            sampling resolution in the data generation script (scripts/abc_preprocess.py) removed the gaps in the ground truth cluster, but
+            libigcal p2cad method still produced visually more appealing result.
 
 - BFS trimming of the mesh did not yield significant improvements over original Point2CAD logic, although the algorithm
   is simpler. If BFS becomes problematic, replace it entirely with original Point2CAD mesh trimming logic.
-
-- 

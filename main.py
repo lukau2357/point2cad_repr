@@ -128,10 +128,10 @@ if __name__ == "__main__":
                 cone_theta_tolerance_degrees = 5,
                 inr_fit_kwargs = {"max_steps": 1500, "noise_magnitude_3d": 0.05, "noise_magnitude_uv": 0.05, "initial_lr": 1e-1},
                 plane_mesh_kwargs = {"mesh_dim": 200, "threshold_multiplier": 5, "plane_sampling_deviation": 0.5},
-                sphere_mesh_kwargs = {"dim_theta": 200, "dim_lambda": 200, "threshold_multiplier": 5},
-                cylinder_mesh_kwargs = {"dim_theta": 200, "dim_height": 100, "threshold_multiplier": 5, "cylinder_height_margin": 0.5},
-                cone_mesh_kwargs = {"dim_theta": 200, "dim_height": 200, "threshold_multiplier": 5, "cone_height_margin": 0.5},
-                inr_mesh_kwargs = {"mesh_dim": 200, "uv_margin": 0.2, "threshold_multiplier": 5}
+                sphere_mesh_kwargs = {"dim_theta": 200, "dim_lambda": 200, "threshold_multiplier": 3},
+                cylinder_mesh_kwargs = {"dim_theta": 200, "dim_height": 100, "threshold_multiplier": 3, "cylinder_height_margin": 0.5},
+                cone_mesh_kwargs = {"dim_theta": 200, "dim_height": 200, "threshold_multiplier": 3, "cone_height_margin": 0.5},
+                inr_mesh_kwargs = {"mesh_dim": 200, "uv_margin": 0.2, "threshold_multiplier": 3}
             )
 
             surface_type_name = SURFACE_NAMES[fitting_result["surface_id"]]
