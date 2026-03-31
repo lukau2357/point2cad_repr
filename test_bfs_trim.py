@@ -328,7 +328,7 @@ if __name__ == "__main__":
                         help="Root directory for saved results")
     parser.add_argument("--part", type=int, default=0,
                         help="Index of the .xyzc file to process (0-based)")
-    parser.add_argument("--post_filter_threshold", type=float, default=2,
+    parser.add_argument("--post_filter_threshold", type=float, default=1.5,
                         help="Post-BFS filter: keep faces whose barycenter is within "
                              "threshold * spacing of the nearest cluster point")
     parser.add_argument("--spacing_percentile", type=float, default=100.0,

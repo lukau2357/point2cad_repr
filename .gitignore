@@ -14,3 +14,5 @@ sample_clouds_stats/
 output_p2cad
 *.png
 output_bfs/
+output_oversized/
+output_uvalpha/

@@ -32,6 +32,9 @@ try:
     from OCC.Core.Geom           import Geom_TrimmedCurve
     from OCC.Core.Geom2d         import Geom2d_TrimmedCurve
     from OCC.Core.GCE2d          import GCE2d_MakeSegment
+    from OCC.Core.Geom2d         import Geom2d_BSplineCurve
+    from OCC.Core.TColgp         import TColgp_Array1OfPnt2d
+    from OCC.Core.TColStd        import TColStd_Array1OfReal, TColStd_Array1OfInteger
     from OCC.Core.GeomAPI        import GeomAPI_ProjectPointOnCurve, GeomAPI_ProjectPointOnSurf
     from OCC.Core.GeomLProp      import GeomLProp_SLProps
     from OCC.Core.gp             import gp_Pnt, gp_Pnt2d, gp_GTrsf, gp_Trsf, gp_Mat, gp_Vec, gp_Quaternion
@@ -2847,20 +2850,33 @@ def build_brep_shape_bop(occ_surfaces, clusters, surface_ids=None,
                 centroid = boundary_uv.mean(axis=0)
                 boundary_uv = centroid + (1.0 + inflate) * (boundary_uv - centroid)
 
-            # Build wire from boundary polygon using UV-space segments on the surface.
-            # Each edge is a straight line in UV mapped onto the surface, so it
-            # follows the surface curvature (e.g., circular arcs on a cylinder).
-            wire_builder = BRepBuilderAPI_MakeWire()
-            for k in range(len(boundary_uv)):
-                uv0 = boundary_uv[k]
-                uv1 = boundary_uv[(k + 1) % len(boundary_uv)]
-                p2d_0 = gp_Pnt2d(float(uv0[0]), float(uv0[1]))
-                p2d_1 = gp_Pnt2d(float(uv1[0]), float(uv1[1]))
-                seg2d = GCE2d_MakeSegment(p2d_0, p2d_1).Value()
-                edge = BRepBuilderAPI_MakeEdge(seg2d, surface).Edge()
-                breplib.BuildCurves3d(edge)
-                wire_builder.Add(edge)
+            # Degree-3 B-spline with alpha-shape vertices as control points.
+            # Rounds corners naturally without oscillation or closure gaps.
+            # Clamped: last pole = first pole ensures exact geometric closure.
+            n_pts = len(boundary_uv)
+            deg = min(3, n_pts)
+            n_poles = n_pts + 1
+            n_interior = n_pts - deg
+            n_knots = n_interior + 2
+            poles = TColgp_Array1OfPnt2d(1, n_poles)
+            for k, uv in enumerate(boundary_uv):
+                poles.SetValue(k + 1, gp_Pnt2d(float(uv[0]), float(uv[1])))
+            poles.SetValue(n_poles, gp_Pnt2d(float(boundary_uv[0][0]),
+                                             float(boundary_uv[0][1])))
+            knots_arr = TColStd_Array1OfReal(1, n_knots)
+            for k in range(n_knots):
+                knots_arr.SetValue(k + 1, float(k))
+            mults_arr = TColStd_Array1OfInteger(1, n_knots)
+            for k in range(n_knots):
+                mults_arr.SetValue(k + 1, 1)
+            mults_arr.SetValue(1, deg + 1)
+            mults_arr.SetValue(n_knots, deg + 1)
+            curve2d = Geom2d_BSplineCurve(poles, knots_arr, mults_arr, deg)
+            edge = BRepBuilderAPI_MakeEdge(curve2d, surface).Edge()
+            breplib.BuildCurves3d(edge)
 
+            wire_builder = BRepBuilderAPI_MakeWire()
+            wire_builder.Add(edge)
             if not wire_builder.IsDone():
                 print(f"[bop] face {i} ({dtype}): wire construction failed")
                 continue

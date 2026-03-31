@@ -1,0 +1,13 @@
+- Start by giving a rough introduction to your project, outline that the pipeline can generate a mesh always, but generatin a BRep
+  is complex, hence the need for reduced representations.
+
+- How is reverse engineering actually done in practice, how does one go from a unsegmented 3D scan to a BRep CAD-importable model? 
+Manual measurements + guessing the right surface? 
+
+3 Formats that I can always produce, which one would be most useful for speeding up the RE process:
+    - Meshes + parametric surfaces
+    - STEP file created from oversize surfaces + analytical intersections (BOPAlgo_Section).
+    - STEP file created from: for each surface, project cluster points to the surface's UV domain, compute alpha shape in UV,
+      perform Douglas-Peucker curve simplification algorithm on the alpha shape boundary, then create a cubic BSpline where 
+      control poinst are boundary vertices (knot vector follows from here deterministically, no least-squares fitting). This 
+      becomes a wire for each face, represented as a pcurve rather than a 3D curve, which is more fitting. 

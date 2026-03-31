@@ -218,7 +218,7 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
     surface_types         : list of str — surface type names (for coloring)
     cluster_trees         : list[cKDTree] — precomputed, one per cluster
     spacings              : list[float]   — intra-cluster NN spacing per cluster
-    post_filter_threshold : multiplier for the optional post-BFS distance filter (commented out)
+    post_filter_threshold : multiplier for the optional post-BFS distance filter
 
     Returns
     -------

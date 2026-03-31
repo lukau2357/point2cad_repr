@@ -45,7 +45,8 @@ RUN pip install --no-cache-dir \
     pyvista \
     matplotlib \
     tqdm \
-    trimesh
+    trimesh \
+    rtree
 
 # Verify imports
 RUN python -c "from OCC.Core.gp import gp_Pnt; print('OCC OK')"
