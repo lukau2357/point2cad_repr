@@ -124,7 +124,7 @@ For tomorrow's meeting:
 
 - More on alpha-shapes (generalization of the convex hull): https://cgm.cs.mcgill.ca/~godfried/teaching/projects97/belair/alpha.html
 -------------------------------------------------------
-Mesh generation (test_bfs_trim.py, BFS vs Point2CAD style with libicgal as mesh self intersection resolution engine)
+Mesh generation (mesh_pipeline.py, BFS vs Point2CAD style with libicgal as mesh self intersection resolution engine)
 - 00470: (Freeform, TODO)
 - 00949: Both work fine.
 - 00000949 - Both work fine.
@@ -142,3 +142,19 @@ Mesh generation (test_bfs_trim.py, BFS vs Point2CAD style with libicgal as mesh 
 
 - BFS trimming of the mesh did not yield significant improvements over original Point2CAD logic, although the algorithm
   is simpler. If BFS becomes problematic, replace it entirely with original Point2CAD mesh trimming logic.
+
+- What to try out for freeforms:
+  - Divide the cluster by levels, for each level fit a Spline, reduced representation?
+  - Try running RANSAC over the freeform cluster?
+  - MLS into BSpline?
+
+- UV alpha-shape mesh masking (TODO):
+  Replace distance-based grid_trimming (threshold_multiplier + spacing) with UV alpha-shape masking
+  for ALL surface types. For each cluster, project points to surface UV, compute alpha shape, keep
+  only grid cells whose UV centroid falls inside the alpha shape. For primitives: analytical UV
+  projection. For INR freeforms: encoder already provides UV coordinates. Optional small
+  shapely.buffer() offset for overlap at intersections. Parameter-free (just alpha), eliminates
+  oversized mesh problem that causes single-component clipping failures with libigl/CGAL.
+  Currently libigl/CGAL doesn't fragment meshes at intersection boundaries (unlike pymesh), so
+  oversized meshes cause inner+outer regions to remain as one component — both BFS and p2cad-style
+  clipping fail to trim the outer region.

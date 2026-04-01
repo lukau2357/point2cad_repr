@@ -5,15 +5,10 @@ For each cluster in a segmented .xyzc file, fits the best primitive surface,
 projects the cluster points to UV space, computes an alpha-shape boundary, and
 builds a wire-bounded face. The result is a compound of trimmed faces whose
 boundaries follow the cluster footprint.
-
-Usage (inside Docker):
-    python export_uvalpha.py sample_clouds/abc_00470/0.xyzc
-    python export_uvalpha.py sample_clouds/abc_00470/0.xyzc \\
-        --output_dir ./output_uvalpha --alpha 0.05 --simplify_epsilon 0.01 \\
-        --inflate 0.05 --tol 1e-3
 """
 
 import argparse
+import glob as _glob
 import os
 
 import numpy as np
@@ -103,26 +98,31 @@ def process(xyzc_path, output_dir, args):
 
     shape = apply_inverse_normalization(shape, mean, R, scale)
     os.makedirs(output_dir, exist_ok=True)
-    model_id = os.path.basename(os.path.dirname(xyzc_path))
     part_id = os.path.splitext(os.path.basename(xyzc_path))[0]
-    export_step(shape, os.path.join(output_dir, f"{model_id}_part_{part_id}.step"))
+    step_path = os.path.join(output_dir, f"part_{part_id}.step")
+    export_step(shape, step_path)
+    print(f"  Exported {step_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export UV alpha-shape trimmed primitive faces as a STEP compound"
+        description="Export UV alpha-shape trimmed primitive faces as a STEP compound",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("xyzc", help="Path to the segmented .xyzc file")
+    parser.add_argument("--model_id", type=str, required=True,
+                        help="Model ID (subdirectory under input_dir)")
+    parser.add_argument("--input_dir", type=str, default="sample_clouds",
+                        help="Root directory for input point cloud subdirs")
+    parser.add_argument("--output_dir", default="./output_uvalpha",
+                        help="Directory for output STEP files")
+    parser.add_argument("--part", type=int, default=None,
+                        help="Process only this part index (0-based). Default: all parts")
     parser.add_argument(
-        "--output_dir", default="./output_uvalpha",
-        help="Directory for output STEP files (default: ./output_uvalpha)",
-    )
-    parser.add_argument(
-        "--alpha", type=float, default=0.0,
+        "--alpha", type=float, default=10,
         help="Alpha-shape parameter (0 = convex hull, larger = tighter boundary)",
     )
     parser.add_argument(
-        "--simplify_epsilon", type=float, default=0.0,
+        "--simplify_epsilon", type=float, default=0.0001,
         help="Douglas-Peucker simplification tolerance in UV units (0 = no simplification)",
     )
     parser.add_argument(
@@ -131,16 +131,29 @@ def main():
     )
     parser.add_argument(
         "--tol", type=float, default=1e-3,
-        help="OCC face construction tolerance (default: 1e-3)",
+        help="OCC face construction tolerance",
     )
     args = parser.parse_args()
 
-    if not os.path.isfile(args.xyzc):
-        parser.error(f"File not found: {args.xyzc}")
+    input_pattern = os.path.join(args.input_dir, args.model_id, "*.xyzc")
+    xyzc_files = sorted(_glob.glob(input_pattern),
+                        key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+    if not xyzc_files:
+        parser.error(f"No .xyzc files found matching: {input_pattern}")
 
-    print(f"Input : {args.xyzc}")
-    print(f"Output: {args.output_dir}")
-    process(args.xyzc, args.output_dir, args)
+    if args.part is not None:
+        if args.part >= len(xyzc_files):
+            parser.error(f"Part {args.part} out of range — model has {len(xyzc_files)} part(s)")
+        part_indices = [args.part]
+    else:
+        part_indices = list(range(len(xyzc_files)))
+
+    model_out_dir = os.path.join(args.output_dir, args.model_id)
+    print(f"Model {args.model_id}: {len(xyzc_files)} part(s), processing {len(part_indices)}")
+
+    for part_idx in part_indices:
+        print(f"\n--- Part {part_idx}: {os.path.basename(xyzc_files[part_idx])} ---")
+        process(xyzc_files[part_idx], model_out_dir, args)
 
 
 if __name__ == "__main__":

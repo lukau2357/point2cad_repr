@@ -48,6 +48,40 @@ def _build_edge_face_map(F):
     return edge_to_faces
 
 
+def _find_intersection_edges(FF, face_provenance, n_vertices):
+    """Find edges lying on intersection curves between surfaces.
+
+    CGAL's remesh_self_intersections shares vertices (via IM dedup) but not
+    edges between surfaces. So intersection boundary edges have exactly 2
+    faces of the same provenance — indistinguishable from interior edges by
+    face count or provenance alone.
+
+    Detection: a vertex is a "boundary vertex" if it appears in faces of
+    multiple provenances. An edge where BOTH endpoints are boundary vertices
+    lies along an intersection curve. Removing these edges from the adjacency
+    graph cuts each surface along its intersection boundaries.
+    """
+    vertex_provs = [set() for _ in range(n_vertices)]
+    for fi in range(len(FF)):
+        prov = int(face_provenance[fi])
+        for vi in FF[fi]:
+            vertex_provs[int(vi)].add(prov)
+
+    boundary_verts = set(vi for vi in range(n_vertices) if len(vertex_provs[vi]) > 1)
+
+    intersection_edges = set()
+    for fi in range(len(FF)):
+        for k in range(3):
+            v0 = int(FF[fi, k])
+            v1 = int(FF[fi, (k + 1) % 3])
+            if v0 in boundary_verts and v1 in boundary_verts:
+                intersection_edges.add((min(v0, v1), max(v0, v1)))
+
+    print(f"[intersection] {len(boundary_verts)} boundary vertices, "
+          f"{len(intersection_edges)} intersection edges")
+    return intersection_edges
+
+
 def build_cluster_trees(clusters, spacing_percentile=100.0):
     """
     Precompute per-cluster KDTree and intra-cluster NN spacing.
@@ -127,9 +161,18 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
     """
     VV, FF, face_provenance = _resolve_intersections(o3d_meshes, tag="p2cad-clip")
 
-    tri_resolved = trimesh.Trimesh(vertices=VV, faces=FF, process=False)
+    # Cut the adjacency graph along intersection curves so that inner/outer
+    # regions of each surface become separate connected components.
+    edge_to_faces = _build_edge_face_map(FF)
+    intersection_edges = _find_intersection_edges(FF, face_provenance, len(VV))
+    adj_pairs = []
+    for edge, face_list in edge_to_faces.items():
+        if len(face_list) == 2 and edge not in intersection_edges:
+            adj_pairs.append(face_list)
+    adj_edges = np.array(adj_pairs, dtype=np.int64) if adj_pairs else np.empty((0, 2), dtype=np.int64)
+
     connected_labels = trimesh.graph.connected_component_labels(
-        edges=tri_resolved.face_adjacency,
+        edges=adj_edges,
         node_count=len(FF)
     )
     unique_labels = [item[0] for item in Counter(connected_labels).most_common()]
@@ -242,6 +285,7 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
 
     # Build edge → [face indices] map on the resolved mesh
     edge_to_faces = _build_edge_face_map(FF)
+    intersection_edges = _find_intersection_edges(FF, face_provenance, len(VV))
 
     # Log adjacent surface pairs detected from cross-provenance edges
     adj_pairs = set()
@@ -256,13 +300,14 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
         print(f"[bfs-clip] adjacent surfaces: {a} ({surface_types[a]}) ↔ "
               f"{b} ({surface_types[b]})")
 
-    # Per-face adjacency: same-provenance 2-face edges only.
-    # Cross-provenance seam edges are non-manifold (4 faces) and excluded,
-    # so BFS naturally cannot cross the seam between surfaces.
+    # Per-face adjacency: exclude intersection boundary edges (detected via
+    # vertex provenance) and non-manifold edges. BFS cannot cross these.
     n_faces = len(FF)
     face_adj = [[] for _ in range(n_faces)]
     for edge, face_list in edge_to_faces.items():
         if len(face_list) != 2:
+            continue
+        if edge in intersection_edges:
             continue
         fi, fj = face_list
         if face_provenance[fi] == face_provenance[fj]:
