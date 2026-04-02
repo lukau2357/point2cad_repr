@@ -13,10 +13,10 @@
 - Cluster oversegmentation remains a problem, investigate how to solve it, preferably in the point cloud generation script!
 
 - Parameter choices (spacing_factor = 1.5, score_cap = 10)
-  - 00949 (default, default) (works with MSI)
-  - 00470 (default, default) (freeform) (works with MSI)
-  - 00000949 (default, default) (workst with MIS)
-  - 00000005 (default, default) (tangent geometries present)
+  - 00949 (default, default) (works with MSI). Google drive export: analytical + manual
+  - 00470 (default, default) (freeform) Does not work with MSI. Google drive export: analytical + manual
+  - 00000949 (default, default) (workst with MIS) Google drive export: analytical + manual
+  - 00000005 (default, default) (tangent geometries present) Google drive export: analytical + manual. Fails for part 7
   - 00000006 (defualt, default) (works with MSI)
   - 00000008 (0.7, default) (works with MSI)
   - 00000061 (default, default) (works with MSI)

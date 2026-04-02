@@ -16,3 +16,5 @@ output_p2cad
 output_bfs/
 output_oversized/
 output_uvalpha/
+client_secrets.json
+credentials.json

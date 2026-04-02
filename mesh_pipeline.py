@@ -12,6 +12,88 @@ import open3d as o3d
 
 
 # ---------------------------------------------------------------------------
+# Merge per-part outputs into unified/
+# ---------------------------------------------------------------------------
+
+def _denorm_points(pts, mean, R, scale):
+    """Inverse PCA normalization: p_world = scale * R^T @ p_norm + mean."""
+    return (scale * (R.T @ pts.T).T + mean)
+
+
+def _merge_part_dirs(part_dirs, unified_dir):
+    """
+    Merge per-part output directories into a single unified directory for
+    the visualizer.  Applies inverse normalization so all parts are in
+    world-space coordinates.  Per-part files remain in normalized space.
+
+    part_dirs : list of (dir_path, cluster_offset, n_clusters)
+    """
+    os.makedirs(unified_dir, exist_ok=True)
+
+    all_snames, all_colors = [], []
+    for dir_path, offset, n in part_dirs:
+        meta = np.load(os.path.join(dir_path, "metadata.npz"), allow_pickle=True)
+        all_snames.extend(meta["surface_names"].tolist())
+        all_colors.extend(meta["cluster_colors"].tolist())
+
+    clip_method = "unknown"
+    if part_dirs:
+        meta0 = np.load(os.path.join(part_dirs[0][0], "metadata.npz"), allow_pickle=True)
+        if "clip_method" in meta0:
+            clip_method = str(meta0["clip_method"])
+
+    np.savez(os.path.join(unified_dir, "metadata.npz"),
+             n_clusters=len(all_snames),
+             surface_names=np.array(all_snames),
+             cluster_colors=np.array(all_colors),
+             clip_method=clip_method)
+
+    unified_combined = o3d.geometry.TriangleMesh()
+    for dir_path, offset, n in part_dirs:
+        meta = np.load(os.path.join(dir_path, "metadata.npz"), allow_pickle=True)
+        mean = meta["norm_mean"]
+        R = meta["norm_R"]
+        scale = float(meta["norm_scale"])
+
+        part_combined = o3d.geometry.TriangleMesh()
+        for i in range(n):
+            # Clusters (.npy)
+            src = os.path.join(dir_path, f"cluster_{i}.npy")
+            if os.path.exists(src):
+                pts = np.load(src)
+                np.save(os.path.join(unified_dir, f"cluster_{i + offset}.npy"),
+                        _denorm_points(pts, mean, R, scale))
+
+            # Surface meshes and trimmed meshes (.npz with vertices/triangles)
+            for prefix in ("surface_mesh", "trimmed_mesh"):
+                src = os.path.join(dir_path, f"{prefix}_{i}.npz")
+                if not os.path.exists(src):
+                    continue
+                d = np.load(src)
+                verts = _denorm_points(d["vertices"], mean, R, scale)
+                np.savez(os.path.join(unified_dir, f"{prefix}_{i + offset}.npz"),
+                         vertices=verts, triangles=d["triangles"])
+
+                if prefix == "trimmed_mesh" and len(verts) > 0:
+                    mesh = o3d.geometry.TriangleMesh()
+                    mesh.vertices = o3d.utility.Vector3dVector(verts)
+                    mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
+                    part_combined += mesh
+
+        # Per-part denormalized trimmed STL
+        part_combined.compute_vertex_normals()
+        part_stl = os.path.join(dir_path, "trimmed_denorm.stl")
+        o3d.io.write_triangle_mesh(part_stl, part_combined)
+        unified_combined += part_combined
+
+    # Unified trimmed STL
+    unified_combined.compute_vertex_normals()
+    unified_stl = os.path.join(unified_dir, "trimmed.stl")
+    o3d.io.write_triangle_mesh(unified_stl, unified_combined)
+    print(f"[mesh] Unified trimmed mesh: {unified_stl}")
+
+
+# ---------------------------------------------------------------------------
 # Compute
 # ---------------------------------------------------------------------------
 
@@ -28,13 +110,13 @@ def run_compute(args):
     tm = args.threshold_multiplier
 
     def normalize_points(pts):
-        pts = pts - np.mean(pts, axis=0)
-        S, U = np.linalg.eigh(pts.T @ pts)
+        mean = pts.mean(axis=0)
+        centered = pts - mean
+        S, U = np.linalg.eigh(centered.T @ centered)
         R = pfu.rotation_matrix_a_to_b(U[:, np.argmin(S)], np.array([1, 0, 0]))
-        pts = (R @ pts.T).T
-        extents = np.max(pts, axis=0) - np.min(pts, axis=0)
-        scale = float(np.max(extents) + 1e-7)
-        return (pts / scale).astype(np.float32)
+        rotated = (R @ centered.T).T
+        scale = float((rotated.max(axis=0) - rotated.min(axis=0)).max()) + 1e-7
+        return (rotated / scale).astype(np.float32), mean, R, scale
 
     input_pattern = os.path.join(args.input_dir, args.model_id, "*.xyzc")
     xyzc_files = sorted(_glob.glob(input_pattern),
@@ -53,9 +135,21 @@ def run_compute(args):
 
     print(f"Model {args.model_id}: {len(xyzc_files)} part(s), processing {len(part_indices)}")
 
+    part_dirs = []
+    cluster_offset = 0
     for part_idx in part_indices:
         _run_compute_part(args, xyzc_files[part_idx], part_idx, normalize_points,
                           DEVICE, tm)
+        out_dir = os.path.join(args.output_dir, args.model_id, f"part_{part_idx}")
+        meta_path = os.path.join(out_dir, "metadata.npz")
+        if os.path.exists(meta_path):
+            n = int(np.load(meta_path, allow_pickle=True)["n_clusters"])
+            part_dirs.append((out_dir, cluster_offset, n))
+            cluster_offset += n
+
+    if part_dirs:
+        unified_dir = os.path.join(args.output_dir, args.model_id, "unified")
+        _merge_part_dirs(part_dirs, unified_dir)
 
 
 def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm):
@@ -82,6 +176,9 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
         n_clusters = int(meta["n_clusters"])
         unique_clusters = meta["cluster_ids"]
         surface_type_names = [str(s) for s in meta["surface_names"]]
+        part_mean = meta["norm_mean"]
+        part_R = meta["norm_R"]
+        part_scale = float(meta["norm_scale"])
 
         clusters = []
         o3d_meshes = []
@@ -106,7 +203,8 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
         print(f"{'='*60}")
 
         data = np.loadtxt(sample_path)
-        data[:, :3] = normalize_points(data[:, :3])
+        pts_norm, part_mean, part_R, part_scale = normalize_points(data[:, :3])
+        data[:, :3] = pts_norm
         unique_clusters, cluster_counts = np.unique(data[:, -1].astype(int), return_counts=True)
         n_clusters = len(unique_clusters)
         print(f"[mesh] {n_clusters} clusters")
@@ -181,6 +279,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
         np.savez(os.path.join(out_dir, f"trimmed_mesh_{idx}.npz"),
                  vertices=verts, triangles=tris)
         combined += mesh
+    combined.compute_vertex_normals()
     stl_path = os.path.join(out_dir, "trimmed.stl")
     o3d.io.write_triangle_mesh(stl_path, combined)
     print(f"[mesh] Exported {stl_path}")
@@ -191,7 +290,8 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
              cluster_ids=unique_clusters,
              cluster_colors=cluster_colors,
              surface_names=np.array(surface_type_names),
-             clip_method=args.clip_method)
+             clip_method=args.clip_method,
+             norm_mean=part_mean, norm_R=part_R, norm_scale=part_scale)
 
     print(f"[mesh] Saved to {out_dir}/")
 
@@ -201,9 +301,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
 # ---------------------------------------------------------------------------
 
 def run_visualize(args):
-    if args.part is None:
-        args.part = 0
-    out_dir = os.path.join(args.output_dir, args.model_id, f"part_{args.part}")
+    out_dir = os.path.join(args.output_dir, args.model_id, "unified")
     meta_path = os.path.join(out_dir, "metadata.npz")
     if not os.path.exists(meta_path):
         print(f"No saved results found in {out_dir}/ — run compute first.")

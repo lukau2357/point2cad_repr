@@ -1,10 +1,10 @@
 """
-Export oversized primitive surface faces as a STEP compound (Format 2).
+Export oversized surface faces as a STEP compound (Format 2).
 
-For each cluster in a segmented .xyzc file, fits the best primitive surface
-and creates a large face whose UV domain covers the cluster's projection
-plus a configurable margin. The result is a compound of untrimmed faces
-intended for manual trimming by a CAD engineer.
+For each cluster in a segmented .xyzc file, fits the best surface (primitive
+or INR/B-spline) and creates a large face whose UV domain covers the cluster's
+projection plus a configurable margin. The result is a compound of untrimmed
+faces intended for manual trimming by a CAD engineer.
 """
 
 import argparse
@@ -13,31 +13,13 @@ import math
 import os
 
 import numpy as np
+import torch
 
-from point2cad.primitive_fitting import (
-    fit_plane_numpy, fit_sphere_numpy, fit_cylinder_optimized, fit_cone,
-)
+from point2cad.surface_fitter import fit_surface
+from point2cad.occ_surfaces import to_occ_surface
 from point2cad.primitive_fitting_utils import rotation_matrix_a_to_b
-from point2cad.occ_surfaces import plane_to_occ, sphere_to_occ, cylinder_to_occ, cone_to_occ
 from point2cad.topology import export_step, apply_inverse_normalization
-from point2cad.surface_types import (
-    SURFACE_PLANE, SURFACE_SPHERE, SURFACE_CYLINDER, SURFACE_CONE, SURFACE_NAMES,
-)
-
-
-_FITTERS = {
-    SURFACE_PLANE:    fit_plane_numpy,
-    SURFACE_SPHERE:   fit_sphere_numpy,
-    SURFACE_CYLINDER: fit_cylinder_optimized,
-    SURFACE_CONE:     fit_cone,
-}
-
-_OCC_BUILDERS = {
-    SURFACE_PLANE:    lambda p, c: plane_to_occ(p),
-    SURFACE_SPHERE:   lambda p, c: sphere_to_occ(p),
-    SURFACE_CYLINDER: lambda p, c: cylinder_to_occ(p),
-    SURFACE_CONE:     lambda p, c: cone_to_occ(p, cluster=c),
-}
+from point2cad.surface_types import SURFACE_NAMES
 
 
 def _normalize(pts):
@@ -49,13 +31,6 @@ def _normalize(pts):
     rotated = (R @ centered.T).T
     scale = float((rotated.max(axis=0) - rotated.min(axis=0)).max()) + 1e-7
     return (rotated / scale).astype(np.float32), mean, R, scale
-
-
-def _fit_best(cluster):
-    """Fit all primitives and return (surface_id, params, error)."""
-    results = {sid: _FITTERS[sid](cluster) for sid in _FITTERS}
-    best = min(results, key=lambda sid: results[sid]["error"])
-    return best, results[best]["params"], results[best]["error"]
 
 
 def _make_large_face(occ_surface, cluster, uv_margin, tol):
@@ -95,7 +70,7 @@ def _make_large_face(occ_surface, cluster, uv_margin, tol):
     return face.Face() if face.IsDone() else None
 
 
-def process(xyzc_path, output_dir, args):
+def process(xyzc_path, output_dir, args, np_rng, device):
     from OCC.Core.BRep import BRep_Builder
     from OCC.Core.TopoDS import TopoDS_Compound
     from OCC.Core.BOPAlgo import BOPAlgo_Section
@@ -109,10 +84,24 @@ def process(xyzc_path, output_dir, args):
     faces = []
     for cid in np.unique(cluster_ids):
         cluster = pts_norm[cluster_ids == cid]
-        sid, params, error = _fit_best(cluster)
+
+        res = fit_surface(
+            cluster,
+            {"hidden_dim": 64, "use_shortcut": True, "fraction_siren": 0.5},
+            np_rng, device,
+            inr_fit_kwargs={
+                "max_steps": 1500,
+                "noise_magnitude_3d": 0.05,
+                "noise_magnitude_uv": 0.05,
+                "initial_lr": 1e-1,
+            },
+        )
+        sid = res["surface_id"]
+        error = res["result"]["error"]
         print(f"  cluster {cid:2d}: {SURFACE_NAMES[sid]:<10s}  error={error:.6f}")
 
-        occ_surf = _OCC_BUILDERS[sid](params, cluster)
+        occ_surf = to_occ_surface(sid, res["result"], cluster=cluster,
+                                  uv_margin=0.05, grid_resolution=50)
         if occ_surf is None:
             print(f"             → OCC surface creation failed, skipping")
             continue
@@ -156,6 +145,8 @@ def process(xyzc_path, output_dir, args):
     export_step(shape, step_path)
     print(f"  Exported {step_path}")
 
+    return shape
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -178,7 +169,13 @@ def main():
         "--tol", type=float, default=1e-3,
         help="OCC face construction tolerance",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    np_rng = np.random.default_rng(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
 
     input_pattern = os.path.join(args.input_dir, args.model_id, "*.xyzc")
     xyzc_files = sorted(_glob.glob(input_pattern),
@@ -196,9 +193,26 @@ def main():
     model_out_dir = os.path.join(args.output_dir, args.model_id)
     print(f"Model {args.model_id}: {len(xyzc_files)} part(s), processing {len(part_indices)}")
 
+    from OCC.Core.BRep import BRep_Builder
+    from OCC.Core.TopoDS import TopoDS_Compound
+
+    denorm_shapes = []
     for part_idx in part_indices:
         print(f"\n--- Part {part_idx}: {os.path.basename(xyzc_files[part_idx])} ---")
-        process(xyzc_files[part_idx], model_out_dir, args)
+        shape = process(xyzc_files[part_idx], model_out_dir, args, np_rng, device)
+        if shape is not None and not shape.IsNull():
+            denorm_shapes.append(shape)
+
+    # Build unified STEP from denormalized shapes (always world-space)
+    if denorm_shapes:
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        for s in denorm_shapes:
+            builder.Add(compound, s)
+        unified_path = os.path.join(model_out_dir, "oversized.step")
+        export_step(compound, unified_path)
+        print(f"  Unified: {unified_path}")
 
 
 if __name__ == "__main__":

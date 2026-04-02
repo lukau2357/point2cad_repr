@@ -1142,6 +1142,7 @@ def run_compute(args):
         # Step 4a: BRep export (shape already built by oracle filter)
         # ------------------------------------------------------------------
         step_path = os.path.join(out_dir, f"{step_stem}.step")
+        shape_world = None
         if shape is None or shape.IsNull():
             print(f"[brep] build failed — 0 faces produced, skipping STEP export")
         else:
@@ -1155,21 +1156,26 @@ def run_compute(args):
         print(f"\n[part] all results saved to {out_dir}/")
 
         if args.model_id:
-            part_dirs.append((out_dir, cluster_offset, len(clusters)))
+            part_dirs.append((out_dir, cluster_offset, len(clusters), shape_world))
             cluster_offset += len(clusters)
 
     # After all parts: merge into unified/
     if part_dirs:
         unified_dir = os.path.join(model_out_dir, "unified")
-        _merge_part_dirs(part_dirs, unified_dir)
-        manual_paths = [
-            os.path.join(d, f"{os.path.basename(d)}.step")
-            for d, _, _ in part_dirs
-        ]
-        merge_step_files(
-            [p for p in manual_paths if os.path.exists(p)],
-            os.path.join(unified_dir, "unified.step"),
+        _merge_part_dirs(
+            [(d, o, n) for d, o, n, _ in part_dirs],
+            unified_dir,
         )
+        # Build unified STEP from denormalized shapes (always world-space)
+        from OCC.Core.BRep import BRep_Builder as _BB
+        from OCC.Core.TopoDS import TopoDS_Compound as _TC
+        builder = _BB()
+        compound = _TC()
+        builder.MakeCompound(compound)
+        for _, _, _, sw in part_dirs:
+            if sw is not None and not sw.IsNull():
+                builder.Add(compound, sw)
+        export_step(compound, os.path.join(unified_dir, "unified.step"))
 
 
 # ---------------------------------------------------------------------------
