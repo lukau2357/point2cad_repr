@@ -134,20 +134,57 @@ def collect_and_upload(drive, model_id, root_folder_id):
     print(f"\nDone: {model_id}")
 
 
+def report_part_counts(drive, root_folder_id):
+    """Count total parts across all models based on .xyzc files on Google Drive."""
+    # List model folders under root
+    q = (f"'{root_folder_id}' in parents "
+         f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
+    model_folders = drive.ListFile({"q": q}).GetList()
+    model_folders.sort(key=lambda f: f["title"])
+
+    total_parts = 0
+    for mf in model_folders:
+        # Look for point_clouds subfolder
+        q_pc = (f"'{mf['id']}' in parents and title='point_clouds' "
+                f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
+        pc_folders = drive.ListFile({"q": q_pc}).GetList()
+        if not pc_folders:
+            continue
+        # Count .xyzc files inside point_clouds
+        q_xyzc = (f"'{pc_folders[0]['id']}' in parents "
+                  f"and title contains '.xyzc' and trashed=false")
+        xyzc_files = drive.ListFile({"q": q_xyzc}).GetList()
+        n_parts = len(xyzc_files)
+        if n_parts > 0:
+            print(f"  {mf['title']}: {n_parts} parts")
+            total_parts += n_parts
+
+    print(f"\nTotal: {total_parts} parts across {len(model_folders)} models")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Collect and upload model results to Google Drive",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--model_id", type=str, required=True,
+    parser.add_argument("--model_id", type=str,
                         help="Model ID (e.g. abc_00000005)")
     parser.add_argument("--root_folder_id", type=str,
                         help="Google Drive folder ID for the upload root "
                              "(from the folder URL: drive.google.com/drive/folders/<ID>)",
                              default="1KV6o_6SCuOk9NGAx1fuYll4YMgYrQAJ_")
+    parser.add_argument("--count-parts", action="store_true",
+                        help="Report per-model part counts and exit")
     args = parser.parse_args()
 
     drive = authenticate()
+
+    if args.count_parts:
+        report_part_counts(drive, args.root_folder_id)
+        return
+
+    if not args.model_id:
+        parser.error("--model_id is required when uploading")
     collect_and_upload(drive, args.model_id, args.root_folder_id)
 
     print("\n--- Cleanup reminder ---")

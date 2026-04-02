@@ -242,7 +242,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
                                       "threshold_multiplier": 3, "cylinder_height_margin": 0.5, "spacing": spacings[idx]},
                 cone_mesh_kwargs={"dim_theta": 200, "dim_height": 200,
                                   "threshold_multiplier": 3, "cone_height_margin": 0.5, "spacing": spacings[idx]},
-                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": 3, "spacing": spacings[idx]},
+                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": 3, "spacing": spacings[idx]}
             )
 
             sid = res["surface_id"]

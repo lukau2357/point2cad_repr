@@ -116,19 +116,23 @@ def process(xyzc_path, output_dir, args, np_rng, device):
     print(f"  {len(faces)}/{len(np.unique(cluster_ids))} faces assembled")
 
     # Compute pairwise surface-surface intersection curves
-    print(f"  Computing intersection curves ...")
-    section = BOPAlgo_Section()
-    for face in faces:
-        section.AddArgument(face)
-    section.Perform()
-    section_shape = section.Shape()
+    section_shape = None
+    if not args.no_section:
+        print(f"  Computing intersection curves ...")
+        section = BOPAlgo_Section()
+        for face in faces:
+            section.AddArgument(face)
+        section.Perform()
+        section_shape = section.Shape()
 
-    n_edges = 0
-    exp = TopExp_Explorer(section_shape, TopAbs_EDGE)
-    while exp.More():
-        n_edges += 1
-        exp.Next()
-    print(f"  {n_edges} intersection edges computed")
+        n_edges = 0
+        exp = TopExp_Explorer(section_shape, TopAbs_EDGE)
+        while exp.More():
+            n_edges += 1
+            exp.Next()
+        print(f"  {n_edges} intersection edges computed")
+    else:
+        print(f"  Skipping intersection curves (--no_section)")
 
     # Combine faces + intersection edges into one compound
     builder = BRep_Builder()
@@ -136,7 +140,8 @@ def process(xyzc_path, output_dir, args, np_rng, device):
     builder.MakeCompound(compound)
     for face in faces:
         builder.Add(compound, face)
-    builder.Add(compound, section_shape)
+    if section_shape is not None:
+        builder.Add(compound, section_shape)
 
     shape = apply_inverse_normalization(compound, mean, R, scale)
     os.makedirs(output_dir, exist_ok=True)
@@ -169,6 +174,8 @@ def main():
         "--tol", type=float, default=1e-3,
         help="OCC face construction tolerance",
     )
+    parser.add_argument("--no_section", action="store_true",
+                        help="Skip intersection curve computation (BOPAlgo_Section)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 

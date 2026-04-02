@@ -768,8 +768,8 @@ def run_compute(args):
                 sphere_mesh_kwargs=_sphere_kw,
                 cylinder_mesh_kwargs=_cylinder_kw,
                 cone_mesh_kwargs=_cone_kw,
-                radius_inflation=0.001,
-                angle_inflation_deg=0,
+                radius_inflation=0,
+                angle_inflation_deg=0
             )
             sid = res["surface_id"]
             surface_ids.append(sid)

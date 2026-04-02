@@ -16,33 +16,54 @@
   - 00949 (default, default) (works with MSI). Google drive export: analytical + manual
   - 00470 (default, default) (freeform) Does not work with MSI. Google drive export: analytical + manual
   - 00000949 (default, default) (workst with MIS) Google drive export: analytical + manual
-  - 00000005 (default, default) (tangent geometries present) Google drive export: analytical + manual. Fails for part 7
-  - 00000006 (defualt, default) (works with MSI)
-  - 00000008 (0.7, default) (works with MSI)
-  - 00000061 (default, default) (works with MSI)
+  - 00000005 (default, default) (tangent geometries present) Google drive export: analytical + manual. Fails for part 7, 9/10 success rate
+  - 00000006 (defualt, default) (works with MSI). Google drive export: MSI + manual.
+  - 00000008 (0.7, default) (works with MSI). Google drive export: analytical + manual, same hyperparameters.
+  - 00000061 (default, default) (works with MSI). Google drive export: analytical + direct. 
   - 00000007 (default, default) (works with MSI)
   - 00000019 (default, default). Mesh intersection algorithm does not work well for Part 4 of this model - neighboring clusters, but actually
     it's a cylindrical surface split into two clusters for which the underlying primitive is the same. Works well with second round of vertex merging
-    though... MSI does not work for tangent geometries, will handle those eventually as well.
+    though... MSI does not work for tangent geometries, will handle those eventually as well. Google drive export: analytical + manual
   - 00000009 (default, default). Fitted 2 INRs instead of 2 cones, but the result was geometrically correct, and it visually matched the input reasonabl well.  
+    Google drive export: analytical + manual, fails. Generation of oversized.step also failed, if the algorithm is constrained to primitive
+    surfaces only it would have likely succeeded. Will not include it in final results, this one needs to be inspected, even mesh clipping
+    seems to fail...
   - 00000017 (default, default)
-  - 00000239 - Does not work, BSpline INR produced error seems to be causing the main problems.
+  - 00000239 - Does not work, BSpline INR produced error seems to be causing the main problems. Google drive export: MSI + direct, algorithm 
+    fails for parts (0, 1, 3), oversized and uv_alpha files for this model are missing, issues with freeform surfaces.
   - 00000073 - Does not work, cylinder/plane issues.... Actually, the issue seems to be genuine surface patches being split into multiple segments. Can you filter out such models entirely?
-  - 00000077 (default, default)
+               Google drive export: MSI + direct, fails for part 1.
+  - 00000077 (default, default). Google drive export: MSI + direct
   - 00000104 - Does not work, 0 vertices, simple model in that regard. Lowering the spacing factor to as low as 0.1 did produce better curves,
     but still not correct results. Sphere/cylinder intersection return 4 BSpline curves that should constitute a single closed curve,
     the algorithm breaks... With mesh intersections, works fine when reducing spacing_factor to 0.1, but still FreeCAD rejects it because of 
     "Invalid tolerance values". Try to catch these cases? Questionable even if such models could appear in practice?
+     Google drive export: MSI + direct. Algorithm fails.
   - 00000121 (default, default). Good showcase of the algorithm for tomorrow's presentation.
+    Google drive export: MSI + direct
   - 00000078 - Solver fails to compute the intersection between a cylinder and a plane that should be intersecting. When using mesh intersections,
     these pairs are still problematic. With mesh intersections in particular, this could be sidesteped by increasing cylinder radii for the purpose
     of mesh generation only, but there are more problems with the mesh pathway (merging gaps in polylines, reliable vertex computation, ...). 
     With MSI approach, cannot battle with tangent geometries...
-  - 00000105 - Does not work..... Sphere mesh generation flawed somehow????
-  - 00000090 - Does not work.....
+    Google drive export: MSI + direct.
+  - 00000105 - Does not work..... Sphere mesh generation flawed somehow???? Google drive export: MSI + direct
+  - 00000090 - Does not work..... Google drive export: MSI + direct
   - 00000359 - Pipeline does not work for single-surface clusters, not that problematic, but irritating nontheless.
-  - 00000406 - Works, but sphere is not trimmed properly. Region selection problem, this is relevant to other models.
+  - 00000406 - Works, but sphere is not trimmed properly. Region selection problem, this is relevant to other models. Google drive export: MSI + direct
   - 00000655 - Works in principle, but also problems with sphere...
+  
+  19 STEP files exported. 53 parts supposedly. The algorithm does not work on:
+  - 00000005, part 1
+  - 00000009, part 0
+  - 00000239, parts 0, 1, 3
+  - 00000073, part 1
+  - 00000104, part 0
+  - 00000078, part 0
+  - 00000105, part 0
+  - 00000090, part 0
+  - 00000406, part 0
+  - 00000655, part 0
+  Failure rate: 12/53, I expect that it's MUCH HIGHER...
   
     python main.py --output_dir output_p2cad --visualize --visualize_id 0 - Demonstrate that even mesh-derived intersections produce noisy results.
 ------------------------------
@@ -158,3 +179,6 @@ Mesh generation (mesh_pipeline.py, BFS vs Point2CAD style with libicgal as mesh 
   Currently libigl/CGAL doesn't fragment meshes at intersection boundaries (unlike pymesh), so
   oversized meshes cause inner+outer regions to remain as one component — both BFS and p2cad-style
   clipping fail to trim the outer region.
+
+- Part indexing: follows FreeCAD alignment, not by part labels!
+- Number of connected components != sum(per face number of compontents) in mesh_pipeline?
