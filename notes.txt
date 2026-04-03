@@ -54,7 +54,6 @@
   
   19 STEP files exported. 53 parts supposedly. The algorithm does not work on:
   - 00000005, part 1
-  - 00000009, part 0
   - 00000239, parts 0, 1, 3
   - 00000073, part 1
   - 00000104, part 0
@@ -182,3 +181,5 @@ Mesh generation (mesh_pipeline.py, BFS vs Point2CAD style with libicgal as mesh 
 
 - Part indexing: follows FreeCAD alignment, not by part labels!
 - Number of connected components != sum(per face number of compontents) in mesh_pipeline?
+- For best description of BRep, look at the SolidGen paper.
+- To fix in brep pipeline: correct outer wire selection, tangent geometries, ILP to always get valid BRep.

@@ -156,7 +156,7 @@ def report_part_counts(drive, root_folder_id):
         xyzc_files = drive.ListFile({"q": q_xyzc}).GetList()
         n_parts = len(xyzc_files)
         if n_parts > 0:
-            print(f"  {mf['title']}: {n_parts} parts")
+            print(f"  {mf['title']}: {n_parts} {'part' if n_parts == 1 else 'parts'}")
             total_parts += n_parts
 
     print(f"\nTotal: {total_parts} parts across {len(model_folders)} models")

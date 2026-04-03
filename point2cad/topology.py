@@ -777,7 +777,8 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
             fw = assemble_wires(fa, occ_surfaces, verts, surface_ids=surface_ids)
             shape, info = build_brep_shape_direct(
                 fa, occ_surfaces, verts, surface_ids=surface_ids,
-                face_wires=fw, tolerance=tolerance,
+                face_wires=fw, tolerance=tolerance, clusters=clusters,
+                cluster_trees=cluster_trees,
             )
         else:
             # Manual wire assembly (original method)
@@ -1565,64 +1566,48 @@ def _wire_uv_signed_area(wire_arcs, surface, n_samples=20):
 
 
 def _build_face_with_uv_classification(face_idx, surface, wire_items,
-                                        tolerance, sewing):
+                                        tolerance):
     """Build a face with correct outer/inner wire classification.
 
     Uses signed UV area to identify the outer wire, then constructs the
     face with BRepBuilderAPI_MakeFace(surface, outer_wire) + Add(inner).
-    Falls back to UV-bounds if all wires have near-zero UV area (e.g.
-    full-period circles on a cylinder).
 
     Parameters
     ----------
-    wire_items : list[(TopoDS_Wire, wire_arcs_list)]
-    Returns True if a face was added to sewing.
+    wire_items   : list[(TopoDS_Wire, wire_arcs_list)]
+    Returns the constructed TopoDS_Face, or None on failure.
     """
     occ_wires = [w for w, _ in wire_items]
 
     if len(occ_wires) == 1:
-        # Single wire — no classification needed.
-        face_maker = BRepBuilderAPI_MakeFace(surface, occ_wires[0])
-        if not face_maker.IsDone():
-            print(f"[brep-direct] face {face_idx}: MakeFace (1 wire) "
-                  f"not done")
-            return False
-        face = face_maker.Face()
-        print(f"[brep-direct] face {face_idx}: 1 wire → ok")
-        sewing.Add(face)
-        return True
+        outer_wire = occ_wires[0]
+        inner_wires = []
+        outer_idx = 0
+    else:
+        areas = []
+        for _, wire_arcs in wire_items:
+            a = _wire_uv_signed_area(wire_arcs, surface)
+            areas.append(a)
+        abs_areas = [abs(a) for a in areas]
+        area_log = "  ".join(f"w{i}={areas[i]:.4f}" for i in range(len(areas)))
+        print(f"[brep-direct] face {face_idx}: UV areas: {area_log}")
+        outer_idx = max(range(len(abs_areas)), key=lambda i: abs_areas[i])
+        outer_wire = occ_wires[outer_idx]
+        inner_wires = [w for i, w in enumerate(occ_wires) if i != outer_idx]
 
-    # Multiple wires — compute signed UV area for each.
-    areas = []
-    for _, wire_arcs in wire_items:
-        a = _wire_uv_signed_area(wire_arcs, surface)
-        areas.append(a)
-
-    abs_areas = [abs(a) for a in areas]
-    max_area = max(abs_areas)
-    area_log = "  ".join(f"w{i}={areas[i]:.4f}" for i in range(len(areas)))
-    print(f"[brep-direct] face {face_idx}: UV areas: {area_log}")
-
-    # Outer wire = largest |area|.
-    outer_idx = max(range(len(abs_areas)), key=lambda i: abs_areas[i])
-    outer_wire = occ_wires[outer_idx]
-
+    print(f"[brep-direct] face {face_idx}: {len(occ_wires)} wire(s)")
     face_maker = BRepBuilderAPI_MakeFace(surface, outer_wire)
-    for i, w in enumerate(occ_wires):
-        if i == outer_idx:
-            continue
-        face_maker.Add(w)
+    for iw in inner_wires:
+        face_maker.Add(iw)
     if not face_maker.IsDone():
-        print(f"[brep-direct] face {face_idx}: MakeFace with "
-              f"outer=w{outer_idx} not done")
-        return False
+        print(f"[brep-direct] face {face_idx}: MakeFace not done")
+        return None
 
     face = face_maker.Face()
     n_wires = sum(1 for _ in _iter_explorer(face, TopAbs_WIRE))
     print(f"[brep-direct] face {face_idx}: {len(occ_wires)} wires "
           f"(outer=w{outer_idx}) → {n_wires} after MakeFace")
-    sewing.Add(face)
-    return True
+    return face
 
 
 def _iter_explorer(shape, shape_type):
@@ -1634,16 +1619,18 @@ def _iter_explorer(shape, shape_type):
 
 
 def build_brep_shape_direct(face_arcs, occ_surfaces, vertices, surface_ids=None,
-                            face_wires=None, tolerance=1e-3):
+                            face_wires=None, tolerance=1e-3, clusters=None,
+                            cluster_trees=None):
     """
     Build a TopoDS_Shape with signed-UV-area wire classification.
 
     For each face, wires are classified as outer/inner by projecting
     sample points into UV space and computing the signed polygon area
     (shoelace formula).  The wire with the largest |area| is the outer
-    boundary; the rest are holes.  When all wires have near-zero UV
-    area (full-period circles on a periodic surface), a UV-bounds
-    fallback is used instead.
+    boundary; the rest are holes.
+
+    When clusters are provided, both wire orientations are tried and
+    the face with lower mean cluster projection error is selected.
 
     Parameters / return value match build_brep_shape for drop-in use.
     """
@@ -1702,15 +1689,16 @@ def build_brep_shape_direct(face_arcs, occ_surfaces, vertices, surface_ids=None,
             print(f"[brep-direct] face {face_idx}: no wires — skipping")
             continue
 
-        # Classify outer wire via signed UV area.
         try:
-            face_ok = _build_face_with_uv_classification(
-                face_idx, surface, wire_items, tolerance, sewing)
+            built_face = _build_face_with_uv_classification(
+                face_idx, surface, wire_items, tolerance)
         except Exception as exc:
             print(f"[brep-direct] face {face_idx}: exception: {exc}")
-            face_ok = False
-        if not face_ok:
+            built_face = None
+        if built_face is None:
             print(f"[brep-direct] face {face_idx}: face construction failed")
+        else:
+            sewing.Add(built_face)
 
     # 3. Sew all faces into a shell.
     print("[brep-direct] Sewing faces ...")
