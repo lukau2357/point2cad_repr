@@ -633,7 +633,8 @@ def run_compute(args):
     from point2cad.topology import (
         build_edge_arcs,
         greedy_oracle_filter,
-        _score_vertex,
+        ilp_topology_filter,
+        _score_vertex, _score_arc,
         print_edge_arcs_summary,
         face_arc_incidence, print_face_arcs_summary,
         assemble_wires, print_face_wires_summary,
@@ -931,7 +932,7 @@ def run_compute(args):
             )
             print(f"[vertices] found {len(vertices)} vertices (IntCS)")
 
-        # Score-cap filter: remove vertices too far from their clusters.
+        # Fitness filter: remove vertices too far from their clusters.
         # Skipped for MSI — vertices come from exact mesh topology.
         if args.intersection_method != "msi":
             vertex_scores = []
@@ -943,12 +944,12 @@ def run_compute(args):
                                       cluster_nn_percentiles)
                 vertex_scores.append(score)
 
-            score_cap = args.score_cap
+            fitness_threshold = args.fitness_threshold
             scores_arr = np.array(vertex_scores)
 
             sorted_indices = np.argsort(scores_arr)
-            print(f"[vertex scores] {len(scores_arr)} vertices, "
-                  f"range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, "
+            print(f"[fitness filter] vertices: {len(scores_arr)}, "
+                  f"score range [{0 if scores_arr.size == 0 else scores_arr.min():.4f}, "
                   f"{0 if scores_arr.size == 0 else scores_arr.max():.4f}]")
             for rank, idx in enumerate(sorted_indices):
                 edges_str = " ".join(
@@ -956,12 +957,12 @@ def run_compute(args):
                 print(f"  v{idx:3d}  score={scores_arr[idx]:10.4f}  "
                       f"edges=[{edges_str}]")
 
-            keep_v = scores_arr <= score_cap
+            keep_v = scores_arr <= fitness_threshold
             n_drop = int(np.sum(~keep_v))
             n_keep = int(np.sum(keep_v))
             if n_drop > 0 and n_keep >= 2:
-                print(f"[score-cap filter] threshold: {score_cap:.2f}  "
-                      f"keeping {n_keep}, dropping {n_drop}/{len(scores_arr)} vertices")
+                print(f"[fitness filter] vertex threshold: {fitness_threshold:.2f}  "
+                      f"keeping {n_keep}, dropping {n_drop}/{len(scores_arr)}")
                 vertices = vertices[keep_v]
                 vertex_edges = [vertex_edges[i]
                                 for i in range(len(keep_v)) if keep_v[i]]
@@ -969,11 +970,11 @@ def run_compute(args):
                     vertex_polys = [vertex_polys[i]
                                     for i in range(len(keep_v)) if keep_v[i]]
             else:
-                print(f"[score-cap filter] threshold {score_cap:.2f} "
+                print(f"[fitness filter] vertex threshold {fitness_threshold:.2f} "
                       f"would keep {n_keep} / drop {n_drop} — skipping")
-            print(f"[score-cap filter] after filter: {len(vertices)} vertices")
+            print(f"[fitness filter] after vertex filter: {len(vertices)} vertices")
         else:
-            print(f"[score-cap filter] skipped for MSI ({len(vertices)} vertices)")
+            print(f"[fitness filter] skipped for MSI ({len(vertices)} vertices)")
 
         # ------------------------------------------------------------------
         # Trimming
@@ -1060,6 +1061,28 @@ def run_compute(args):
             )
         print_edge_arcs_summary(edge_arcs)
 
+        # Arc fitness filter: remove arcs too far from their clusters.
+        fitness_threshold = args.fitness_threshold
+        n_before = sum(len(a) for a in edge_arcs.values())
+        n_dropped = 0
+        for edge_key in list(edge_arcs.keys()):
+            i, j = edge_key
+            kept = []
+            for arc in edge_arcs[edge_key]:
+                s = _score_arc(arc, i, j, cluster_trees, cluster_nn_percentiles)
+                if s <= fitness_threshold:
+                    kept.append(arc)
+                else:
+                    print(f"[fitness filter] dropping arc {edge_key}[{arc['arc_idx']}] "
+                          f"score={s:.4f}")
+                    n_dropped += 1
+            if kept:
+                edge_arcs[edge_key] = kept
+            else:
+                del edge_arcs[edge_key]
+        print(f"[fitness filter] arcs: keeping {n_before - n_dropped}/{n_before}, "
+              f"dropped {n_dropped} (threshold={fitness_threshold:.2f})")
+
         # Diagnostic: check how well B-spline curves lie on their surfaces
         if args.intersection_method == "msi":
             from OCC.Core.GeomAPI import GeomAPI_ProjectPointOnSurf
@@ -1104,16 +1127,25 @@ def run_compute(args):
                 kw_pre[f"arc_color_{k}"] = [0.2, 0.85, 0.2]
             np.savez(os.path.join(out_dir, f"arcs_pre_filter_{ei}_{ej}.npz"), **kw_pre)
 
-        # Greedy oracle-guided filter: remove worst-scoring objects one at
-        # a time until BRepCheck_Analyzer returns True.
-        edge_arcs, vertices, vertex_edges, shape, brep_info = greedy_oracle_filter(
-            edge_arcs, vertices, vertex_edges,
-            clusters, cluster_trees, cluster_nn_percentiles,
-            occ_surfaces=occ_surfs, surface_ids=surface_ids,
-            tolerance=1e-3,
-            cluster_bboxes=cluster_bboxes,
-            wire_method=args.wire_method,
-        )
+        # Topology filter: select arcs/vertices to keep.
+        if args.topology_method == "ilp":
+            edge_arcs, vertices, vertex_edges, shape, brep_info = ilp_topology_filter(
+                edge_arcs, vertices, vertex_edges,
+                clusters, cluster_trees, cluster_nn_percentiles,
+                occ_surfaces=occ_surfs, surface_ids=surface_ids,
+                tolerance=1e-3,
+                cluster_bboxes=cluster_bboxes,
+                wire_method=args.wire_method,
+            )
+        else:
+            edge_arcs, vertices, vertex_edges, shape, brep_info = greedy_oracle_filter(
+                edge_arcs, vertices, vertex_edges,
+                clusters, cluster_trees, cluster_nn_percentiles,
+                occ_surfaces=occ_surfs, surface_ids=surface_ids,
+                tolerance=1e-3,
+                cluster_bboxes=cluster_bboxes,
+                wire_method=args.wire_method,
+            )
         if shape is not None and not shape.IsNull():
             print_edge_arcs_summary(edge_arcs)
             face_arcs = face_arc_incidence(edge_arcs)
@@ -1210,9 +1242,11 @@ if __name__ == "__main__":
                         help="Discard adjacency pairs whose boundary point count "
                              "falls below this percentile of all boundary counts. "
                              "Set to 0 to disable.")
-    parser.add_argument("--score_cap", type=float, default=10,
-                        help="Max vertex fitness score (d/p) to keep in pre-filter. "
-                             "Score is scale-invariant: 1.0 = cluster boundary.")
+    parser.add_argument("--fitness_threshold", type=float, default=10,
+                        help="Max fitness score (d/p) for vertices and arcs in "
+                             "pre-filter. Elements with score above this are "
+                             "discarded. Score is scale-invariant: 1.0 = cluster "
+                             "boundary.")
     parser.add_argument("--boundary_mesh", action="store_true",
                         help="Visualize boundary strips as filled Delaunay meshes "
                              "instead of point clouds (visualize mode only)")
@@ -1236,6 +1270,11 @@ if __name__ == "__main__":
                              "wires and faces from edges automatically. "
                              "'manual': angular ordering + manual cycle detection "
                              "(original method).")
+    parser.add_argument("--topology_method", type=str, default="greedy",
+                        choices=["greedy", "ilp"],
+                        help="Topology filter method. "
+                             "'greedy': greedy worst-first arc removal. "
+                             "'ilp': integer linear program (scipy milp).")
     args = parser.parse_args()
 
     if args.model_id is None:

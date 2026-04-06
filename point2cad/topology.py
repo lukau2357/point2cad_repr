@@ -27,6 +27,7 @@ import contextlib
 from collections import defaultdict
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.optimize import milp, LinearConstraint, Bounds
 
 try:
     from OCC.Core.Geom           import Geom_TrimmedCurve
@@ -871,6 +872,293 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
           f"after removing all candidates. "
           f"Best: {best_info.get('n_faces', 0)} faces")
     return best_ea, best_v, best_ve, best_shape, best_info
+
+
+# ---------------------------------------------------------------------------
+# Step 1e — ILP topology filter
+# ---------------------------------------------------------------------------
+
+def ilp_topology_filter(edge_arcs, vertices, vertex_edges,
+                        clusters, cluster_trees, cluster_nn_percentiles,
+                        occ_surfaces, surface_ids=None,
+                        tolerance=1e-3,
+                        cluster_bboxes=None, wire_method="direct",
+                        lam=5):
+    """
+    ILP-based topology filter: select arcs and vertices that minimize
+    geometric fitness cost while satisfying topological constraints.
+
+    Objective:
+        min  sum_k (score_k - lambda) * a_k  +  sum_m (score_m - lambda) * v_m
+
+    Constraints:
+        1. Eulerian parity: for each face f and each vertex m incident to f,
+           the number of selected open arcs touching (f, m) must be even.
+           Enforced as:  sum_{k in A_f(m)} a_k  =  2 * z_{f,m}   (z integer >= 0)
+        2. Vertex implication: if an open arc is kept, both its endpoint
+           vertices must be kept:  v_m >= a_k  for each endpoint m of arc k.
+
+    Parameters
+    ----------
+    lam : float
+        Regularization: reward for keeping each element.  Arcs/vertices with
+        score < lam are incentivized to stay; score > lam to be removed.
+        Topology constraints can override in either direction.
+    """
+    n_v = len(vertices)
+    n_a_total = sum(len(a) for a in edge_arcs.values())
+    print(f"[ILP filter] input: {n_v} vertices, {n_a_total} arcs")
+
+    # ------------------------------------------------------------------
+    # Flatten arcs into an indexed list
+    # ------------------------------------------------------------------
+    arc_list = []       # (edge_key, arc_idx, arc_dict)
+    for edge_key, arcs in edge_arcs.items():
+        for arc_idx, arc in enumerate(arcs):
+            arc_list.append((edge_key, arc_idx, arc))
+    n_arcs = len(arc_list)
+    n_verts = len(vertices)
+
+    if n_arcs == 0:
+        print("[ILP filter] no arcs — nothing to optimize")
+        return edge_arcs, vertices, vertex_edges, None, {"valid": False, "n_faces": 0}
+
+    # ------------------------------------------------------------------
+    # Compute scores
+    # ------------------------------------------------------------------
+    arc_scores = []
+    for edge_key, arc_idx, arc in arc_list:
+        i, j = edge_key
+        s = _score_arc(arc, i, j, cluster_trees, cluster_nn_percentiles)
+        arc_scores.append(s)
+        print(f"  arc {edge_key}[{arc_idx}] score={s:.4f}")
+
+    vertex_scores = []
+    for v_idx in range(n_verts):
+        involved = set()
+        for edge in vertex_edges[v_idx]:
+            involved.update(edge)
+        s = _score_vertex(vertices[v_idx], involved, cluster_trees,
+                          cluster_nn_percentiles)
+        vertex_scores.append(s)
+        print(f"  v{v_idx:>3d} score={s:.4f}")
+
+    # # ------------------------------------------------------------------
+    # # Early exit: if all faces are already Eulerian, skip ILP
+    # # ------------------------------------------------------------------
+    # bad_faces = _non_eulerian_faces_direct(edge_arcs)
+    # if not bad_faces:
+    #     print("[ILP filter] all faces Eulerian — skipping ILP, building directly")
+    #     fa = face_arc_incidence(edge_arcs)
+    #     if wire_method == "direct":
+    #         fw = assemble_wires(fa, occ_surfaces, vertices, surface_ids=surface_ids)
+    #         shape, info = build_brep_shape_direct(
+    #             fa, occ_surfaces, vertices, surface_ids=surface_ids,
+    #             face_wires=fw, tolerance=tolerance, clusters=clusters,
+    #             cluster_trees=cluster_trees,
+    #         )
+    #     elif wire_method == "manual":
+    #         fw = assemble_wires(fa, occ_surfaces, vertices, surface_ids=surface_ids)
+    #         shape, info = build_brep_shape(
+    #             fa, occ_surfaces, vertices, surface_ids=surface_ids,
+    #             face_wires=fw, tolerance=tolerance,
+    #         )
+    #     elif wire_method == "builderface":
+    #         shape, info = build_brep_shape_builderface(
+    #             fa, occ_surfaces, vertices, surface_ids=surface_ids,
+    #             tolerance=tolerance, clusters=clusters,
+    #         )
+    #     elif wire_method == "cells":
+    #         shape, info = build_brep_shape_cells(
+    #             fa, occ_surfaces, vertices, surface_ids=surface_ids,
+    #             tolerance=tolerance, clusters=clusters,
+    #         )
+    #     else:
+    #         raise ValueError(f"Unknown wire_method: {wire_method}")
+    #     valid = info.get("valid", False) and info.get("n_faces", 0) > 0
+    #     print(f"[ILP filter] BRep: {info.get('n_faces', 0)} faces, valid={valid}")
+    #     return edge_arcs, vertices, vertex_edges, shape, info
+    #
+    # print(f"[ILP filter] non-Eulerian faces: {sorted(bad_faces)} — running ILP")
+
+    # ------------------------------------------------------------------
+    # Decision variables:  [a_0 .. a_{n_arcs-1}, v_0 .. v_{n_verts-1}, z_0 .. z_{n_z-1}]
+    # ------------------------------------------------------------------
+    # Build Eulerian parity index: for each (face, vertex) pair, collect arc indices
+    face_vertex_arcs = defaultdict(list)  # (face_idx, vertex_idx) -> [arc indices in arc_list]
+    for k, (edge_key, arc_idx, arc) in enumerate(arc_list):
+        if arc.get("closed"):
+            continue
+        vs, ve = arc["v_start"], arc["v_end"]
+        if vs is None or ve is None:
+            # Open arc with no attributed vertices — will be dropped by
+            # _apply_removals anyway; exclude from topology constraints.
+            continue
+        i, j = edge_key
+        face_vertex_arcs[(i, vs)].append(k)
+        face_vertex_arcs[(i, ve)].append(k)
+        face_vertex_arcs[(j, vs)].append(k)
+        face_vertex_arcs[(j, ve)].append(k)
+
+    # One z variable per (face, vertex) pair
+    fv_pairs = list(face_vertex_arcs.keys())
+    n_z = len(fv_pairs)
+    n_vars = n_arcs + n_verts + n_z
+
+    print(f"[ILP filter] variables: {n_arcs} arcs + {n_verts} vertices + "
+          f"{n_z} parity aux = {n_vars} total")
+
+    # ------------------------------------------------------------------
+    # Cost vector c
+    # ------------------------------------------------------------------
+    c = np.zeros(n_vars)
+    for k in range(n_arcs):
+        c[k] = arc_scores[k] - lam
+    for m in range(n_verts):
+        c[n_arcs + m] = vertex_scores[m] - lam
+    # z variables have zero cost
+
+    # ------------------------------------------------------------------
+    # Bounds: a_k in {0,1}, v_m in {0,1}, z_{f,m} in {0, ..., inf} integer
+    # ------------------------------------------------------------------
+    lb = np.zeros(n_vars)
+    ub = np.ones(n_vars)
+    # z variables: upper bound = max degree / 2 (generous)
+    for idx in range(n_z):
+        ub[n_arcs + n_verts + idx] = n_arcs  # generous upper bound
+    integrality = np.ones(n_vars)  # all integer
+
+    # ------------------------------------------------------------------
+    # Constraints
+    # ------------------------------------------------------------------
+    A_rows = []
+    b_lb = []
+    b_ub = []
+
+    # C1: Eulerian parity  —  sum_{k in A_f(m)} a_k  -  2 * z_{f,m} = 0
+    for z_idx, fv_pair in enumerate(fv_pairs):
+        row = np.zeros(n_vars)
+        for k in face_vertex_arcs[fv_pair]:
+            row[k] = 1.0
+        row[n_arcs + n_verts + z_idx] = -2.0
+        A_rows.append(row)
+        b_lb.append(0.0)
+        b_ub.append(0.0)
+
+    # C2: Vertex implication  —  v_m - a_k >= 0  for each open arc's endpoints
+    for k, (edge_key, arc_idx, arc) in enumerate(arc_list):
+        if arc.get("closed"):
+            continue
+        vs, ve = arc["v_start"], arc["v_end"]
+        if vs is None or ve is None:
+            continue
+        for v_idx in (vs, ve):
+            row = np.zeros(n_vars)
+            row[n_arcs + v_idx] = 1.0
+            row[k] = -1.0
+            A_rows.append(row)
+            b_lb.append(0.0)
+            b_ub.append(np.inf)
+
+    if A_rows:
+        A = np.array(A_rows)
+        constraints = LinearConstraint(A, b_lb, b_ub)
+    else:
+        constraints = None
+
+    print(f"[ILP filter] constraints: {len(A_rows)} rows "
+          f"({len(fv_pairs)} parity + {len(A_rows) - len(fv_pairs)} vertex impl.)")
+
+    # ------------------------------------------------------------------
+    # Solve
+    # ------------------------------------------------------------------
+    bounds = Bounds(lb, ub)
+    result = milp(c, constraints=constraints, integrality=integrality,
+                  bounds=bounds)
+
+    if not result.success:
+        print(f"[ILP filter] WARNING: solver failed — {result.message}")
+        print("[ILP filter] falling back to keeping all arcs/vertices")
+        # Fall through to build with everything
+        keep_arcs = set(range(n_arcs))
+        keep_verts = set(range(n_verts))
+    else:
+        x = result.x
+        keep_arcs = {k for k in range(n_arcs) if x[k] > 0.5}
+        keep_verts = {m for m in range(n_verts) if x[n_arcs + m] > 0.5}
+        obj_val = result.fun
+        print(f"[ILP filter] solved — objective={obj_val:.4f}, "
+              f"keeping {len(keep_arcs)}/{n_arcs} arcs, "
+              f"{len(keep_verts)}/{n_verts} vertices")
+
+    # ------------------------------------------------------------------
+    # Log removals
+    # ------------------------------------------------------------------
+    removed_arcs = set(range(n_arcs)) - keep_arcs
+    removed_verts = set(range(n_verts)) - keep_verts
+    for k in sorted(removed_arcs):
+        edge_key, arc_idx, arc = arc_list[k]
+        print(f"[ILP filter] removed arc {edge_key}[{arc_idx}] "
+              f"t=[{arc['t_start']:.4f},{arc['t_end']:.4f}] "
+              f"score={arc_scores[k]:.4f}")
+    for m in sorted(removed_verts):
+        print(f"[ILP filter] removed vertex v{m} score={vertex_scores[m]:.4f}")
+
+    # ------------------------------------------------------------------
+    # Apply removals via _apply_removals
+    # ------------------------------------------------------------------
+    removed_vertex_set = set(range(n_verts)) - keep_verts
+    removed_arc_keys = set()
+    for k in removed_arcs:
+        edge_key, arc_idx, _ = arc_list[k]
+        removed_arc_keys.add((edge_key, arc_idx))
+
+    ea, verts, ve = _apply_removals(edge_arcs, vertices, vertex_edges,
+                                    removed_vertex_set, removed_arc_keys)
+
+    # ------------------------------------------------------------------
+    # Build BRep with the filtered topology
+    # ------------------------------------------------------------------
+    if wire_method == "direct":
+        bad_faces = _non_eulerian_faces_direct(ea)
+        if bad_faces:
+            print(f"[ILP filter] WARNING: non-Eulerian faces after ILP: {sorted(bad_faces)}")
+        fa = face_arc_incidence(ea)
+        fw = assemble_wires(fa, occ_surfaces, verts, surface_ids=surface_ids)
+        shape, info = build_brep_shape_direct(
+            fa, occ_surfaces, verts, surface_ids=surface_ids,
+            face_wires=fw, tolerance=tolerance, clusters=clusters,
+            cluster_trees=cluster_trees,
+        )
+    elif wire_method == "manual":
+        bad_faces = _non_eulerian_faces_direct(ea)
+        if bad_faces:
+            print(f"[ILP filter] WARNING: non-Eulerian faces after ILP: {sorted(bad_faces)}")
+        fa = face_arc_incidence(ea)
+        fw = assemble_wires(fa, occ_surfaces, verts, surface_ids=surface_ids)
+        shape, info = build_brep_shape(
+            fa, occ_surfaces, verts, surface_ids=surface_ids,
+            face_wires=fw, tolerance=tolerance,
+        )
+    elif wire_method == "builderface":
+        fa = face_arc_incidence(ea)
+        shape, info = build_brep_shape_builderface(
+            fa, occ_surfaces, verts, surface_ids=surface_ids,
+            tolerance=tolerance, clusters=clusters,
+        )
+    elif wire_method == "cells":
+        fa = face_arc_incidence(ea)
+        shape, info = build_brep_shape_cells(
+            fa, occ_surfaces, verts, surface_ids=surface_ids,
+            tolerance=tolerance, clusters=clusters,
+        )
+    else:
+        raise ValueError(f"Unknown wire_method: {wire_method}")
+
+    valid = info.get("valid", False) and info.get("n_faces", 0) > 0
+    print(f"[ILP filter] BRep: {info.get('n_faces', 0)} faces, valid={valid}")
+
+    return ea, verts, ve, shape, info
 
 
 # ---------------------------------------------------------------------------
