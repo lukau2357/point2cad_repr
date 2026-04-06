@@ -40,7 +40,7 @@ try:
     from OCC.Core.gp             import gp_Pnt, gp_Pnt2d, gp_GTrsf, gp_Trsf, gp_Mat, gp_Vec, gp_Quaternion
     from OCC.Core.BRep           import BRep_Builder, BRep_Tool
     from OCC.Core.TopExp         import TopExp_Explorer
-    from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_WIRE, TopAbs_SHELL, TopAbs_SOLID
+    from OCC.Core.TopAbs         import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_WIRE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_IN
     from OCC.Core.TopoDS         import (topods, TopoDS_Edge, TopoDS_Wire,
                                          TopoDS_Face, TopoDS_Shell, TopoDS_Compound)
     from OCC.Core.BRepBuilderAPI import (
@@ -55,10 +55,13 @@ try:
     )
     from OCC.Core.ShapeFix       import ShapeFix_Wire, ShapeFix_Shape, ShapeFix_Shell, ShapeFix_Face
     from OCC.Core.BRepLib        import breplib
+    from OCC.Core.BRepTools      import breptools
     from OCC.Core.STEPControl    import (STEPControl_Writer, STEPControl_AsIs,
                                           STEPControl_Reader)
     from OCC.Core.IFSelect       import IFSelect_RetDone
     from OCC.Core.BOPAlgo        import BOPAlgo_MakerVolume, BOPAlgo_Builder, BOPAlgo_GlueFull, BOPAlgo_BuilderFace, BOPAlgo_CellsBuilder
+    from OCC.Core.BRepAlgoAPI    import BRepAlgoAPI_Splitter
+    from OCC.Core.BRepClass      import BRepClass_FaceClassifier
     from OCC.Core.TopTools       import TopTools_ListOfShape
     from OCC.Core.BRepCheck      import BRepCheck_Analyzer, BRepCheck_NoError
     from OCC.Core.BRepGProp      import brepgprop
@@ -1565,17 +1568,43 @@ def _wire_uv_signed_area(wire_arcs, surface, n_samples=20):
 
 
 
-def _build_face_with_uv_classification(face_idx, surface, wire_items,
-                                        tolerance):
-    """Build a face with correct outer/inner wire classification.
+def _wire_length(wire):
+    """Compute the 3D length of a TopoDS_Wire via linear properties."""
+    props = GProp_GProps()
+    brepgprop.LinearProperties(wire, props)
+    return props.Mass()
 
-    Uses signed UV area to identify the outer wire, then constructs the
-    face with BRepBuilderAPI_MakeFace(surface, outer_wire) + Add(inner).
 
-    Parameters
-    ----------
-    wire_items   : list[(TopoDS_Wire, wire_arcs_list)]
-    Returns the constructed TopoDS_Face, or None on failure.
+def _is_closed_surface(surface):
+    """Return True if the surface is compact (finite area).
+
+    On compact surfaces (sphere, torus, closed B-splines) a single closed
+    wire creates two finite regions that MakeFace cannot disambiguate.
+    Non-compact surfaces (cylinder, cone, plane) extend to infinity, so
+    MakeFace naturally picks the finite region.
+
+    Detection logic:
+      - Closed in both u and v → compact (torus, closed B-spline).
+      - Closed in u, v has finite bounds → compact (sphere: v ∈ [-π/2, π/2]).
+      - Cylinder/cone: u-closed but v ∈ (-∞, +∞) → not compact.
+    """
+    u_closed = surface.IsUPeriodic() or surface.IsUClosed()
+    v_closed = surface.IsVPeriodic() or surface.IsVClosed()
+    if u_closed and v_closed:
+        return True
+    if u_closed and not v_closed:
+        _, _, v1, v2 = surface.Bounds()
+        # OCC uses ~1e100 for infinite bounds; finite means compact.
+        if abs(v2 - v1) < 1e10:
+            return True
+    return False
+
+
+def _build_face_standard(face_idx, surface, wire_items, tolerance):
+    """Build a face on a non-closed surface.
+
+    The outer wire is identified by longest 3D length.  Remaining wires
+    are added as holes.  Returns TopoDS_Face or None.
     """
     occ_wires = [w for w, _ in wire_items]
 
@@ -1584,14 +1613,11 @@ def _build_face_with_uv_classification(face_idx, surface, wire_items,
         inner_wires = []
         outer_idx = 0
     else:
-        areas = []
-        for _, wire_arcs in wire_items:
-            a = _wire_uv_signed_area(wire_arcs, surface)
-            areas.append(a)
-        abs_areas = [abs(a) for a in areas]
-        area_log = "  ".join(f"w{i}={areas[i]:.4f}" for i in range(len(areas)))
-        print(f"[brep-direct] face {face_idx}: UV areas: {area_log}")
-        outer_idx = max(range(len(abs_areas)), key=lambda i: abs_areas[i])
+        lengths = [_wire_length(w) for w in occ_wires]
+        length_log = "  ".join(f"w{i}={lengths[i]:.4f}"
+                               for i in range(len(lengths)))
+        print(f"[brep-direct] face {face_idx}: wire lengths: {length_log}")
+        outer_idx = max(range(len(lengths)), key=lambda i: lengths[i])
         outer_wire = occ_wires[outer_idx]
         inner_wires = [w for i, w in enumerate(occ_wires) if i != outer_idx]
 
@@ -1610,6 +1636,115 @@ def _build_face_with_uv_classification(face_idx, surface, wire_items,
     return face
 
 
+def _build_face_splitter(face_idx, surface, wire_items, tolerance,
+                         cluster_tree):
+    """Build a face on a closed surface using BRepAlgoAPI_Splitter.
+
+    MakeFace on closed surfaces (sphere, torus) cannot select the correct
+    region — it ignores wires as trimming boundaries.  Instead:
+      1. Create a full-domain face (no wires).
+      2. Split it with the wire edges using Splitter.
+      3. Score each resulting region by mean distance to the cluster
+         point cloud and select the closest one.
+
+    Parameters
+    ----------
+    cluster_tree : scipy.spatial.cKDTree for this face's cluster points.
+                   If None, falls back to _build_face_standard.
+    """
+    if cluster_tree is None:
+        print(f"[brep-direct] face {face_idx}: closed surface but no "
+              f"cluster_tree — falling back to standard MakeFace")
+        return _build_face_standard(face_idx, surface, wire_items, tolerance)
+
+    # 1. Full-domain face.
+    full_face_maker = BRepBuilderAPI_MakeFace(surface, tolerance)
+    if not full_face_maker.IsDone():
+        print(f"[brep-direct] face {face_idx}: full-domain MakeFace failed")
+        return _build_face_standard(face_idx, surface, wire_items, tolerance)
+    full_face = full_face_maker.Face()
+
+    # 2. Collect all edges from the wires as cutting tools.
+    tools = TopTools_ListOfShape()
+    n_edges = 0
+    for wire, _ in wire_items:
+        for edge in _iter_explorer(wire, TopAbs_EDGE):
+            tools.Append(edge)
+            n_edges += 1
+
+    if n_edges == 0:
+        print(f"[brep-direct] face {face_idx}: no edges for Splitter")
+        return _build_face_standard(face_idx, surface, wire_items, tolerance)
+
+    # 3. Run Splitter.
+    splitter = BRepAlgoAPI_Splitter()
+    args = TopTools_ListOfShape()
+    args.Append(full_face)
+    splitter.SetArguments(args)
+    splitter.SetTools(tools)
+    splitter.Build()
+    if not splitter.IsDone():
+        print(f"[brep-direct] face {face_idx}: Splitter failed")
+        return _build_face_standard(face_idx, surface, wire_items, tolerance)
+
+    result = splitter.Shape()
+
+    # 4. Collect resulting faces.
+    regions = list(_iter_explorer(result, TopAbs_FACE))
+    print(f"[brep-direct] face {face_idx}: Splitter produced "
+          f"{len(regions)} region(s) from {n_edges} edge(s)")
+
+    if len(regions) == 0:
+        return _build_face_standard(face_idx, surface, wire_items, tolerance)
+    if len(regions) == 1:
+        return topods.Face(regions[0])
+
+    # 5. Score each region: sample points on the face, measure mean
+    #    distance to the cluster point cloud.
+    best_face = None
+    best_score = float("inf")
+    n_samples = 200
+    for ri, region_shape in enumerate(regions):
+        region_face = topods.Face(region_shape)
+        # Get face-level UV bounds (respects trimming, unlike surface Bounds).
+        u_lo2, u_hi2, v_lo2, v_hi2 = breptools.UVBounds(region_face)
+        surf_handle = BRep_Tool.Surface(region_face)
+
+        pts_inside = []
+        n_u = max(int(math.sqrt(n_samples)), 4)
+        n_v = max(n_samples // n_u, 4)
+        for iu in range(n_u):
+            u = u_lo2 + (u_hi2 - u_lo2) * (iu + 0.5) / n_u
+            for iv in range(n_v):
+                v = v_lo2 + (v_hi2 - v_lo2) * (iv + 0.5) / n_v
+                classifier = BRepClass_FaceClassifier(
+                    region_face, gp_Pnt2d(u, v), tolerance)
+                if classifier.State() == TopAbs_IN:
+                    p = surf_handle.Value(u, v)
+                    pts_inside.append([p.X(), p.Y(), p.Z()])
+
+        if len(pts_inside) == 0:
+            print(f"[brep-direct] face {face_idx}: region {ri} — "
+                  f"0 interior samples")
+            continue
+
+        pts_arr = np.array(pts_inside)
+        dists, _ = cluster_tree.query(pts_arr)
+        mean_dist = float(np.mean(dists))
+        print(f"[brep-direct] face {face_idx}: region {ri} — "
+              f"{len(pts_inside)} samples, mean_dist={mean_dist:.6f}")
+
+        if mean_dist < best_score:
+            best_score = mean_dist
+            best_face = region_face
+
+    if best_face is None:
+        print(f"[brep-direct] face {face_idx}: no scorable Splitter region")
+        return _build_face_standard(face_idx, surface, wire_items, tolerance)
+
+    return best_face
+
+
 def _iter_explorer(shape, shape_type):
     """Yield sub-shapes from a TopExp_Explorer."""
     exp = TopExp_Explorer(shape, shape_type)
@@ -1622,15 +1757,14 @@ def build_brep_shape_direct(face_arcs, occ_surfaces, vertices, surface_ids=None,
                             face_wires=None, tolerance=1e-3, clusters=None,
                             cluster_trees=None):
     """
-    Build a TopoDS_Shape with signed-UV-area wire classification.
+    Build a TopoDS_Shape with wire-length outer/inner classification.
 
-    For each face, wires are classified as outer/inner by projecting
-    sample points into UV space and computing the signed polygon area
-    (shoelace formula).  The wire with the largest |area| is the outer
-    boundary; the rest are holes.
+    For non-closed surfaces, the outer wire is identified by longest 3D
+    length; remaining wires are holes.
 
-    When clusters are provided, both wire orientations are tried and
-    the face with lower mean cluster projection error is selected.
+    For closed surfaces (sphere, torus), MakeFace cannot select the
+    correct region, so BRepAlgoAPI_Splitter splits a full-domain face
+    and the region closest to the cluster point cloud is selected.
 
     Parameters / return value match build_brep_shape for drop-in use.
     """
@@ -1652,6 +1786,7 @@ def build_brep_shape_direct(face_arcs, occ_surfaces, vertices, surface_ids=None,
 
     # 2. Build wires and faces, then sew.
     sewing = BRepBuilderAPI_Sewing(tolerance)
+    splitter_faces = []   # closed-surface faces bypass sewing
 
     for face_idx, arcs in face_arcs.items():
         if face_idx >= len(occ_surfaces) or occ_surfaces[face_idx] is None:
@@ -1690,20 +1825,43 @@ def build_brep_shape_direct(face_arcs, occ_surfaces, vertices, surface_ids=None,
             continue
 
         try:
-            built_face = _build_face_with_uv_classification(
-                face_idx, surface, wire_items, tolerance)
+            if _is_closed_surface(surface):
+                ct = cluster_trees[face_idx] if cluster_trees else None
+                print(f"[brep-direct] face {face_idx}: closed surface "
+                      f"→ using Splitter")
+                built_face = _build_face_splitter(
+                    face_idx, surface, wire_items, tolerance, ct)
+                is_splitter = True
+            else:
+                built_face = _build_face_standard(
+                    face_idx, surface, wire_items, tolerance)
+                is_splitter = False
         except Exception as exc:
             print(f"[brep-direct] face {face_idx}: exception: {exc}")
             built_face = None
+            is_splitter = False
         if built_face is None:
             print(f"[brep-direct] face {face_idx}: face construction failed")
+        elif is_splitter:
+            splitter_faces.append(built_face)
         else:
             sewing.Add(built_face)
 
-    # 3. Sew all faces into a shell.
+    # 3. Sew non-closed-surface faces, then combine with Splitter faces.
     print("[brep-direct] Sewing faces ...")
     sewing.Perform()
-    shape = sewing.SewedShape()
+    sewn_shape = sewing.SewedShape()
+
+    # Combine sewn faces and Splitter faces into a single compound.
+    compound = TopoDS_Compound()
+    bb.MakeCompound(compound)
+    if sewn_shape is not None and not sewn_shape.IsNull():
+        bb.Add(compound, sewn_shape)
+    for sf in splitter_faces:
+        bb.Add(compound, sf)
+    print(f"[brep-direct] {len(splitter_faces)} Splitter face(s) added "
+          f"outside sewing")
+    shape = compound
 
     n_input_faces = len(face_arcs)
     if shape is None or shape.IsNull():
