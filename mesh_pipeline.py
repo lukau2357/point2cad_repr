@@ -210,10 +210,27 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
         print(f"[mesh] {n_clusters} clusters")
 
         clusters = []
-        for idx, (cid, c_count) in enumerate(zip(unique_clusters, cluster_counts)):
+        for cid in unique_clusters:
             cluster = data[data[:, -1] == cid][:, :3].astype(np.float32)
             clusters.append(cluster)
-            np.save(os.path.join(out_dir, f"cluster_{idx}.npy"), cluster)
+
+        # Drop clusters too small to fit a primitive surface stably.
+        # Matches HPNet/Point2CAD floor of 20 points (covers 6-DoF cone).
+        MIN_CLUSTER_PTS = 20
+        keep_mask = [len(c) >= MIN_CLUSTER_PTS for c in clusters]
+        n_dropped = sum(1 for k in keep_mask if not k)
+        if n_dropped > 0:
+            dropped_info = [(int(cid), len(clusters[i]))
+                            for i, cid in enumerate(unique_clusters) if not keep_mask[i]]
+            print(f"[preprocess] dropped {n_dropped} cluster(s) "
+                  f"with < {MIN_CLUSTER_PTS} pts: {dropped_info}")
+            clusters        = [c for c, k in zip(clusters, keep_mask) if k]
+            unique_clusters = np.array([cid for cid, k in zip(unique_clusters, keep_mask) if k])
+            cluster_counts  = np.array([cnt for cnt, k in zip(cluster_counts, keep_mask) if k])
+            n_clusters      = len(clusters)
+
+        for idx in range(len(clusters)):
+            np.save(os.path.join(out_dir, f"cluster_{idx}.npy"), clusters[idx])
 
         cluster_trees, spacings = build_cluster_trees(clusters, args.spacing_percentile)
 
@@ -459,7 +476,7 @@ if __name__ == "__main__":
                              "for the post-BFS filter (default 100 = max NN distance)")
     parser.add_argument("--seed", type=int, default=41,
                         help="Reproducibility seed")
-    parser.add_argument("--clip_method", type=str, default="bfs",
+    parser.add_argument("--clip_method", type=str, default="p2cad",
                         choices=["bfs", "p2cad"],
                         help="Mesh trimming method: 'bfs' (BFS flood-fill) or 'p2cad' (Point2CAD-style components)")
     parser.add_argument("--area_multiplier", type=float, default=2.0,

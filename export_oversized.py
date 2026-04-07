@@ -81,9 +81,15 @@ def process(xyzc_path, output_dir, args, np_rng, device):
     pts_norm, mean, R, scale = _normalize(data[:, :3])
     cluster_ids = data[:, 3].astype(int)
 
+    MIN_CLUSTER_PTS = 20  # matches HPNet/Point2CAD primitive-fitter floor
     faces = []
     for cid in np.unique(cluster_ids):
         cluster = pts_norm[cluster_ids == cid]
+
+        if len(cluster) < MIN_CLUSTER_PTS:
+            print(f"[preprocess] dropped cluster {int(cid)} "
+                  f"({len(cluster)} < {MIN_CLUSTER_PTS} pts)")
+            continue
 
         res = fit_surface(
             cluster,

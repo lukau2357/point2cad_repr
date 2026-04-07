@@ -494,7 +494,7 @@ def build_edge_arcs(intersections, vertices, vertex_edges, threshold=1e-4):
 
 
 # ---------------------------------------------------------------------------
-# Step 1c — Scoring helpers (used by greedy oracle filter)
+# Step 1c — Scoring helpers (used by greedy greedy filter)
 # ---------------------------------------------------------------------------
 
 def _score_vertex(vpos, involved_clusters, cluster_trees, cluster_nn_percentiles):
@@ -695,7 +695,7 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     """
     n_v = len(vertices)
     n_a = sum(len(a) for a in edge_arcs.values())
-    print(f"[oracle filter] input: {n_v} vertices, {n_a} arcs")
+    print(f"[greedy filter] input: {n_v} vertices, {n_a} arcs")
 
     # ------------------------------------------------------------------
     # Phase 1: Score candidates
@@ -726,11 +726,11 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     arc_candidates.sort(key=lambda c: c[0], reverse=True)
 
     if arc_candidates:
-        print(f"[oracle filter] {len(arc_candidates)} arc candidates "
+        print(f"[greedy filter] {len(arc_candidates)} arc candidates "
               f"(score range: {arc_candidates[-1][0]:.4f} — "
               f"{arc_candidates[0][0]:.4f})")
     else:
-        print("[oracle filter] no removable candidates")
+        print("[greedy filter] no removable candidates")
 
     # ------------------------------------------------------------------
     # Phase 2: Remove isolated vertices unconditionally
@@ -742,7 +742,7 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
         if _vertex_degree(v_idx, edge_arcs) == 0:
             removed_vertices.add(v_idx)
     if removed_vertices:
-        print(f"[oracle filter] removing {len(removed_vertices)} isolated vertices")
+        print(f"[greedy filter] removing {len(removed_vertices)} isolated vertices")
 
     # ------------------------------------------------------------------
     # Phase 3: Greedy removal loop (arcs first, then vertices)
@@ -805,14 +805,14 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
         return valid, shape, info, ea, verts, ve
 
     # Try with everything first (minus isolated vertices)
-    print("[oracle filter] trying full model ...")
+    print("[greedy filter] trying full model ...")
     _captured = io.StringIO()
     with contextlib.redirect_stdout(_captured):
         valid, shape, info, final_ea, final_v, final_ve = _try_build(
             removed_vertices, removed_arc_keys)
     # Always print build details (previously suppressed on success).
     for _line in _captured.getvalue().splitlines():
-        print(f"[oracle filter] {_line}")
+        print(f"[greedy filter] {_line}")
     # Log arcs silently dropped by _apply_removals (open arcs with
     # v_start=None/v_end=None that can't survive vertex compaction).
     n_in = sum(len(a) for a in edge_arcs.values())
@@ -820,20 +820,20 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
     if n_out < n_in:
         dropped = n_in - n_out - len(removed_arc_keys)
         if dropped > 0:
-            print(f"[oracle filter] {dropped} dangling arc(s) dropped "
+            print(f"[greedy filter] {dropped} dangling arc(s) dropped "
                   f"(open, no vertex attribution)")
     if valid:
-        print(f"[oracle filter] full model valid — "
+        print(f"[greedy filter] full model valid — "
               f"{info['n_faces']} faces, no removals needed")
         return final_ea, final_v, final_ve, shape, info
 
     non_euler = info.get("non_eulerian")
     if non_euler:
-        print(f"[oracle filter] full model invalid — non-Eulerian faces: {non_euler}")
+        print(f"[greedy filter] full model invalid — non-Eulerian faces: {non_euler}")
     else:
-        print(f"[oracle filter] full model invalid — BRepCheck failed "
+        print(f"[greedy filter] full model invalid — BRepCheck failed "
               f"({info.get('n_faces', 0)} faces)")
-    print(f"[oracle filter] starting greedy removal")
+    print(f"[greedy filter] starting greedy removal")
 
     best_shape, best_info = shape, info
     best_ea, best_v, best_ve = final_ea, final_v, final_ve
@@ -845,7 +845,7 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
         removed_arc_keys.add(ident)
         edge_key, _ = ident
         arc = edge_arcs[edge_key][arc_idx]
-        print(f"[oracle filter] removing arc {edge_key}[{arc_idx}] "
+        print(f"[greedy filter] removing arc {edge_key}[{arc_idx}] "
               f"t=[{arc['t_start']:.4f},{arc['t_end']:.4f}] score={score:.4f}")
 
         _captured = io.StringIO()
@@ -853,14 +853,14 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
             valid, shape, info, ea, verts, ve = _try_build(
                 removed_vertices, removed_arc_keys)
         for _line in _captured.getvalue().splitlines():
-            print(f"[oracle filter] {_line}")
+            print(f"[greedy filter] {_line}")
 
         n_faces = info.get("n_faces", 0)
         non_euler = info.get("non_eulerian")
         if non_euler:
-            print(f"[oracle filter]   non-Eulerian faces: {non_euler}")
+            print(f"[greedy filter]   non-Eulerian faces: {non_euler}")
         if valid:
-            print(f"[oracle filter] valid! {n_faces} faces after "
+            print(f"[greedy filter] valid! {n_faces} faces after "
                   f"{len(removed_arc_keys)} arc removals")
             return ea, verts, ve, shape, info
         if n_faces > best_info.get("n_faces", 0):
@@ -868,7 +868,7 @@ def greedy_oracle_filter(edge_arcs, vertices, vertex_edges,
             best_ea, best_v, best_ve = ea, verts, ve
 
     # Exhausted all arc candidates without reaching validity
-    print(f"[oracle filter] WARNING: could not achieve valid BRep "
+    print(f"[greedy filter] WARNING: could not achieve valid BRep "
           f"after removing all candidates. "
           f"Best: {best_info.get('n_faces', 0)} faces")
     return best_ea, best_v, best_ve, best_shape, best_info
@@ -883,7 +883,7 @@ def ilp_topology_filter(edge_arcs, vertices, vertex_edges,
                         occ_surfaces, surface_ids=None,
                         tolerance=1e-3,
                         cluster_bboxes=None, wire_method="direct",
-                        lam=5):
+                        lam=20):
     """
     ILP-based topology filter: select arcs and vertices that minimize
     geometric fitness cost while satisfying topological constraints.
@@ -946,40 +946,40 @@ def ilp_topology_filter(edge_arcs, vertices, vertex_edges,
     # # ------------------------------------------------------------------
     # # Early exit: if all faces are already Eulerian, skip ILP
     # # ------------------------------------------------------------------
-    # bad_faces = _non_eulerian_faces_direct(edge_arcs)
-    # if not bad_faces:
-    #     print("[ILP filter] all faces Eulerian — skipping ILP, building directly")
-    #     fa = face_arc_incidence(edge_arcs)
-    #     if wire_method == "direct":
-    #         fw = assemble_wires(fa, occ_surfaces, vertices, surface_ids=surface_ids)
-    #         shape, info = build_brep_shape_direct(
-    #             fa, occ_surfaces, vertices, surface_ids=surface_ids,
-    #             face_wires=fw, tolerance=tolerance, clusters=clusters,
-    #             cluster_trees=cluster_trees,
-    #         )
-    #     elif wire_method == "manual":
-    #         fw = assemble_wires(fa, occ_surfaces, vertices, surface_ids=surface_ids)
-    #         shape, info = build_brep_shape(
-    #             fa, occ_surfaces, vertices, surface_ids=surface_ids,
-    #             face_wires=fw, tolerance=tolerance,
-    #         )
-    #     elif wire_method == "builderface":
-    #         shape, info = build_brep_shape_builderface(
-    #             fa, occ_surfaces, vertices, surface_ids=surface_ids,
-    #             tolerance=tolerance, clusters=clusters,
-    #         )
-    #     elif wire_method == "cells":
-    #         shape, info = build_brep_shape_cells(
-    #             fa, occ_surfaces, vertices, surface_ids=surface_ids,
-    #             tolerance=tolerance, clusters=clusters,
-    #         )
-    #     else:
-    #         raise ValueError(f"Unknown wire_method: {wire_method}")
-    #     valid = info.get("valid", False) and info.get("n_faces", 0) > 0
-    #     print(f"[ILP filter] BRep: {info.get('n_faces', 0)} faces, valid={valid}")
-    #     return edge_arcs, vertices, vertex_edges, shape, info
-    #
-    # print(f"[ILP filter] non-Eulerian faces: {sorted(bad_faces)} — running ILP")
+    bad_faces = _non_eulerian_faces_direct(edge_arcs)
+    if not bad_faces:
+        print("[ILP filter] all faces Eulerian — skipping ILP, building directly")
+        fa = face_arc_incidence(edge_arcs)
+        if wire_method == "direct":
+            fw = assemble_wires(fa, occ_surfaces, vertices, surface_ids=surface_ids)
+            shape, info = build_brep_shape_direct(
+                fa, occ_surfaces, vertices, surface_ids=surface_ids,
+                face_wires=fw, tolerance=tolerance, clusters=clusters,
+                cluster_trees=cluster_trees,
+            )
+        elif wire_method == "manual":
+            fw = assemble_wires(fa, occ_surfaces, vertices, surface_ids=surface_ids)
+            shape, info = build_brep_shape(
+                fa, occ_surfaces, vertices, surface_ids=surface_ids,
+                face_wires=fw, tolerance=tolerance,
+            )
+        elif wire_method == "builderface":
+            shape, info = build_brep_shape_builderface(
+                fa, occ_surfaces, vertices, surface_ids=surface_ids,
+                tolerance=tolerance, clusters=clusters,
+            )
+        elif wire_method == "cells":
+            shape, info = build_brep_shape_cells(
+                fa, occ_surfaces, vertices, surface_ids=surface_ids,
+                tolerance=tolerance, clusters=clusters,
+            )
+        else:
+            raise ValueError(f"Unknown wire_method: {wire_method}")
+        valid = info.get("valid", False) and info.get("n_faces", 0) > 0
+        print(f"[ILP filter] BRep: {info.get('n_faces', 0)} faces, valid={valid}")
+        return edge_arcs, vertices, vertex_edges, shape, info
+    
+    print(f"[ILP filter] non-Eulerian faces: {sorted(bad_faces)} — running ILP")
 
     # ------------------------------------------------------------------
     # Decision variables:  [a_0 .. a_{n_arcs-1}, v_0 .. v_{n_verts-1}, z_0 .. z_{n_z-1}]
@@ -1084,6 +1084,25 @@ def ilp_topology_filter(edge_arcs, vertices, vertex_edges,
         keep_verts = set(range(n_verts))
     else:
         x = result.x
+        # Verify binary enforcement: all arc/vertex vars must round to {0,1}
+        binary_tol = 1e-6
+        nonbinary = []
+        for i in range(n_arcs + n_verts):
+            xi = float(x[i])
+            if min(abs(xi), abs(xi - 1.0)) > binary_tol:
+                nonbinary.append((i, xi))
+        if nonbinary:
+            print(f"[ILP filter] WARNING: {len(nonbinary)} non-binary vars "
+                  f"(first 5: {nonbinary[:5]})")
+        else:
+            print(f"[ILP filter] binary check OK: all {n_arcs + n_verts} "
+                  f"arc/vertex vars in {{0,1}} (tol={binary_tol})")
+
+        arc_x = [float(x[k]) for k in range(n_arcs)]
+        vert_x = [float(x[n_arcs + m]) for m in range(n_verts)]
+        print(f"[ILP filter] arc vars x: {arc_x}")
+        print(f"[ILP filter] vert vars x: {vert_x}")
+
         keep_arcs = {k for k in range(n_arcs) if x[k] > 0.5}
         keep_verts = {m for m in range(n_verts) if x[n_arcs + m] > 0.5}
         obj_val = result.fun

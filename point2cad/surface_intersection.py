@@ -36,11 +36,13 @@ try:
     from OCC.Core.GeomAPI     import (GeomAPI_IntSS, GeomAPI_IntCS,
                                       GeomAPI_ProjectPointOnCurve,
                                       GeomAPI_ProjectPointOnSurf)
-    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
+    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve, GeomAdaptor_Surface
     from OCC.Core.GeomAbs     import (GeomAbs_Line, GeomAbs_Circle, GeomAbs_Ellipse,
                                        GeomAbs_Hyperbola, GeomAbs_Parabola,
                                        GeomAbs_BezierCurve, GeomAbs_BSplineCurve,
-                                       GeomAbs_OtherCurve)
+                                       GeomAbs_OtherCurve,
+                                       GeomAbs_Plane, GeomAbs_Cylinder,
+                                       GeomAbs_Sphere, GeomAbs_Cone)
     from OCC.Core.Precision   import precision
     _OCC_INF = precision.Infinite()
     _GEOMABS_NAMES = {
@@ -681,7 +683,117 @@ def trim_by_vertices(raw_intersections, vertices, vertex_edges,
     return trimmed
 
 
-def compute_vertices_intcs(adj, intersections, occ_surfaces, threshold=1e-3):
+def _line_cylinder_tangent_point(curve, surface, tol):
+    """
+    Closed-form tangent intersection of a Geom_Line with a
+    Geom_CylindricalSurface.
+
+    Math
+    ----
+    Line:     p(t) = p0 + t v
+    Cylinder: axis through c with direction a, radius r
+
+    Let w(t)   = p(t) - c
+        w_perp = w - (w·a) a   (component of w perpendicular to the axis)
+        u0     = w_perp evaluated at t = 0   (constant)
+        v_perp = v - (v·a) a                (constant)
+
+    Then w_perp(t) = u0 + t v_perp and the squared distance from p(t) to the
+    cylinder axis is
+
+        d²(t) = ‖u0‖² + 2 t (u0·v_perp) + t² ‖v_perp‖²
+
+    minimised at  t* = −(u0·v_perp) / ‖v_perp‖²  (assuming the line is not
+    parallel to the axis, ‖v_perp‖ > 0).  The minimum distance is
+
+        d_min² = ‖u0‖² − (u0·v_perp)² / ‖v_perp‖²
+
+    and a tangent intersection exists iff |d_min − r| ≤ tol.  At the
+    tangent point d_min = r, so p(t*) is the tangent vertex.
+
+    Parameters
+    ----------
+    curve   : Geom_Curve known to adapt to GeomAbs_Line
+    surface : Geom_Surface known to adapt to GeomAbs_Cylinder
+    tol     : tolerance on |d_min − r|
+
+    Returns
+    -------
+    np.ndarray of shape (3,) with the tangent point, or None if no tangent
+    intersection within tolerance.
+    """
+    cadap = GeomAdaptor_Curve(curve)
+    sadap = GeomAdaptor_Surface(surface)
+
+    lin = cadap.Line()           # gp_Lin
+    cyl = sadap.Cylinder()       # gp_Cylinder
+
+    p0 = np.array([lin.Location().X(), lin.Location().Y(), lin.Location().Z()])
+    v  = np.array([lin.Direction().X(), lin.Direction().Y(), lin.Direction().Z()])
+
+    ax = cyl.Axis()
+    c  = np.array([ax.Location().X(), ax.Location().Y(), ax.Location().Z()])
+    a  = np.array([ax.Direction().X(), ax.Direction().Y(), ax.Direction().Z()])
+    r  = float(cyl.Radius())
+
+    w0       = p0 - c
+    u0       = w0 - float(np.dot(w0, a)) * a       # (3,)
+    v_perp   = v  - float(np.dot(v,  a)) * a        # (3,)
+    v_perp_sq = float(np.dot(v_perp, v_perp))
+
+    if v_perp_sq < 1e-12:
+        # Line parallel to cylinder axis — distance constant in t.
+        # If |‖u0‖ − r| ≤ tol the line is a generator (handled by the
+        # surface∩surface tangent fallback elsewhere); no isolated vertex.
+        return None
+
+    t_star = -float(np.dot(u0, v_perp)) / v_perp_sq
+    d_min_sq = float(np.dot(u0, u0)) - float(np.dot(u0, v_perp))**2 / v_perp_sq
+    if d_min_sq < 0.0:
+        d_min_sq = 0.0
+    d_min = math.sqrt(d_min_sq)
+
+    if abs(d_min - r) > tol:
+        return None
+
+    return p0 + t_star * v
+
+
+def _try_tangent_curve_surface_intersection(curve, surface, tol=1e-3):
+    """
+    Dispatcher for analytical curve∩surface tangent fallbacks, used when
+    GeomAPI_IntCS returns no intersection points.
+
+    Tangent intersections are degenerate cases for the IntCS solver
+    (double roots, discriminant ≈ 0) and frequently slip through as
+    "no points found".  This function checks the curve/surface type pair
+    and routes to a closed-form tangent test for handled cases.
+
+    Currently handled:
+        Line ∩ Cylinder    (00470 box-with-fillet corners)
+
+    Future additions:
+        Circle ∩ Cylinder, Line ∩ Cone, Circle ∩ Sphere, ...
+
+    Returns
+    -------
+    np.ndarray of shape (3,) with the tangent point, or None if the type
+    pair is not handled or no tangent intersection exists within tol.
+    """
+    try:
+        ctype = GeomAdaptor_Curve(curve).GetType()
+        stype = GeomAdaptor_Surface(surface).GetType()
+    except Exception:
+        return None
+
+    if ctype == GeomAbs_Line and stype == GeomAbs_Cylinder:
+        return _line_cylinder_tangent_point(curve, surface, tol)
+
+    return None
+
+
+def compute_vertices_intcs(adj, intersections, occ_surfaces, threshold=1e-3,
+                           tangent_tol=1e-3):
     """
     Find B-Rep vertices using curve–surface intersection (GeomAPI_IntCS).
 
@@ -762,10 +874,23 @@ def compute_vertices_intcs(adj, intersections, occ_surfaces, threshold=1e-3):
                         print(f"[compute_vertices_intcs] IntCS({edge_a}, S_{h}) "
                               f"exception: {err}")
                         continue
-                    for k in range(1, intcs.NbPoints() + 1):
-                        p = intcs.Point(k)
-                        candidates.append(np.array([p.X(), p.Y(), p.Z()]))
-                        candidate_triples.append(triple)
+                    if intcs.NbPoints() > 0:
+                        for k in range(1, intcs.NbPoints() + 1):
+                            p = intcs.Point(k)
+                            candidates.append(np.array([p.X(), p.Y(), p.Z()]))
+                            candidate_triples.append(triple)
+                    else:
+                        # Tangent fallback: IntCS misses tangent intersections
+                        # (double roots, discriminant ≈ 0).  Closed-form check
+                        # for handled curve/surface type pairs.
+                        tpt = _try_tangent_curve_surface_intersection(
+                            ca, surf_h, tol=tangent_tol)
+                        if tpt is not None:
+                            print(f"[compute_vertices_intcs] tangent fallback "
+                                  f"({edge_a}, S_{h}) → "
+                                  f"({tpt[0]:.6f}, {tpt[1]:.6f}, {tpt[2]:.6f})")
+                            candidates.append(tpt)
+                            candidate_triples.append(triple)
 
                 # IntCS(C_fh, S_g): point lies on surfaces f, h, g
                 for cb in curves_b:
@@ -775,10 +900,20 @@ def compute_vertices_intcs(adj, intersections, occ_surfaces, threshold=1e-3):
                         print(f"[compute_vertices_intcs] IntCS({edge_b}, S_{g}) "
                               f"exception: {err}")
                         continue
-                    for k in range(1, intcs.NbPoints() + 1):
-                        p = intcs.Point(k)
-                        candidates.append(np.array([p.X(), p.Y(), p.Z()]))
-                        candidate_triples.append(triple)
+                    if intcs.NbPoints() > 0:
+                        for k in range(1, intcs.NbPoints() + 1):
+                            p = intcs.Point(k)
+                            candidates.append(np.array([p.X(), p.Y(), p.Z()]))
+                            candidate_triples.append(triple)
+                    else:
+                        tpt = _try_tangent_curve_surface_intersection(
+                            cb, surf_g, tol=tangent_tol)
+                        if tpt is not None:
+                            print(f"[compute_vertices_intcs] tangent fallback "
+                                  f"({edge_b}, S_{g}) → "
+                                  f"({tpt[0]:.6f}, {tpt[1]:.6f}, {tpt[2]:.6f})")
+                            candidates.append(tpt)
+                            candidate_triples.append(triple)
 
     print(f"[compute_vertices_intcs] {len(candidates)} raw candidates "
           f"before dedup (threshold={threshold})")
@@ -868,3 +1003,4 @@ def compute_vertices_intcs(adj, intersections, occ_surfaces, threshold=1e-3):
           f"after triple attribution")
     return (np.array(merged_positions, dtype=np.float64) if merged_positions
             else np.empty((0, 3), dtype=np.float64)), merged_edge_sets
+

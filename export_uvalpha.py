@@ -42,8 +42,14 @@ def process(xyzc_path, output_dir, args, np_rng, device):
     clusters = []
     surface_ids = []
 
+    MIN_CLUSTER_PTS = 20  # matches HPNet/Point2CAD primitive-fitter floor
     for cid in unique_cids:
         cluster = pts_norm[cluster_ids == cid]
+
+        if len(cluster) < MIN_CLUSTER_PTS:
+            print(f"[preprocess] dropped cluster {int(cid)} "
+                  f"({len(cluster)} < {MIN_CLUSTER_PTS} pts)")
+            continue
 
         res = fit_surface(
             cluster,

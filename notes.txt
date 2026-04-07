@@ -183,3 +183,7 @@ Mesh generation (mesh_pipeline.py, BFS vs Point2CAD style with libicgal as mesh 
 - Number of connected components != sum(per face number of compontents) in mesh_pipeline?
 - For best description of BRep, look at the SolidGen paper.
 - To fix in brep pipeline: correct outer wire selection, tangent geometries, ILP to always get valid BRep.
+
+--------------- ABC PARTS ------------------------------
+- 00470 - tangent intersection curves
+- 00417 - tangent surfaces
