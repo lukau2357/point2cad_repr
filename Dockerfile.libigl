@@ -46,7 +46,8 @@ RUN pip install --no-cache-dir \
     matplotlib \
     tqdm \
     trimesh \
-    rtree
+    rtree \
+    h5py
 
 # Verify imports
 RUN python -c "from OCC.Core.gp import gp_Pnt; print('OCC OK')"
