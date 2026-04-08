@@ -171,7 +171,7 @@ if __name__ == "__main__":
             # walk_radius = 1,
             # foreign_threshold = 0.3,
             clip_method = "component_based",
-            area_multiplier = 1.5,
+            area_multiplier = 2,
             component_filter = "area_per_point",
             connectivity = "edge",
         )

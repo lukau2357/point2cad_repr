@@ -168,15 +168,19 @@ def cone_special_handling(results, errors, simple_error_threshold, plane_cone_ra
     return SURFACE_CONE
         
 
-def plane_special_handling(results, errors, plane_sphere_ratio_threshold):
+def plane_sphere_arbitration(errors, plane_sphere_ratio_threshold):
     """
-    If plane is selected as the best simple surface, check whether a sphere
-    fits significantly better.  Returns SURFACE_SPHERE when
+    Symmetric arbiter between plane and sphere. Returns SURFACE_SPHERE iff
 
         plane_error / sphere_error  >=  plane_sphere_ratio_threshold
 
-    (i.e. the sphere must be much better to justify replacing the plane),
-    otherwise returns SURFACE_PLANE.
+    (i.e. sphere is substantially better than plane), otherwise SURFACE_PLANE.
+
+    Used from both branches of the dispatch (`simple_min == SURFACE_PLANE`
+    and `simple_min == SURFACE_SPHERE`) so that the plane-vs-sphere decision
+    is identical regardless of which one wins the raw argmin. Without this,
+    a noisy planar patch can be silently described as a giant-radius sphere
+    just because the extra DoF undercut plane error by a hair.
     """
     if ratio(errors[SURFACE_PLANE], errors[SURFACE_SPHERE]) >= plane_sphere_ratio_threshold:
         return SURFACE_SPHERE
@@ -190,7 +194,7 @@ def fit_surface(cluster,
                 simple_error_threshold = 8e-3,
                 simple_inr_ratio_threshold = 1.5,
                 plane_cone_ratio_threshold = 2.5,
-                plane_sphere_ratio_threshold = 2.5,
+                plane_sphere_ratio_threshold = 3.5,
                 cone_theta_tolerance_degrees = 5,
                 sphere_fit_kwargs = None,
                 cylinder_fit_kwargs = None,
@@ -251,8 +255,8 @@ def fit_surface(cluster,
 
         else:
             surface_to_use = simple_min
-            if simple_min == SURFACE_PLANE:
-                surface_to_use = plane_special_handling(results, errors, plane_sphere_ratio_threshold)
+            if simple_min == SURFACE_PLANE or simple_min == SURFACE_SPHERE:
+                surface_to_use = plane_sphere_arbitration(errors, plane_sphere_ratio_threshold)
             mesh = resolve_mesh(surface_to_use, results[surface_to_use], cluster, np_rng, device,
             plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
             radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
@@ -279,8 +283,8 @@ def fit_surface(cluster,
             # In that case, use INR.
             if resulting_min == -1:
                 resulting_min = global_min
-        elif resulting_min == SURFACE_PLANE:
-            resulting_min = plane_special_handling(results, errors[:-1], plane_sphere_ratio_threshold)
+        elif resulting_min == SURFACE_PLANE or resulting_min == SURFACE_SPHERE:
+            resulting_min = plane_sphere_arbitration(errors[:-1], plane_sphere_ratio_threshold)
 
     mesh = resolve_mesh(resulting_min, results[resulting_min], cluster, np_rng, device,
                         plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,

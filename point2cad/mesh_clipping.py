@@ -82,26 +82,58 @@ def _find_intersection_edges(FF, face_provenance, n_vertices):
     return intersection_edges
 
 
-def build_cluster_trees(clusters, spacing_percentile=100.0):
+def _upsample_points_knn(points, times=3, k=5):
+    """
+    Densify a point cloud by inserting kNN-centroid points, Point2CAD style.
+
+    For each point, find its k nearest neighbors (including itself) and append
+    their centroid as a new point. Repeat `times` passes; each pass roughly
+    doubles the cloud. Mirrors `up_sample_points_torch_memory_efficient` from
+    Point2CAD's fitting_utils.py.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    for _ in range(times):
+        if len(pts) < k + 1:
+            break
+        # query k+1 and drop column 0 (self-match at distance 0) so the
+        # centroid averages k *true* neighbors instead of being biased by self.
+        _, nn_idx = cKDTree(pts).query(pts, k=k + 1)
+        centers = pts[nn_idx[:, 1:]].mean(axis=1)
+        pts = np.concatenate([pts, centers], axis=0)
+    return pts
+
+
+def build_cluster_trees(clusters, spacing_percentile=100.0, upsample_passes=3):
     """
     Precompute per-cluster KDTree and intra-cluster NN spacing.
+
+    The KDTree is built on a kNN-centroid upsampled copy of the cluster (same
+    densification Point2CAD applies inside visualize_basic_mesh) so the
+    nearest-neighbor lookup used by mesh post-filters is robust to sparse
+    regions. Spacing is computed on the *original* cluster so that thresholds
+    like `post_filter_threshold * spacings[s]` are not artificially shrunk by
+    the upsampling.
 
     Parameters
     ----------
     clusters           : list of (N, 3) float arrays
     spacing_percentile : percentile of intra-cluster NN distances (default 100 = max)
+    upsample_passes    : number of kNN-centroid upsampling passes for the KDTree
+                         (Point2CAD uses 3 for plane/cylinder/cone, 2 for sphere)
 
     Returns
     -------
-    trees    : list[cKDTree]
-    spacings : list[float] — one scalar per cluster
+    trees    : list[cKDTree] — built on upsampled cluster
+    spacings : list[float]   — computed on the original cluster
     """
     trees, spacings = [], []
     for c in clusters:
-        tree = cKDTree(c)
-        d, _ = tree.query(c, k=2)   # k=2: column 0 is self (dist=0), column 1 is NN
+        d, _ = cKDTree(c).query(c, k=2)   # spacing: original-cluster NN
         spacings.append(float(np.percentile(d[:, 1], spacing_percentile)))
-        trees.append(tree)
+
+        c_dense = _upsample_points_knn(c, times=upsample_passes) \
+                  if upsample_passes > 0 else c
+        trees.append(cKDTree(c_dense))
     return trees, spacings
 
 
@@ -138,7 +170,9 @@ def _resolve_intersections(o3d_meshes, tag="clip"):
 
 
 def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
-                      area_multiplier=2.0):
+                      cluster_trees=None, spacings=None,
+                      area_multiplier=2.0,
+                      post_filter_threshold=None):
     """
     Point2CAD-style mesh clipping: connected components of the resolved mesh
     filtered by area-per-supporting-point ratio.
@@ -150,15 +184,23 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
 
     Parameters
     ----------
-    o3d_meshes     : list of open3d.geometry.TriangleMesh, one per cluster
-    clusters       : list of (N, 3) float arrays — input point clouds
-    surface_types  : list of str — surface type names (for coloring)
-    area_multiplier: keep components with area_per_point < best * area_multiplier
+    o3d_meshes            : list of open3d.geometry.TriangleMesh, one per cluster
+    clusters              : list of (N, 3) float arrays — input point clouds
+    surface_types         : list of str — surface type names (for coloring)
+    cluster_trees         : list of scipy KDTree, one per cluster (optional)
+    spacings              : list[float] — intra-cluster NN spacing per cluster (optional)
+    area_multiplier       : keep components with area_per_point < best * area_multiplier
+    post_filter_threshold : if not None, drop kept faces whose barycenter is
+                            farther than post_filter_threshold * spacings[s] from
+                            the nearest point in cluster s. Same rule as
+                            clip_meshes_bfs. Requires cluster_trees and spacings.
 
     Returns
     -------
     clipped : list of open3d.geometry.TriangleMesh, one per cluster
     """
+    if post_filter_threshold is not None and (cluster_trees is None or spacings is None):
+        raise ValueError("post_filter_threshold requires cluster_trees and spacings")
     VV, FF, face_provenance = _resolve_intersections(o3d_meshes, tag="p2cad-clip")
 
     # Cut the adjacency graph along intersection curves so that inner/outer
@@ -181,15 +223,20 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
     # Build submeshes and attribute each to a surface via majority provenance
     submeshes = []
     submesh_surface = []
+    n_tiny_dropped = 0
     for lbl in unique_labels:
         face_idx = np.where(connected_labels == lbl)[0]
         if len(face_idx) <= 2:
+            n_tiny_dropped += 1
             continue
         sub = trimesh.Trimesh(vertices=VV,
                               faces=FF[face_idx],
                               process=False)
         submeshes.append(sub)
         submesh_surface.append(int(face_provenance[face_idx[0]]))
+
+    print(f"[p2cad-clip] dropped {n_tiny_dropped} tiny components (<=2 faces); "
+          f"{len(submeshes)} retained for per-surface attribution")
 
     clipped = []
     for s in range(len(clusters)):
@@ -226,9 +273,26 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
         print(f"[p2cad-clip] surface {s} ({surface_types[s]}): "
               f"{len(keep_idx)}/{len(subs)} components kept")
 
+        kept_vertices = np.array(kept.vertices)
+        kept_faces    = np.array(kept.faces)
+
+        # Optional post-filter: drop faces whose barycenter is farther than
+        # post_filter_threshold * spacings[s] from the nearest cluster point.
+        # Mirrors clip_meshes_bfs (mesh_clipping.py:357-361).
+        if post_filter_threshold is not None and len(kept_faces) > 0:
+            thr = post_filter_threshold * spacings[s]
+            barycenters = kept_vertices[kept_faces].mean(axis=1)
+            bar_dists, _ = cluster_trees[s].query(barycenters)
+            mask = bar_dists <= thr
+            n_before = len(kept_faces)
+            kept_faces = kept_faces[mask]
+            print(f"[p2cad-clip] surface {s} ({surface_types[s]}): "
+                  f"post-filter kept {len(kept_faces)}/{n_before} faces "
+                  f"(thr={thr:.5f})")
+
         mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices  = o3d.utility.Vector3dVector(np.array(kept.vertices))
-        mesh.triangles = o3d.utility.Vector3iVector(np.array(kept.faces))
+        mesh.vertices  = o3d.utility.Vector3dVector(kept_vertices)
+        mesh.triangles = o3d.utility.Vector3iVector(kept_faces)
         mesh.remove_unreferenced_vertices()
         mesh.compute_vertex_normals()
         mesh.paint_uniform_color(get_surface_color(surface_types[s]))
