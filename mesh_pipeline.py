@@ -137,9 +137,15 @@ def run_compute(args):
 
     part_dirs = []
     cluster_offset = 0
+    part_times = []
+    t_total = time.perf_counter()
     for part_idx in part_indices:
+        t_part = time.perf_counter()
         _run_compute_part(args, xyzc_files[part_idx], part_idx, normalize_points,
                           DEVICE, tm)
+        dt_part = time.perf_counter() - t_part
+        part_times.append((part_idx, dt_part))
+        print(f"[timing] part {part_idx}: {dt_part:.2f}s")
         out_dir = os.path.join(args.output_dir, args.model_id, f"part_{part_idx}")
         meta_path = os.path.join(out_dir, "metadata.npz")
         if os.path.exists(meta_path):
@@ -150,6 +156,12 @@ def run_compute(args):
     if part_dirs:
         unified_dir = os.path.join(args.output_dir, args.model_id, "unified")
         _merge_part_dirs(part_dirs, unified_dir)
+
+    dt_total = time.perf_counter() - t_total
+    print(f"\n[timing] === mesh_pipeline summary for {args.model_id} ===")
+    for pi, dt in part_times:
+        print(f"[timing]   part {pi}: {dt:.2f}s")
+    print(f"[timing]   total ({len(part_times)} parts): {dt_total:.2f}s")
 
 
 def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm):
@@ -192,6 +204,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
 
         print(f"[mesh] Loaded {n_clusters} clusters and meshes from {out_dir}/")
         cluster_trees, spacings = build_cluster_trees(clusters, args.spacing_percentile)
+        fit_time = 0.0
     else:
         if os.path.exists(out_dir):
             shutil.rmtree(out_dir)
@@ -237,6 +250,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
         o3d_meshes = []
         surface_type_names = []
 
+        t_fit = time.perf_counter()
         for idx, (cid, c_count) in enumerate(zip(unique_clusters, cluster_counts)):
             cluster = clusters[idx]
 
@@ -259,7 +273,8 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
                                       "threshold_multiplier": 3, "cylinder_height_margin": 0.5, "spacing": spacings[idx]},
                 cone_mesh_kwargs={"dim_theta": 200, "dim_height": 200,
                                   "threshold_multiplier": 3, "cone_height_margin": 0.5, "spacing": spacings[idx]},
-                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": 3, "spacing": spacings[idx]}
+                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": 3, "spacing": spacings[idx]},
+                radius_inflation=0.001
             )
 
             sid = res["surface_id"]
@@ -278,7 +293,9 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
             tris  = np.asarray(res["mesh"].triangles)
             np.savez(os.path.join(out_dir, f"surface_mesh_{idx}.npz"),
                      vertices=verts, triangles=tris)
+        fit_time = time.perf_counter() - t_fit
 
+    t_clip = time.perf_counter()
     if args.clip_method == "bfs":
         print("[mesh] Running BFS flood-fill trimming ...")
         clipped_meshes = clip_meshes_bfs(o3d_meshes, clusters, surface_type_names,
@@ -287,7 +304,21 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
     else:
         print("[mesh] Running Point2CAD-style trimming ...")
         clipped_meshes = clip_meshes_p2cad(o3d_meshes, clusters, surface_type_names,
-                                           area_multiplier=args.area_multiplier)
+                                           cluster_trees=cluster_trees,
+                                           spacings=spacings,
+                                           area_multiplier=args.area_multiplier,
+                                           post_filter_threshold=args.post_filter_threshold)
+    clip_time = time.perf_counter() - t_clip
+
+    print(f"[timing]   fit:  {fit_time:.2f}s")
+    print(f"[timing]   clip: {clip_time:.2f}s")
+    print(f"[timing]   sum:  {fit_time + clip_time:.2f}s")
+
+    import json as _json
+    with open(os.path.join(out_dir, "timing.json"), "w") as _f:
+        _json.dump({"fit_time": fit_time,
+                    "clip_time": clip_time,
+                    "total_time": fit_time + clip_time}, _f, indent=2)
 
     combined = o3d.geometry.TriangleMesh()
     for idx, mesh in enumerate(clipped_meshes):
@@ -318,56 +349,181 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
 # ---------------------------------------------------------------------------
 
 def run_visualize(args):
-    out_dir = os.path.join(args.output_dir, args.model_id, "unified")
-    meta_path = os.path.join(out_dir, "metadata.npz")
-    if not os.path.exists(meta_path):
-        print(f"No saved results found in {out_dir}/ — run compute first.")
-        return
+    """
+    Five windows, all in normalized (per-part) space:
+        1. Input point cloud
+        2. Mine — unclipped surface meshes (with N/P cycling)
+        3. Mine — clipped meshes
+        4. Original Point2CAD — unclipped meshes
+        5. Original Point2CAD — clipped meshes
 
-    meta           = np.load(meta_path, allow_pickle=True)
-    n_clusters     = int(meta["n_clusters"])
-    cluster_colors = meta["cluster_colors"]
-    surface_names  = meta["surface_names"]
-    clip_method    = str(meta["clip_method"]) if "clip_method" in meta else "unknown"
-
+    Multi-part agnostic: iterates `part_*/` dirs on both sides and concatenates
+    everything in memory. No reliance on `unified/` (which is world-space and
+    has no original-Point2CAD counterpart, so apples-to-apples comparison
+    requires staying in normalized space).
+    """
     from point2cad.color_config import get_surface_color
 
-    # Point cloud: one colored pcd per cluster, merged
-    pcd_combined = o3d.geometry.PointCloud()
-    for i in range(n_clusters):
-        pts = np.load(os.path.join(out_dir, f"cluster_{i}.npy"))
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts)
-        pcd.paint_uniform_color(cluster_colors[i].tolist())
-        pcd_combined += pcd
+    model_root = os.path.join(args.output_dir, args.model_id)
+    if not os.path.isdir(model_root):
+        print(f"No saved results found in {model_root}/ — run compute first.")
+        return
 
-    # Unclipped meshes — kept as individual list for N/P cycling
-    surface_meshes = []
-    surface_mesh_ids = []
-    for i in range(n_clusters):
-        path = os.path.join(out_dir, f"surface_mesh_{i}.npz")
-        if not os.path.exists(path):
+    part_dirs = sorted(
+        d for d in os.listdir(model_root)
+        if d.startswith("part_") and os.path.isdir(os.path.join(model_root, d))
+    )
+    if not part_dirs:
+        print(f"No part_* subdirs in {model_root}/ — run compute first.")
+        return
+
+    pcd_combined     = o3d.geometry.PointCloud()
+    surface_meshes   = []   # flat list across all parts (for N/P cycling)
+    surface_labels   = []   # parallel list of "part{P}/cluster{i} ({stype})"
+    clipped_combined = o3d.geometry.TriangleMesh()
+    clip_method      = "unknown"
+
+    # ---- Per-part timings (mine + original Point2CAD if present) ---------
+    import json as _json
+    def _load_timing(path):
+        if os.path.isfile(path):
+            try:
+                with open(path) as f:
+                    return _json.load(f)
+            except Exception:
+                return None
+        return None
+
+    mine_timings, orig_timings = [], []
+    orig_root = os.path.join("..", "point2cad", "output_p2cad_orig", args.model_id)
+
+    for pd in part_dirs:
+        part_dir = os.path.join(model_root, pd)
+        meta_path = os.path.join(part_dir, "metadata.npz")
+        if not os.path.exists(meta_path):
             continue
-        d = np.load(path)
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
-        mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
-        mesh.compute_vertex_normals()
-        mesh.paint_uniform_color(get_surface_color(str(surface_names[i])))
-        surface_meshes.append(mesh)
-        surface_mesh_ids.append(i)
+        mine_timings.append((pd, _load_timing(os.path.join(part_dir, "timing.json"))))
+        orig_timings.append((pd, _load_timing(os.path.join(orig_root, pd, "timing.json"))))
+        meta = np.load(meta_path, allow_pickle=True)
+        n_clusters     = int(meta["n_clusters"])
+        cluster_colors = meta["cluster_colors"]
+        surface_names  = meta["surface_names"]
+        if "clip_method" in meta:
+            clip_method = str(meta["clip_method"])
 
-    # N/P highlight state: -1 = show all
+        for i in range(n_clusters):
+            stype = str(surface_names[i])
+            scolor = get_surface_color(stype)
+
+            pts_path = os.path.join(part_dir, f"cluster_{i}.npy")
+            if os.path.exists(pts_path):
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(np.load(pts_path))
+                pcd.paint_uniform_color(cluster_colors[i].tolist())
+                pcd_combined += pcd
+
+            sm_path = os.path.join(part_dir, f"surface_mesh_{i}.npz")
+            if os.path.exists(sm_path):
+                d = np.load(sm_path)
+                mesh = o3d.geometry.TriangleMesh()
+                mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
+                mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
+                mesh.compute_vertex_normals()
+                mesh.paint_uniform_color(scolor)
+                surface_meshes.append(mesh)
+                surface_labels.append(f"{pd}/cluster_{i} ({stype})")
+
+            tm_path = os.path.join(part_dir, f"trimmed_mesh_{i}.npz")
+            if os.path.exists(tm_path):
+                d = np.load(tm_path)
+                if len(d["vertices"]) > 0:
+                    mesh = o3d.geometry.TriangleMesh()
+                    mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
+                    mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
+                    mesh.compute_vertex_normals()
+                    mesh.paint_uniform_color(scolor)
+                    clipped_combined += mesh
+
+    # ---- Original Point2CAD outputs (per-cluster plys + types.json) ------
+    def _load_orig(kind):
+        """kind ∈ {'unclipped', 'clipped'}. Iterates part_*/<kind>/cluster_*.ply,
+        reads types.json sidecar, applies our color scheme per cluster."""
+        import json as _json
+        import glob as _g
+        root = os.path.join("..", "point2cad", "output_p2cad_orig", args.model_id)
+        combined = o3d.geometry.TriangleMesh()
+        if not os.path.isdir(root):
+            return combined
+        for pd in sorted(d for d in os.listdir(root)
+                         if d.startswith("part_")
+                         and os.path.isdir(os.path.join(root, d))):
+            kind_dir = os.path.join(root, pd, kind)
+            types_path = os.path.join(kind_dir, "types.json")
+            if not os.path.isfile(types_path):
+                continue
+            with open(types_path) as f:
+                types = _json.load(f)
+            cluster_plys = sorted(
+                _g.glob(os.path.join(kind_dir, "cluster_*.ply")),
+                key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]),
+            )
+            for ply in cluster_plys:
+                cid = int(os.path.splitext(os.path.basename(ply))[0].split("_")[1])
+                if cid >= len(types):
+                    continue
+                m = o3d.io.read_triangle_mesh(ply)
+                if len(m.vertices) == 0:
+                    continue
+                m.compute_vertex_normals()
+                m.paint_uniform_color(get_surface_color(types[cid]))
+                combined += m
+        return combined
+
+    orig_unclipped = _load_orig("unclipped")
+    orig_clipped   = _load_orig("clipped")
+
+    # ---- Print timing comparison -----------------------------------------
+    def _fmt(t):
+        return f"{t:7.2f}s" if t is not None else "      -"
+
+    def _row(label, ts):
+        if ts is None:
+            return f"{label:>16}: {'      -':>8} {'      -':>8} {'      -':>8}"
+        return (f"{label:>16}: {_fmt(ts.get('fit_time')):>8} "
+                f"{_fmt(ts.get('clip_time')):>8} {_fmt(ts.get('total_time')):>8}")
+
+    print("\n[timing] === per-part timings ===")
+    print(f"{'':>16}  {'fit':>8} {'clip':>8} {'total':>8}")
+    mine_tot = {"fit": 0.0, "clip": 0.0, "sum": 0.0}
+    orig_tot = {"fit": 0.0, "clip": 0.0, "sum": 0.0}
+    for (pd, mt), (_, ot) in zip(mine_timings, orig_timings):
+        print(f"  {pd}")
+        print("  " + _row("mine", mt))
+        print("  " + _row("orig p2cad", ot))
+        if mt:
+            mine_tot["fit"]  += mt.get("fit_time", 0.0) or 0.0
+            mine_tot["clip"] += mt.get("clip_time", 0.0) or 0.0
+            mine_tot["sum"]  += mt.get("total_time", 0.0) or 0.0
+        if ot:
+            orig_tot["fit"]  += ot.get("fit_time", 0.0) or 0.0
+            orig_tot["clip"] += ot.get("clip_time", 0.0) or 0.0
+            orig_tot["sum"]  += ot.get("total_time", 0.0) or 0.0
+    print(f"\n  {'TOTAL':>16}")
+    print(f"  {'mine':>16}: {mine_tot['fit']:7.2f}s {mine_tot['clip']:7.2f}s {mine_tot['sum']:7.2f}s")
+    print(f"  {'orig p2cad':>16}: {orig_tot['fit']:7.2f}s {orig_tot['clip']:7.2f}s {orig_tot['sum']:7.2f}s")
+    if orig_tot['sum'] > 0 and mine_tot['sum'] > 0:
+        print(f"  speedup (orig/mine): {orig_tot['sum'] / mine_tot['sum']:.2f}x")
+    print()
+
+    # ---- N/P cycling over `surface_meshes` -------------------------------
     _highlight = {"idx": -1}
 
     def _update_highlight(vis_obj):
         idx = _highlight["idx"]
         for k, mesh in enumerate(surface_meshes):
-            si = surface_mesh_ids[k]
-            if idx == -1:
-                mesh.paint_uniform_color(get_surface_color(str(surface_names[si])))
-            elif k == idx:
-                mesh.paint_uniform_color(get_surface_color(str(surface_names[si])))
+            stype = surface_labels[k].rsplit("(", 1)[-1].rstrip(")")
+            if idx == -1 or k == idx:
+                mesh.paint_uniform_color(get_surface_color(stype))
             else:
                 mesh.paint_uniform_color([0.3, 0.3, 0.3])
             mesh.compute_vertex_normals()
@@ -376,8 +532,7 @@ def run_visualize(args):
         if idx == -1:
             print("[surfaces] showing ALL clusters")
         else:
-            si = surface_mesh_ids[idx]
-            print(f"[surfaces] cluster {si} ({surface_names[si]})")
+            print(f"[surfaces] {surface_labels[idx]}")
 
     def _on_key_next(vis_obj):
         n = len(surface_meshes)
@@ -395,49 +550,53 @@ def run_visualize(args):
         _update_highlight(vis_obj)
         return False
 
-    # BFS-clipped meshes
-    clipped_combined = o3d.geometry.TriangleMesh()
-    for i in range(n_clusters):
-        path = os.path.join(out_dir, f"trimmed_mesh_{i}.npz")
-        if not os.path.exists(path):
-            continue
-        d = np.load(path)
-        if len(d["vertices"]) == 0:
-            continue
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
-        mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
-        mesh.compute_vertex_normals()
-        mesh.paint_uniform_color(get_surface_color(str(surface_names[i])))
-        clipped_combined += mesh
+    # ---- Window layout ---------------------------------------------------
+    W, H, top = 520, 540, 50
+    row1_top, row2_top = top, top + H + 60
 
     vis1 = o3d.visualization.Visualizer()
-    vis1.create_window("Point cloud", width=640, height=720, left=0, top=50)
+    vis1.create_window("Point cloud", width=W, height=H, left=0, top=row1_top)
     vis1.add_geometry(pcd_combined)
     vis1.get_render_option().point_size = 2.0
 
     vis2 = o3d.visualization.VisualizerWithKeyCallback()
-    vis2.create_window("Unclipped mesh",
-                       width=640, height=720, left=640, top=50)
+    vis2.create_window("Mine — unclipped", width=W, height=H, left=W, top=row1_top)
     for mesh in surface_meshes:
         vis2.add_geometry(mesh)
     vis2.register_key_callback(ord("N"), _on_key_next)
     vis2.register_key_callback(ord("P"), _on_key_prev)
     vis2.get_render_option().mesh_show_back_face = True
-    print("[surfaces] Press N/P in 'Unclipped' window to cycle clusters")
+    print("[surfaces] Press N/P in 'Mine — unclipped' window to cycle clusters")
 
     vis3 = o3d.visualization.Visualizer()
-    vis3.create_window(f"Clipped mesh({clip_method})", width=640, height=720, left=1280, top=50)
+    vis3.create_window(f"Mine — clipped ({clip_method})",
+                       width=W, height=H, left=2 * W, top=row1_top)
     vis3.add_geometry(clipped_combined)
     vis3.get_render_option().mesh_show_back_face = True
 
-    # vis4 = o3d.visualization.Visualizer()
-    # vis4.create_window("Screened Poisson", width=480, height=720, left=1440, top=50)
-    # vis4.add_geometry(poisson_mesh)
-    # vis4.get_render_option().mesh_show_back_face = True
-
     vises = [vis1, vis2, vis3]
-    running = [True, True, True]
+
+    if len(orig_unclipped.vertices) > 0:
+        vis4 = o3d.visualization.Visualizer()
+        vis4.create_window("Original Point2CAD — unclipped",
+                           width=W, height=H, left=W, top=row2_top)
+        vis4.add_geometry(orig_unclipped)
+        vis4.get_render_option().mesh_show_back_face = True
+        vises.append(vis4)
+    else:
+        print("[orig p2cad] no unclipped meshes found")
+
+    if len(orig_clipped.vertices) > 0:
+        vis5 = o3d.visualization.Visualizer()
+        vis5.create_window("Original Point2CAD — clipped",
+                           width=W, height=H, left=2 * W, top=row2_top)
+        vis5.add_geometry(orig_clipped)
+        vis5.get_render_option().mesh_show_back_face = True
+        vises.append(vis5)
+    else:
+        print("[orig p2cad] no clipped meshes found")
+
+    running = [True] * len(vises)
     while all(running):
         for k, vis in enumerate(vises):
             if running[k]:
@@ -483,7 +642,7 @@ if __name__ == "__main__":
                         help="[p2cad only] Keep components with area_per_point < best * area_multiplier")
     parser.add_argument("--clip_only", action="store_true",
                         help="Skip surface fitting; load saved untrimmed meshes and re-run clipping only")
-    parser.add_argument("--threshold_multiplier", type=float, default=5,
+    parser.add_argument("--threshold_multiplier", type=float, default=6,
                         help="Controls untrimmed mesh generation - higher values indicate more tolerace for face selection.")
     parser.add_argument("--poisson_depth", type=int, default=9,
                         help="Octree depth for screened Poisson reconstruction (higher = finer detail)")

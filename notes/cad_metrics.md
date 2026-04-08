@@ -1,242 +1,126 @@
-# CAD Reconstruction Evaluation Metrics
+# Pipeline fidelity metrics (point2cad_repr vs original Point2CAD)
 
-Evaluation of a reconstructed STEP file against a ground-truth STEP file.
-Both files can be loaded with OCC, giving access to exact analytical geometry.
+Final evaluation suite for comparing the two mesh-generation pipelines on ABC parts. **Mesh-only**: both pipelines produce per-cluster clipped meshes; all metrics consume those meshes plus the segmented input cloud. No ground-truth STEP, no T_param sampling.
 
----
+## Why mesh-only
 
-## 1. Hausdorff Distance
+ABC parts dataset has no easy mapping back to original ABC IDs, so GT meshes can't be retrieved for resampling. T_param-based analytical sampling was rejected: it adds complexity, requires per-primitive region/extent decisions, and is not truthful to what the methods actually produce. Both pipelines are mesh generators — evaluating the meshes they produce is the principled choice.
 
-### Mathematical definition
-
-Let $S_{rec}$ and $S_{gt}$ denote the reconstructed and ground-truth surfaces as point sets in $\mathbb{R}^3$.
-
-The **one-sided (directed) Hausdorff distance** from $A$ to $B$ is:
-
-$$h(A, B) = \sup_{a \in A} \inf_{b \in B} d(a, b)$$
-
-i.e. the worst-case nearest-neighbour distance when querying from $A$ into $B$.
-
-The **symmetric Hausdorff distance** is:
-
-$$H(A, B) = \max\bigl(h(A, B),\; h(B, A)\bigr)$$
-
-### Geometric interpretation
-
-- $h(S_{rec} \to S_{gt})$: the furthest any reconstructed surface point is from the GT. Penalises spurious or misshapen geometry that strays from the GT.
-- $h(S_{gt} \to S_{rec})$: the furthest any GT point is from the reconstruction. Penalises missing surfaces or large holes.
-- $H$: the maximum of both; a single outlier point can dominate.
-
-### Relation to this problem
-
-Because both models are exact CAD geometry (not sampled point clouds), the
-point-to-set distance $\inf_{b \in B} d(a, b)$ can be computed exactly using OCC's
-`GeomAPI_ProjectPointOnSurf` rather than a kd-tree approximation. This makes the
-metric exact rather than sampling-density-dependent.
-
-Practically:
-1. Sample a dense point set $P_{rec}$ from $S_{rec}$ (e.g. 100k points via STEP sampler).
-2. For each $p \in P_{rec}$, compute the exact distance to $S_{gt}$ using OCC projection.
-3. $h(S_{rec} \to S_{gt}) = \max_{p} d(p, S_{gt})$.
-4. Repeat in the other direction for $h(S_{gt} \to S_{rec})$.
-
-**Sensitivity to outliers:** A single badly-placed reconstructed face makes $H$ large
-even if 99% of the model is perfect. Always report mean/median alongside Hausdorff.
+All metrics computed in **normalized space** (per-part PCA + unit cube), with the **same per-part normalization** applied to both pipelines so the numbers are directly comparable.
 
 ---
 
-## 2. Point-to-Surface Mean / RMS Distance
+## 1. P-coverage (global, ParseNet / Point2CAD style)
 
-Compute the full distribution of distances, not just the maximum:
+$$P_{\text{cov}} = \frac{1}{|P|} \sum_{k=1}^{|P|} \mathbb{I}\!\left[d(p_k,\, S^r) \leq r\right], \qquad r = 0.01$$
 
-$$\overline{d}(S_{rec} \to S_{gt}) = \frac{1}{|P_{rec}|} \sum_{p \in P_{rec}} d(p, S_{gt})$$
+- $P$ = input point cloud (all clusters merged).
+- $S^r$ = **union of all clipped reconstructed meshes** — label-free.
+- $d(p_k, S^r) = \min_{T \in F_{\text{union}}} d(p_k, T)$, exact point-to-triangle.
+- Computed via `igl.point_mesh_squared_distance(input_pts, V_union, F_union)`, take square root, threshold at $r$.
 
-Report both directions and take the symmetric mean as the primary scalar metric.
-This is strictly more informative than Hausdorff alone and more robust to outliers.
+### Why global, not per-cluster
 
-Using OCC projection (not point-to-point) removes the bias introduced by the
-sampling density of the reference cloud.
+ParseNet's formulation is unambiguous: $\mathbb{I}[\min_{k=1..K} D(p_i, s_k) < \varepsilon]$ — explicit minimum over all $K$ fitted surfaces, i.e. distance to the union. Point2CAD follows ParseNet but drops the index in the formula; the prose ("$S$ is all CAD reconstruction surfaces") confirms the global reading. A per-cluster variant was considered and rejected: it would be nearly redundant with per-cluster residual error (same correspondence, just thresholded vs averaged) and would collapse the only label-free signal in the suite.
 
----
+### What it catches
 
-## 3. F-score at Threshold $\tau$
-
-From Tatarchenko et al. (2019), now standard in 3D reconstruction benchmarks:
-
-$$\text{Precision}(\tau) = \frac{|\{p \in P_{rec} : d(p, S_{gt}) \leq \tau\}|}{|P_{rec}|}$$
-
-$$\text{Recall}(\tau) = \frac{|\{p \in P_{gt} : d(p, S_{rec}) \leq \tau\}|}{|P_{gt}|}$$
-
-$$F(\tau) = \frac{2 \cdot \text{Precision} \cdot \text{Recall}}{\text{Precision} + \text{Recall}}$$
-
-$\tau$ should be normalised to object scale, e.g. 1% and 2% of the bounding-box diagonal.
-Plot $F(\tau)$ as a curve over $\tau$ for a full picture.
-
-Interpretation:
-- Low Precision → reconstruction contains geometry not in GT (hallucinated surfaces)
-- Low Recall    → GT contains geometry missing from reconstruction
-- $F$ balances both
+Under-coverage of the input cloud — regions where no reconstructed surface comes within $r$. Robust to label/cluster permutations because labels are not used.
 
 ---
 
-## 4. Normal Consistency
+## 2. Per-cluster residual error
 
-Sample (point, normal) pairs from both surfaces. For each reconstructed point
-projected onto the GT, compare surface normals:
+$$\text{Err}_i = \frac{1}{N_i} \sum_{s_{i,k} \in S_i^{gt}} d(s_{i,k},\, S_i^r), \qquad \overline{\text{Err}} = \frac{1}{K}\sum_{i=1}^{K} \text{Err}_i$$
 
-$$\text{NC} = \frac{1}{|P_{rec}|} \sum_{p \in P_{rec}} \bigl|\hat{n}_{rec}(p) \cdot \hat{n}_{gt}(\text{proj}(p))\bigr|$$
+- $S_i^{gt}$ proxied by **input cloud points labeled $i$** (no GT mesh available).
+- $S_i^r$ = the reconstructed mesh for cluster $i$ only — **not** the union.
+- $N_i$ = number of input points in cluster $i$.
+- Final scalar: per-cluster mean, then averaged uniformly over clusters (not weighted by point count).
 
-Absolute value because normals may be flipped. Range $[0, 1]$; $1$ = perfect alignment.
-Captures whether analytical surface orientations (plane normals, cylinder axes) are
-correct, which Hausdorff alone cannot.
+### Honest disclosure
 
----
+The paper's residual error assumes $\{s_{i,k}\}$ are drawn from a known ground-truth surface. Without GT, we proxy with the segmented input points. This must be stated explicitly when reporting:
 
-## 5. Topology Metrics (B-Rep specific)
+> "Residual error computed with GT samples proxied by segmented input points, since no GT mesh is available for ABC parts."
 
-Geometry metrics say nothing about structural correctness. Report alongside:
+### What it catches
 
-| Metric | Description |
-|--------|-------------|
-| Face count ratio | $\frac{\mid F_{rec}\mid}{\mid F_{gt} \mid} \approx 1$ |
-| Surface type accuracy | Fraction of GT faces whose type (plane/cylinder/…) is matched |
-| Edge count ratio | $\frac{\mid E_{rec} \mid}{\mid E_{gt} \mid}$ |
-| Vertex count ratio | $\frac{\mid V_{rec} \mid}{\mid V_{gt} \mid}$ |
-
-For surface type matching, assign each reconstructed face to the nearest GT face
-(by centroid or Hausdorff) and compare `BRepAdaptor_Surface.GetType()`.
+Per-surface fit quality and label/clipping mismatch. This is the diagnostic metric — it tells you *which* surfaces fit poorly, which the global metrics cannot. Both pipelines preserve cluster IDs from the input file, so the per-cluster correspondence is well-defined and apples-to-apples.
 
 ---
 
-## 6. Volumetric IoU (if watertight)
+## 3. Symmetric Chamfer distance
 
-When both models form closed solids:
+$$\text{CD}_{\text{sym}}(P, M) \;=\; \frac{1}{2}\!\left( \frac{1}{|P|}\sum_{p \in P} d(p, M) \;+\; \frac{1}{N}\sum_{i=1}^{N} \min_{p \in P} \|q_i - p\|_2 \right)$$
 
-$$\text{IoU} = \frac{\text{Vol}(S_{rec} \cap S_{gt})}{\text{Vol}(S_{rec} \cup S_{gt})}$$
+where $M$ = union of clipped meshes, $\{q_i\}_{i=1}^{N}$ are uniform area-weighted samples from $M$.
 
-Can be computed by voxelisation at fixed resolution (marching cubes both models)
-or via OCC Boolean operations (`BRepAlgoAPI_Common`, `BRepAlgoAPI_Fuse`).
-This is the single most interpretable metric: "what fraction of the 3D shape is
-correctly recovered?"
+### Two terms, two computations
 
-OCC Boolean operations can fail on near-degenerate geometry; voxelisation is more
-robust but resolution-dependent.
+**PC → Mesh** (left term): exact, no mesh sampling needed.
+
+$$\frac{1}{|P|}\sum_{p \in P} d(p, M) \quad\text{via}\quad \texttt{igl.point\_mesh\_squared\_distance}$$
+
+This direction is closed-form because point-to-triangle distance has a closed form (see below). `igl` accelerates the per-triangle search with an AABB tree.
+
+**Mesh → PC** (right term): Monte Carlo approximation of the surface integral.
+
+$$\frac{1}{\text{Area}(M)} \int_M \min_{p \in P} \|q - p\|_2 \, dq \;\approx\; \frac{1}{N}\sum_{i=1}^{N} \min_{p \in P} \|q_i - p\|_2$$
+
+This integral has no closed form because $\min_{p \in P}\|q - p\|$ is piecewise-defined (Voronoi cells of $P$). Approximated by sampling $M$ uniformly via `trimesh.sample.sample_surface_even(M, N)` (Poisson-disk variant, lower variance than plain area-weighted) and KD-tree nearest neighbor in $P$.
+
+### Sample count
+
+$N = \max(|P|,\, 100\,000)$, **same $N$ for both pipelines**. Variance of the Monte Carlo estimator is $O(1/N)$; in practice doubling $N$ should not change the reported number meaningfully.
+
+### What it catches
+
+Both failure modes — the PC→Mesh term penalizes under-coverage (regions of input cloud not reached by reconstruction), the Mesh→PC term penalizes over-extension (spurious geometry the clipping didn't remove). Together they're strictly more informative than P-coverage alone (which collapses the PC→Mesh distance into a binary threshold).
 
 ---
 
-## Part-Level Reconstruction and Evaluation
+## Mathematical foundation: point-to-mesh distance
 
-### Why part-level?
+For a triangle mesh $M = (V, F)$ viewed as a 2-manifold subset of $\mathbb{R}^3$:
 
-Some ABC models are Compounds of N independent solid parts.  Processing the
-entire Compound as one point cloud yields too many clusters (e.g. 60 for a
-10-part model), causing numerical instability in surface fitting and BRep
-construction.  The generation script (`abc_preprocess.py --by_part`) splits
-each part into a separate `.xyzc` file; `brep_pipeline.py --model_id` runs
-the reconstruction pipeline on each part independently.
+$$d(p, M) = \inf_{q \in M} \|p - q\|_2 = \min_{T \in F} d(p, T)$$
 
-### Output layout (reconstruction)
+The infimum is achieved (mesh is closed) and reduces to a minimum over triangles. **Point-to-triangle distance** $d(p, T)$ is computed in closed form:
 
-```
-output_brep/
-  {model_id}/
-    part_000/         ← per-part npz files + {model_id}_part_000_bop.step
-    part_001/
-    ...
-    unified/          ← merged npz files with cluster ID offsets (for visualizer)
-    unified_bop.step  ← all part STEPs merged into one Compound
-```
+1. Project $p$ onto the triangle's plane $\to p'$.
+2. Compute barycentric coordinates of $p'$ w.r.t. $T$.
+3. If all barycentrics $\in [0,1]$, the projection lies inside the triangle and $d(p,T) = \|p - p'\|$.
+4. Otherwise the closest point is on an edge or vertex; clamp the barycentrics and recompute.
 
-The `unified/` directory uses globally offset cluster IDs so the visualizer
-(`brep_pipeline.py --visualize --model_id`) works without any changes.
+`igl.point_mesh_squared_distance` does this with an AABB tree so the per-query cost is logarithmic in $|F|$ rather than linear. **Exact, no discretization error** — the only place sampling enters the metric suite is the Mesh→PC chamfer direction, and that's a Monte Carlo integral over the surface, not a discretization of the distance function.
 
-### Evaluation: part-agnostic via unified STEP
+---
 
-Because the unified STEP (`unified_bop.step`) is a single Compound shape
-containing all reconstructed parts, evaluation is identical to the single-model
-case:
+## Why these three (and not others)
 
-1. Sample N points from `unified_bop.step` (pool all faces, area-weighted)
-2. Sample N points from the ground-truth STEP file (same logic)
-3. Compute Chamfer / Hausdorff / F-score between the two point sets
+| Metric | Label-aware? | Continuous? | Direction | Catches |
+|---|---|---|---|---|
+| P-coverage | No (union) | No (binary) | PC → mesh | Under-coverage of input cloud |
+| Per-cluster residual | Yes | Yes | PC → cluster mesh | Per-surface fit quality, mis-clipping |
+| Symmetric chamfer | No (union) | Yes | Both | Under- and over-extension of reconstruction |
 
-No part-correspondence matching is needed.  Parts that failed BRep construction
-produce no faces in the unified STEP, which naturally increases Chamfer distance
-to the GT points in those regions — an appropriate penalty.
+Each catches a failure the others miss. Two of the three (P-coverage, residual error) are paper-comparable in *definition*; absolute numbers won't match prior work because of normalization and sampling-density differences, but the relative ordering between the two pipelines is what matters for this comparison.
 
-The GT STEP does not need to be split; it is sampled as-is.
+Discarded alternatives:
 
-## Recommended Evaluation Pipeline
+- **Per-cluster P-coverage** — nearly redundant with per-cluster residual error (same correspondence, thresholded vs averaged) and collapses the only label-free signal in the suite.
+- **T_param analytical sampling** — adds complexity, requires per-primitive region decisions, and isn't truthful to what mesh-generation methods produce.
+- **GT-mesh Chamfer** — impossible without ABC ID mapping.
+- **Volumetric IoU, Hausdorff, normal consistency, F-score @ τ** — listed in older drafts of this note but not adopted; the three above already span the relevant failure modes for this comparison.
 
-For comparison with prior work (ComplexGen, HNC-CAD, ABC baselines):
+---
 
-| Priority | Metric | Tool |
-|----------|--------|------|
-| Primary  | Symmetric point-to-surface mean distance | OCC `GeomAPI_ProjectPointOnSurf` |
-| Primary  | F-score @ 1% and 2% diagonal | numpy after OCC projection |
-| Secondary | Hausdorff distance (both directions) | OCC projection |
-| Secondary | Normal consistency | OCC surface normals |
-| Structural | Face / edge / vertex count ratios | OCC `TopExp_Explorer` |
-| Optional  | Volumetric IoU | OCC Boolean or voxelisation |
+## Reporting checklist
 
-### Implementation sketch
-
-```python
-from OCC.Core.STEPControl import STEPControl_Reader
-from OCC.Core.TopExp      import TopExp_Explorer
-from OCC.Core.TopAbs      import TopAbs_FACE
-from OCC.Core             import topods
-from OCC.Core.BRep        import BRep_Tool
-from OCC.Core.GeomAPI     import GeomAPI_ProjectPointOnSurf
-from OCC.Core.gp          import gp_Pnt
-
-def load_step_faces(path):
-    reader = STEPControl_Reader()
-    reader.ReadFile(path); reader.TransferRoots()
-    shape = reader.OneShape()
-    exp   = TopExp_Explorer(shape, TopAbs_FACE)
-    faces = []
-    while exp.More():
-        faces.append(topods.Face(exp.Current()))
-        exp.Next()
-    return faces
-
-def point_to_shape_distances(points, gt_faces):
-    """Exact point-to-surface distances using OCC projection."""
-    dists = np.zeros(len(points))
-    for k, pt in enumerate(points):
-        p    = gp_Pnt(*pt.tolist())
-        best = np.inf
-        for face in gt_faces:
-            surf = BRep_Tool.Surface(face)
-            proj = GeomAPI_ProjectPointOnSurf(p, surf)
-            if proj.NbPoints() > 0:
-                best = min(best, proj.LowerDistance())
-        dists[k] = best
-    return dists
-
-rec_faces = load_step_faces("reconstructed.step")
-gt_faces  = load_step_faces("ground_truth.step")
-
-P_rec = sample_points_from_step("reconstructed.step", n=100_000, ...)
-P_gt  = sample_points_from_step("ground_truth.step",  n=100_000, ...)
-
-d_rec_to_gt = point_to_shape_distances(P_rec, gt_faces)
-d_gt_to_rec = point_to_shape_distances(P_gt,  rec_faces)
-
-hausdorff = max(d_rec_to_gt.max(), d_gt_to_rec.max())
-mean_dist = 0.5 * (d_rec_to_gt.mean() + d_gt_to_rec.mean())
-
-diag = np.linalg.norm(bbox_max - bbox_min)
-for tau_pct in [0.01, 0.02]:
-    tau       = tau_pct * diag
-    precision = (d_rec_to_gt <= tau).mean()
-    recall    = (d_gt_to_rec <= tau).mean()
-    fscore    = 2 * precision * recall / (precision + recall + 1e-12)
-    print(f"F@{tau_pct*100:.0f}%: P={precision:.3f} R={recall:.3f} F={fscore:.3f}")
-```
-
-**Performance note:** Projecting 100k points onto all GT faces naively is $O(N \times |F_{gt}|)$
-OCC calls. For models with many faces, accelerate by first finding candidate faces via
-a bounding-box tree (BVH or scipy kd-tree on face centroids), then projecting only
-onto the nearest few faces.
+- All 3 metrics computed in normalized space (unit cube), same per-part normalization on both pipelines.
+- State $r = 0.01$ for P-coverage.
+- State $N$ (mesh sample count) for chamfer.
+- For residual error, disclose GT-proxy = segmented input points.
+- Report per-part numbers and dataset averages.
+- Symmetric chamfer reported as the average of the two directions (state explicitly that it's the average, not the sum).
