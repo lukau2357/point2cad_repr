@@ -11,7 +11,7 @@ def inspect(path):
     print(f"\n{'='*60}")
     print(f"{path}")
     print(f"{'='*60}")
-    with h5py.File(path, "r") as f:
+    with h5py.File(path, "r") as f:    
         for k in sorted(f.keys()):
             ds = f[k]
             print(f"  {k:<15} shape={str(ds.shape):<15} dtype={ds.dtype}")
@@ -33,7 +33,8 @@ if __name__ == "__main__":
         paths = sys.argv[1:]
     else:
         default_dir = "../../abc_parts/ABC_final"
-        paths = sorted(glob.glob(os.path.join(default_dir, "*.h5")))[:3]
+        paths = sorted(glob.glob(os.path.join(default_dir, "*.h5")))[:10]
+
         if not paths:
             print(f"No .h5 files found in {default_dir}")
             print("Usage: python scripts/inspect_h5.py file1.h5 [file2.h5 ...]")

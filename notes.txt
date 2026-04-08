@@ -184,6 +184,9 @@ Mesh generation (mesh_pipeline.py, BFS vs Point2CAD style with libicgal as mesh 
 - For best description of BRep, look at the SolidGen paper.
 - To fix in brep pipeline: correct outer wire selection, tangent geometries, ILP to always get valid BRep.
 
+- Just abandon STEP generation completely... Focus on mesh, as far as STEP can go we can always produce oversized + 
+uv_alpha... Improve mesh for freeforms...
+
 --------------- ABC PARTS ------------------------------
 - 00470 - tangent intersection curves
 - 00417 - tangent surfaces
