@@ -279,16 +279,16 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
         # Optional post-filter: drop faces whose barycenter is farther than
         # post_filter_threshold * spacings[s] from the nearest cluster point.
         # Mirrors clip_meshes_bfs (mesh_clipping.py:357-361).
-        if post_filter_threshold is not None and len(kept_faces) > 0:
-            thr = post_filter_threshold * spacings[s]
-            barycenters = kept_vertices[kept_faces].mean(axis=1)
-            bar_dists, _ = cluster_trees[s].query(barycenters)
-            mask = bar_dists <= thr
-            n_before = len(kept_faces)
-            kept_faces = kept_faces[mask]
-            print(f"[p2cad-clip] surface {s} ({surface_types[s]}): "
-                  f"post-filter kept {len(kept_faces)}/{n_before} faces "
-                  f"(thr={thr:.5f})")
+        # if post_filter_threshold is not None and len(kept_faces) > 0:
+        #     thr = post_filter_threshold * spacings[s]
+        #     barycenters = kept_vertices[kept_faces].mean(axis=1)
+        #     bar_dists, _ = cluster_trees[s].query(barycenters)
+        #     mask = bar_dists <= thr
+        #     n_before = len(kept_faces)
+        #     kept_faces = kept_faces[mask]
+        #     print(f"[p2cad-clip] surface {s} ({surface_types[s]}): "
+        #           f"post-filter kept {len(kept_faces)}/{n_before} faces "
+        #           f"(thr={thr:.5f})")
 
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices  = o3d.utility.Vector3dVector(kept_vertices)

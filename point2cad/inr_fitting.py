@@ -28,7 +28,7 @@ def uv_to_decoder(output, is_closed):
         # but zero padding during training!!!
         # Function definition: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L758
         # Training loop chunk: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L592
-        res = torch.cat([output, torch.zeros_like(output)], dim = -1)
+        res = torch.cat([output, output], dim = -1)
     
     return res
 
@@ -243,7 +243,7 @@ class INRNetwork(torch.nn.Module):
         device = next(self.parameters()).device
         points = self.sample_points(mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = uv_margin)
         mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device, threshold_multiplier = threshold_multiplier)
-        mask = None
+        # mask = None
         meshes = triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr", mask = mask)
         # Contains Open3D mesh and Trimesh mesh for INR in particular
         return meshes

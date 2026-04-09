@@ -259,6 +259,9 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
                 cluster,
                 {"hidden_dim": 64, "use_shortcut": True, "fraction_siren": 0.5},
                 np_rng, DEVICE,
+                freeform_method=args.freeform_method,
+                spacing=spacings[idx],
+                cluster_tree=cluster_trees[idx],
                 inr_fit_kwargs={
                     "max_steps": 1500,
                     "noise_magnitude_3d": 0.05,
@@ -268,12 +271,12 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
                 plane_mesh_kwargs={"mesh_dim": 200, "threshold_multiplier": tm,
                                    "plane_sampling_deviation": 0.5, "spacing": spacings[idx]},
                 sphere_mesh_kwargs={"dim_theta": 200, "dim_lambda": 200,
-                                    "threshold_multiplier": 3, "spacing": spacings[idx]},
+                                    "threshold_multiplier": tm, "spacing": spacings[idx]},
                 cylinder_mesh_kwargs={"dim_theta": 200, "dim_height": 100,
-                                      "threshold_multiplier": 3, "cylinder_height_margin": 0.5, "spacing": spacings[idx]},
+                                      "threshold_multiplier": tm, "cylinder_height_margin": 0.5, "spacing": spacings[idx]},
                 cone_mesh_kwargs={"dim_theta": 200, "dim_height": 200,
-                                  "threshold_multiplier": 3, "cone_height_margin": 0.5, "spacing": spacings[idx]},
-                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": 3, "spacing": spacings[idx]},
+                                  "threshold_multiplier": tm, "cone_height_margin": 0.5, "spacing": spacings[idx]},
+                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0, "threshold_multiplier": tm, "spacing": spacings[idx]},
                 radius_inflation=0.001
             )
 
@@ -500,6 +503,11 @@ def run_visualize(args):
         print(f"  {pd}")
         print("  " + _row("mine", mt))
         print("  " + _row("orig p2cad", ot))
+        if mt and ot:
+            mt_sum = mt.get("total_time") or 0.0
+            ot_sum = ot.get("total_time") or 0.0
+            if mt_sum > 0 and ot_sum > 0:
+                print(f"  {'speedup':>16}: {ot_sum / mt_sum:.2f}x (orig/mine)")
         if mt:
             mine_tot["fit"]  += mt.get("fit_time", 0.0) or 0.0
             mine_tot["clip"] += mt.get("clip_time", 0.0) or 0.0
@@ -633,6 +641,10 @@ if __name__ == "__main__":
     parser.add_argument("--spacing_percentile", type=float, default=100.0,
                         help="Percentile of intra-cluster NN distances used as spacing "
                              "for the post-BFS filter (default 100 = max NN distance)")
+    parser.add_argument("--freeform_method", type=str, default="inr",
+                        choices=["inr", "bpa", "bpa_bspline"],
+                        help="How to handle freeform clusters: 'inr' (neural autoencoder), "
+                             "'bpa' (Ball Pivoting Algorithm), or 'bpa_bspline' (BPA → LSCM → B-spline)")
     parser.add_argument("--seed", type=int, default=41,
                         help="Reproducibility seed")
     parser.add_argument("--clip_method", type=str, default="p2cad",

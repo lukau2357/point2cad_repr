@@ -184,9 +184,17 @@ Mesh generation (mesh_pipeline.py, BFS vs Point2CAD style with libicgal as mesh 
 - For best description of BRep, look at the SolidGen paper.
 - To fix in brep pipeline: correct outer wire selection, tangent geometries, ILP to always get valid BRep.
 
-- Just abandon STEP generation completely... Focus on mesh, as far as STEP can go we can always produce oversized + 
+- Just abandon STEP generation completely... Focus on mesh, as far as STEP can go we can always produce oversized +
 uv_alpha... Improve mesh for freeforms...
+
+- Mesh grid resolution is another contribution: our pipeline runs at 200x200 (sphere/cone),
+  200x100 (cylinder), 200 (plane/INR). Original Point2CAD ships at 120 (plane), 100x100 (sphere),
+  60x100 (cylinder), 50x100 (cone), 100 (INR) — and CAN'T trivially be bumped because their
+  bit_mapping_points_torch step allocates O(grid * |P|) memory. If they had pushed grid resolution
+  in their own ablations they might have noticed the same quality gap, but their tessellation is
+  reshape-based and structurally caps grid density. Worth mentioning explicitly in the paper.
 
 --------------- ABC PARTS ------------------------------
 - 00470 - tangent intersection curves
 - 00417 - tangent surfaces
+- 00475 - Showcase meshes, mine vs Point2CAD
