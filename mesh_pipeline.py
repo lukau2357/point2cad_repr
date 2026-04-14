@@ -107,7 +107,6 @@ def run_compute(args):
     from point2cad.surface_fitter import SURFACE_NAMES, fit_surface
 
     DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-    tm = args.threshold_multiplier
 
     def normalize_points(pts):
         mean = pts.mean(axis=0)
@@ -142,7 +141,7 @@ def run_compute(args):
     for part_idx in part_indices:
         t_part = time.perf_counter()
         _run_compute_part(args, xyzc_files[part_idx], part_idx, normalize_points,
-                          DEVICE, tm)
+                          DEVICE)
         dt_part = time.perf_counter() - t_part
         part_times.append((part_idx, dt_part))
         print(f"[timing] part {part_idx}: {dt_part:.2f}s")
@@ -164,12 +163,14 @@ def run_compute(args):
     print(f"[timing]   total ({len(part_times)} parts): {dt_total:.2f}s")
 
 
-def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm):
+def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
     from point2cad.color_config import get_surface_color
     from point2cad.mesh_clipping import clip_meshes_bfs, clip_meshes_p2cad, build_cluster_trees
     from point2cad.surface_fitter import SURFACE_NAMES, fit_surface
 
     np_rng = np.random.default_rng(args.seed)
+    tm = args.threshold_multiplier
+    abs_th = 0.1 if args.trimming_mode == "absolute" else None
 
     out_dir = os.path.join(args.output_dir, args.model_id, f"part_{part_idx}")
 
@@ -269,13 +270,17 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE, tm)
                     "initial_lr": 1e-1,
                 },
                 plane_mesh_kwargs={"mesh_dim": 200, "threshold_multiplier": tm,
-                                   "plane_sampling_deviation": 0.5, "spacing": spacings[idx]},
+                                   "plane_sampling_deviation": 2, "spacing": spacings[idx],
+                                   "absolute_threshold": abs_th},
                 sphere_mesh_kwargs={"dim_theta": 200, "dim_lambda": 200,
-                                    "threshold_multiplier": tm, "spacing": spacings[idx]},
+                                    "threshold_multiplier": tm, "spacing": spacings[idx],
+                                    "absolute_threshold": abs_th},
                 cylinder_mesh_kwargs={"dim_theta": 200, "dim_height": 100,
-                                      "threshold_multiplier": tm, "cylinder_height_margin": 0.5, "spacing": spacings[idx]},
+                                      "threshold_multiplier": tm, "cylinder_height_margin": 0.5, "spacing": spacings[idx],
+                                      "absolute_threshold": abs_th},
                 cone_mesh_kwargs={"dim_theta": 200, "dim_height": 200,
-                                  "threshold_multiplier": tm, "cone_height_margin": 0.5, "spacing": spacings[idx]},
+                                  "threshold_multiplier": tm, "cone_height_margin": 0.5, "spacing": spacings[idx],
+                                  "absolute_threshold": abs_th},
                 inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0, "threshold_multiplier": tm, "spacing": spacings[idx]},
                 radius_inflation=0.001
             )
@@ -654,8 +659,12 @@ if __name__ == "__main__":
                         help="[p2cad only] Keep components with area_per_point < best * area_multiplier")
     parser.add_argument("--clip_only", action="store_true",
                         help="Skip surface fitting; load saved untrimmed meshes and re-run clipping only")
+    parser.add_argument("--trimming_mode", type=str, default="adaptive",
+                        choices=["adaptive", "absolute"],
+                        help="UV grid trimming mode: 'adaptive' uses threshold_multiplier * spacing, "
+                             "'absolute' uses fixed threshold of 0.1 (Point2CAD-style)")
     parser.add_argument("--threshold_multiplier", type=float, default=6,
-                        help="Controls untrimmed mesh generation - higher values indicate more tolerace for face selection.")
+                        help="[adaptive only] Controls untrimmed mesh generation - higher values indicate more tolerance for face selection.")
     parser.add_argument("--poisson_depth", type=int, default=9,
                         help="Octree depth for screened Poisson reconstruction (higher = finer detail)")
     parser.add_argument("--poisson_density_quantile", type=float, default=0.02,

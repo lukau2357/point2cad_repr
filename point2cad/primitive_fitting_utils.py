@@ -36,13 +36,12 @@ def rotation_matrix_a_to_b(A, B):
 
 def grid_trimming(cluster, vertices, size_u, size_v, device,
                    threshold_multiplier=3.0, spacing_percentile=90,
-                   spacing=None):
+                   spacing=None, absolute_threshold=None):
     """Keep mesh cells whose mean lies within threshold of the cluster.
 
-    threshold = threshold_multiplier * spacing
-
-    If ``spacing`` is provided (pre-computed per-cluster max NN distance),
-    the O(n²) intra-cluster distance computation is skipped.
+    If ``absolute_threshold`` is provided, it is used directly as the distance
+    cutoff (Point2CAD uses 0.1 for all surface types).  Otherwise the adaptive
+    formula ``threshold = threshold_multiplier * spacing`` is used.
     """
     grid = vertices.reshape(size_u, size_v, -1)
     grid = grid[:, :, np.newaxis, :]
@@ -54,12 +53,15 @@ def grid_trimming(cluster, vertices, size_u, size_v, device,
     cell_means = cell_means.permute(2, 3, 1, 0).squeeze(-2)
     cluster = torch.tensor(cluster, dtype = torch.float32, device = device)
 
-    if spacing is None:
-        cluster_dists = torch.cdist(cluster, cluster)
-        cluster_dists.fill_diagonal_(float("inf"))
-        nn_dists = cluster_dists.min(dim = -1).values
-        spacing = torch.quantile(nn_dists, spacing_percentile / 100.0).item()
-    threshold = threshold_multiplier * spacing
+    if absolute_threshold is not None:
+        threshold = absolute_threshold
+    else:
+        if spacing is None:
+            cluster_dists = torch.cdist(cluster, cluster)
+            cluster_dists.fill_diagonal_(float("inf"))
+            nn_dists = cluster_dists.min(dim = -1).values
+            spacing = torch.quantile(nn_dists, spacing_percentile / 100.0).item()
+        threshold = threshold_multiplier * spacing
 
     cell_means = cell_means.reshape((-1, 3))
     D = torch.cdist(cell_means, cluster)
@@ -185,12 +187,14 @@ def generate_plane_mesh(mesh_dim, a, d, cluster, np_rng, device,
                         plane_sampling_deviation = 0.1,
                         threshold_multiplier = 3.0,
                         spacing_percentile = 90,
-                        spacing = None):
+                        spacing = None,
+                        absolute_threshold = None):
     vertices = sample_plane(mesh_dim, a, d, cluster, np_rng, sampling_deviation = plane_sampling_deviation)
     mask = grid_trimming(cluster, vertices, mesh_dim, mesh_dim, device,
                          threshold_multiplier = threshold_multiplier,
                          spacing_percentile = spacing_percentile,
-                         spacing = spacing)
+                         spacing = spacing,
+                         absolute_threshold = absolute_threshold)
     return triangulate_and_mesh(vertices, mesh_dim, mesh_dim, "plane", mask = mask)
 
 def sample_sphere(dim_theta, dim_lambda, radius, center):
@@ -215,12 +219,14 @@ def sample_sphere(dim_theta, dim_lambda, radius, center):
 def generate_sphere_mesh(dim_theta, dim_lambda, radius, center, cluster, device,
                          threshold_multiplier = 3.0,
                          spacing_percentile = 90,
-                         spacing = None):
+                         spacing = None,
+                         absolute_threshold = None):
     vertices = sample_sphere(dim_theta, dim_lambda, radius, center)
     mask = grid_trimming(cluster, vertices, dim_theta, dim_lambda, device,
                          threshold_multiplier = threshold_multiplier,
                          spacing_percentile = spacing_percentile,
-                         spacing = spacing)
+                         spacing = spacing,
+                         absolute_threshold = absolute_threshold)
     return triangulate_and_mesh(vertices, dim_theta, dim_lambda, "sphere", mask = mask)
 
 def sample_cylinder(dim_theta, dim_height, radius, center, axis, points, height_margin = 0):
@@ -262,13 +268,15 @@ def generate_cylinder_mesh(dim_theta, dim_height, radius, center, axis, cluster,
                            threshold_multiplier = 3.0,
                            cylinder_height_margin = 0.1,
                            spacing_percentile = 90,
-                           spacing = None):
+                           spacing = None,
+                           absolute_threshold = None):
     vertices = sample_cylinder(dim_theta, dim_height, radius, center, axis, cluster,
                                height_margin = cylinder_height_margin)
     mask = grid_trimming(cluster, vertices, dim_theta, 2 * dim_height, device,
                          threshold_multiplier = threshold_multiplier,
                          spacing_percentile = spacing_percentile,
-                         spacing = spacing)
+                         spacing = spacing,
+                         absolute_threshold = absolute_threshold)
     return triangulate_and_mesh(vertices, dim_theta, 2 * dim_height, "cylinder", mask = mask)
 
 def sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, height_margin = 0, single_sided = True):
@@ -329,12 +337,14 @@ def generate_cone_mesh(dim_theta, dim_height, vertex, axis, theta, cluster_point
                        cone_height_margin = 0.1,
                        cone_single_sided = True,
                        spacing_percentile = 90,
-                       spacing = None):
+                       spacing = None,
+                       absolute_threshold = None):
     vertices = sample_cone(dim_theta, dim_height, vertex, axis, theta, cluster_points, height_margin = cone_height_margin, single_sided = cone_single_sided)
     mask = grid_trimming(cluster_points, vertices, dim_theta, dim_height, device,
                          threshold_multiplier = threshold_multiplier,
                          spacing_percentile = spacing_percentile,
-                         spacing = spacing)
+                         spacing = spacing,
+                         absolute_threshold = absolute_threshold)
     return triangulate_and_mesh(vertices, dim_theta, dim_height, "cone", mask = mask)
 
 if __name__ == "__main__":
