@@ -239,13 +239,25 @@ class INRNetwork(torch.nn.Module):
         
         return X
 
-    def sample_mesh(self, mesh_dim, uv_bb_min, uv_bb_max, cluster, cluster_mean, cluster_scale, uv_margin = 0.1, threshold_multiplier = 3, spacing = None):
+    def sample_mesh(self, mesh_dim, uv_bb_min, uv_bb_max, cluster, cluster_mean, cluster_scale,
+                    uv_margin = 0.1, threshold_multiplier = 3, spacing = None,
+                    uv_points = None, alpha = 10.0):
         device = next(self.parameters()).device
         points = self.sample_points(mesh_dim, uv_bb_min, uv_bb_max, cluster_mean, cluster_scale, uv_margin = uv_margin)
-        # mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device, threshold_multiplier = threshold_multiplier)
-        mask = None
+
+        # Alpha shape trimming only for fully open surfaces — closed coordinates
+        # have a seam at ±1 that creates artificial gaps in the alpha shape
+        if uv_points is not None and not self.is_u_closed and not self.is_v_closed:
+            from .primitive_fitting_utils import alpha_shape_trimming
+            uv_length = uv_bb_max - uv_bb_min
+            uv_min_ext = uv_bb_min - uv_length * uv_margin
+            uv_max_ext = uv_bb_max + uv_length * uv_margin
+            mask = alpha_shape_trimming(uv_points, mesh_dim, mesh_dim, uv_min_ext, uv_max_ext, alpha=alpha)
+        else:
+            mask = None
+
+        mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device, threshold_multiplier = threshold_multiplier, spacing = spacing)
         meshes = triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr", mask = mask)
-        # Contains Open3D mesh and Trimesh mesh for INR in particular
         return meshes
     
 class LinearWarmupCosineAnnealingLR(_LRScheduler):
@@ -420,5 +432,6 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
 
     best_model["params"]["uv_bb_min"] = uv_bb_min
     best_model["params"]["uv_bb_max"] = uv_bb_max
+    best_model["params"]["uv_points"] = uvs
 
     return best_model

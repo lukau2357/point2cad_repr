@@ -281,7 +281,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
                 cone_mesh_kwargs={"dim_theta": 200, "dim_height": 200,
                                   "threshold_multiplier": tm, "cone_height_margin": 0.5, "spacing": spacings[idx],
                                   "absolute_threshold": abs_th},
-                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0, "threshold_multiplier": tm, "spacing": spacings[idx]},
+                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": tm, "spacing": spacings[idx]},
                 radius_inflation=0.001
             )
 
@@ -358,38 +358,73 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
 
 def run_visualize(args):
     """
-    Five windows, all in normalized (per-part) space:
+    Five windows, all in denormalized world-space:
         1. Input point cloud
         2. Mine — unclipped surface meshes (with N/P cycling)
         3. Mine — clipped meshes
         4. Original Point2CAD — unclipped meshes
         5. Original Point2CAD — clipped meshes
 
-    Multi-part agnostic: iterates `part_*/` dirs on both sides and concatenates
-    everything in memory. No reliance on `unified/` (which is world-space and
-    has no original-Point2CAD counterpart, so apples-to-apples comparison
-    requires staying in normalized space).
+    Loads our data from unified/ (already denormalized by _merge_part_dirs).
+    Original Point2CAD PLYs are denormalized using normalization.npz saved
+    alongside each part.
     """
     from point2cad.color_config import get_surface_color
 
     model_root = os.path.join(args.output_dir, args.model_id)
-    if not os.path.isdir(model_root):
-        print(f"No saved results found in {model_root}/ — run compute first.")
+    unified_dir = os.path.join(model_root, "unified")
+    if not os.path.isdir(unified_dir):
+        print(f"No unified/ directory in {model_root}/ — run compute first.")
         return
 
-    part_dirs = sorted(
-        d for d in os.listdir(model_root)
-        if d.startswith("part_") and os.path.isdir(os.path.join(model_root, d))
-    )
-    if not part_dirs:
-        print(f"No part_* subdirs in {model_root}/ — run compute first.")
+    meta_path = os.path.join(unified_dir, "metadata.npz")
+    if not os.path.exists(meta_path):
+        print(f"No metadata.npz in {unified_dir}/ — run compute first.")
         return
+
+    meta = np.load(meta_path, allow_pickle=True)
+    n_clusters     = int(meta["n_clusters"])
+    cluster_colors = meta["cluster_colors"]
+    surface_names  = meta["surface_names"]
+    clip_method    = str(meta["clip_method"]) if "clip_method" in meta else "unknown"
 
     pcd_combined     = o3d.geometry.PointCloud()
-    surface_meshes   = []   # flat list across all parts (for N/P cycling)
-    surface_labels   = []   # parallel list of "part{P}/cluster{i} ({stype})"
+    surface_meshes   = []   # flat list across all clusters (for N/P cycling)
+    surface_labels   = []   # parallel list of "cluster{i} ({stype})"
     clipped_combined = o3d.geometry.TriangleMesh()
-    clip_method      = "unknown"
+
+    for i in range(n_clusters):
+        stype = str(surface_names[i])
+        scolor = get_surface_color(stype)
+
+        pts_path = os.path.join(unified_dir, f"cluster_{i}.npy")
+        if os.path.exists(pts_path):
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(np.load(pts_path))
+            pcd.paint_uniform_color(cluster_colors[i].tolist())
+            pcd_combined += pcd
+
+        sm_path = os.path.join(unified_dir, f"surface_mesh_{i}.npz")
+        if os.path.exists(sm_path):
+            d = np.load(sm_path)
+            mesh = o3d.geometry.TriangleMesh()
+            mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
+            mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
+            mesh.compute_vertex_normals()
+            mesh.paint_uniform_color(scolor)
+            surface_meshes.append(mesh)
+            surface_labels.append(f"cluster_{i} ({stype})")
+
+        tm_path = os.path.join(unified_dir, f"trimmed_mesh_{i}.npz")
+        if os.path.exists(tm_path):
+            d = np.load(tm_path)
+            if len(d["vertices"]) > 0:
+                mesh = o3d.geometry.TriangleMesh()
+                mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
+                mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
+                mesh.compute_vertex_normals()
+                mesh.paint_uniform_color(scolor)
+                clipped_combined += mesh
 
     # ---- Per-part timings (mine + original Point2CAD if present) ---------
     import json as _json
@@ -402,60 +437,23 @@ def run_visualize(args):
                 return None
         return None
 
+    part_dirs = sorted(
+        d for d in os.listdir(model_root)
+        if d.startswith("part_") and os.path.isdir(os.path.join(model_root, d))
+    )
     mine_timings, orig_timings = [], []
     orig_root = os.path.join("..", "point2cad", "output_p2cad_orig", args.model_id)
 
     for pd in part_dirs:
         part_dir = os.path.join(model_root, pd)
-        meta_path = os.path.join(part_dir, "metadata.npz")
-        if not os.path.exists(meta_path):
-            continue
         mine_timings.append((pd, _load_timing(os.path.join(part_dir, "timing.json"))))
         orig_timings.append((pd, _load_timing(os.path.join(orig_root, pd, "timing.json"))))
-        meta = np.load(meta_path, allow_pickle=True)
-        n_clusters     = int(meta["n_clusters"])
-        cluster_colors = meta["cluster_colors"]
-        surface_names  = meta["surface_names"]
-        if "clip_method" in meta:
-            clip_method = str(meta["clip_method"])
-
-        for i in range(n_clusters):
-            stype = str(surface_names[i])
-            scolor = get_surface_color(stype)
-
-            pts_path = os.path.join(part_dir, f"cluster_{i}.npy")
-            if os.path.exists(pts_path):
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(np.load(pts_path))
-                pcd.paint_uniform_color(cluster_colors[i].tolist())
-                pcd_combined += pcd
-
-            sm_path = os.path.join(part_dir, f"surface_mesh_{i}.npz")
-            if os.path.exists(sm_path):
-                d = np.load(sm_path)
-                mesh = o3d.geometry.TriangleMesh()
-                mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
-                mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
-                mesh.compute_vertex_normals()
-                mesh.paint_uniform_color(scolor)
-                surface_meshes.append(mesh)
-                surface_labels.append(f"{pd}/cluster_{i} ({stype})")
-
-            tm_path = os.path.join(part_dir, f"trimmed_mesh_{i}.npz")
-            if os.path.exists(tm_path):
-                d = np.load(tm_path)
-                if len(d["vertices"]) > 0:
-                    mesh = o3d.geometry.TriangleMesh()
-                    mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
-                    mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
-                    mesh.compute_vertex_normals()
-                    mesh.paint_uniform_color(scolor)
-                    clipped_combined += mesh
 
     # ---- Original Point2CAD outputs (per-cluster plys + types.json) ------
     def _load_orig(kind):
         """kind ∈ {'unclipped', 'clipped'}. Iterates part_*/<kind>/cluster_*.ply,
-        reads types.json sidecar, applies our color scheme per cluster."""
+        reads types.json sidecar, applies our color scheme per cluster.
+        Denormalizes using normalization.npz saved alongside each part."""
         import json as _json
         import glob as _g
         root = os.path.join("..", "point2cad", "output_p2cad_orig", args.model_id)
@@ -465,10 +463,20 @@ def run_visualize(args):
         for pd in sorted(d for d in os.listdir(root)
                          if d.startswith("part_")
                          and os.path.isdir(os.path.join(root, d))):
-            kind_dir = os.path.join(root, pd, kind)
+            part_dir = os.path.join(root, pd)
+            kind_dir = os.path.join(part_dir, kind)
             types_path = os.path.join(kind_dir, "types.json")
             if not os.path.isfile(types_path):
                 continue
+
+            # Load normalization params for this part
+            norm_path = os.path.join(part_dir, "normalization.npz")
+            if os.path.isfile(norm_path):
+                norm = np.load(norm_path)
+                denorm = lambda pts: _denorm_points(pts, norm["mean"], norm["R"], float(norm["scale"]))
+            else:
+                denorm = lambda pts: pts
+
             with open(types_path) as f:
                 types = _json.load(f)
             cluster_plys = sorted(
@@ -482,6 +490,7 @@ def run_visualize(args):
                 m = o3d.io.read_triangle_mesh(ply)
                 if len(m.vertices) == 0:
                     continue
+                m.vertices = o3d.utility.Vector3dVector(denorm(np.asarray(m.vertices)))
                 m.compute_vertex_normals()
                 m.paint_uniform_color(get_surface_color(types[cid]))
                 combined += m
@@ -647,9 +656,9 @@ if __name__ == "__main__":
                         help="Percentile of intra-cluster NN distances used as spacing "
                              "for the post-BFS filter (default 100 = max NN distance)")
     parser.add_argument("--freeform_method", type=str, default="inr",
-                        choices=["inr", "bpa", "bpa_bspline"],
+                        choices=["inr", "bpa", "spectral"],
                         help="How to handle freeform clusters: 'inr' (neural autoencoder), "
-                             "'bpa' (Ball Pivoting Algorithm), or 'bpa_bspline' (BPA → LSCM → B-spline)")
+                             "'bpa' (Ball Pivoting Algorithm), or 'spectral' (spectral embedding → bisplrep B-spline)")
     parser.add_argument("--seed", type=int, default=41,
                         help="Reproducibility seed")
     parser.add_argument("--clip_method", type=str, default="p2cad",

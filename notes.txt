@@ -198,3 +198,6 @@ uv_alpha... Improve mesh for freeforms...
 - 00470 - tangent intersection curves
 - 00417 - tangent surfaces
 - 00475 - Showcase meshes, mine vs Point2CAD
+
+Automatic Reconstruction of Topology Optimization to Editable CAD Models - What about this paper?
+BrepGaussian - What about this paper?

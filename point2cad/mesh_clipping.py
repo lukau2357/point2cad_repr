@@ -1,7 +1,5 @@
 import numpy as np
 import open3d as o3d
-import igl
-import igl.copyleft.cgal
 import trimesh
 from collections import Counter, deque
 from scipy.spatial import cKDTree
@@ -137,6 +135,65 @@ def build_cluster_trees(clusters, spacing_percentile=100.0, upsample_passes=3):
     return trees, spacings
 
 
+def _has_igl():
+    try:
+        import igl
+        import igl.copyleft.cgal
+        return True
+    except ImportError:
+        return False
+
+
+def _has_pymesh():
+    try:
+        import pymesh
+        return True
+    except ImportError:
+        return False
+
+
+def _resolve_intersections_pymesh(o3d_meshes, tag="clip"):
+    """
+    Merge all surface meshes, resolve self-intersections via pymesh/CGAL,
+    deduplicate vertices. Mirrors mesh_postprocessing.py's proven approach.
+
+    Returns
+    -------
+    VV             : (N, 3) float64 — resolved vertices
+    FF             : (M, 3) int64   — resolved faces
+    face_provenance: (M,)   int32   — original surface index per resolved face
+    """
+    import pymesh
+
+    pm_meshes = []
+    for m in o3d_meshes:
+        V_i, F_i = o3d_mesh_to_numpy(m)
+        if F_i.size == 0:
+            pm_meshes.append(pymesh.form_mesh(np.zeros((3, 3)), np.array([[0, 1, 2]])))
+            continue
+        pm_meshes.append(pymesh.form_mesh(V_i.astype(np.float64), F_i.astype(np.int32)))
+
+    # Step 1: merge — pymesh.merge_meshes provides face_sources attribute
+    pm_merged = pymesh.merge_meshes(pm_meshes)
+    face_sources_merged = pm_merged.get_attribute("face_sources").astype(np.int32)
+    print(f"[{tag}] Merged: {len(pm_merged.vertices)} vertices, {len(pm_merged.faces)} faces")
+
+    # Step 2: resolve self-intersections
+    pm_resolved_ori = pymesh.resolve_self_intersection(pm_merged)
+
+    # Step 3: remove duplicate vertices (NOT faces/degenerate — matches mesh_postprocessing.py)
+    pm_resolved, _ = pymesh.remove_duplicated_vertices(pm_resolved_ori, tol=1e-6, importance=None)
+
+    # Two-level provenance: resolved face → merged face → original surface
+    face_sources_resolved_ori = pm_resolved_ori.get_attribute("face_sources").astype(np.int32)
+    face_provenance = face_sources_merged[face_sources_resolved_ori].astype(np.int32)
+
+    VV = np.array(pm_resolved.vertices, dtype=np.float64)
+    FF = np.array(pm_resolved.faces, dtype=np.int64)
+    print(f"[{tag}] Resolved (pymesh): {len(VV)} vertices, {len(FF)} faces")
+    return VV, FF, face_provenance
+
+
 def _resolve_intersections(o3d_meshes, tag="clip"):
     """
     Merge all surface meshes, resolve self-intersections via libigl/CGAL,
@@ -148,6 +205,9 @@ def _resolve_intersections(o3d_meshes, tag="clip"):
     FF             : (M, 3) int64   — resolved faces
     face_provenance: (M,)   int32   — original surface index per resolved face
     """
+    import igl
+    import igl.copyleft.cgal
+
     mesh_list = []
     for m in o3d_meshes:
         V_i, F_i = o3d_mesh_to_numpy(m)
@@ -171,7 +231,7 @@ def _resolve_intersections(o3d_meshes, tag="clip"):
 
 def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
                       cluster_trees=None, spacings=None,
-                      area_multiplier=2.0,
+                      area_multiplier=2,
                       post_filter_threshold=None):
     """
     Point2CAD-style mesh clipping: connected components of the resolved mesh
@@ -201,22 +261,40 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
     """
     if post_filter_threshold is not None and (cluster_trees is None or spacings is None):
         raise ValueError("post_filter_threshold requires cluster_trees and spacings")
-    VV, FF, face_provenance = _resolve_intersections(o3d_meshes, tag="p2cad-clip")
 
-    # Cut the adjacency graph along intersection curves so that inner/outer
-    # regions of each surface become separate connected components.
-    edge_to_faces = _build_edge_face_map(FF)
-    intersection_edges = _find_intersection_edges(FF, face_provenance, len(VV))
-    adj_pairs = []
-    for edge, face_list in edge_to_faces.items():
-        if len(face_list) == 2 and edge not in intersection_edges:
-            adj_pairs.append(face_list)
-    adj_edges = np.array(adj_pairs, dtype=np.int64) if adj_pairs else np.empty((0, 2), dtype=np.int64)
+    if _has_igl():
+        VV, FF, face_provenance = _resolve_intersections(o3d_meshes, tag="p2cad-clip")
 
-    connected_labels = trimesh.graph.connected_component_labels(
-        edges=adj_edges,
-        node_count=len(FF)
-    )
+        # libigl pathway: CGAL shares edges across surfaces after IM dedup,
+        # so we must explicitly detect and remove intersection boundary edges.
+        edge_to_faces = _build_edge_face_map(FF)
+        intersection_edges = _find_intersection_edges(FF, face_provenance, len(VV))
+        adj_pairs = []
+        for edge, face_list in edge_to_faces.items():
+            if len(face_list) == 2 and edge not in intersection_edges:
+                adj_pairs.append(face_list)
+        adj_edges = np.array(adj_pairs, dtype=np.int64) if adj_pairs else np.empty((0, 2), dtype=np.int64)
+
+        connected_labels = trimesh.graph.connected_component_labels(
+            edges=adj_edges,
+            node_count=len(FF)
+        )
+    elif _has_pymesh():
+        VV, FF, face_provenance = _resolve_intersections_pymesh(o3d_meshes, tag="p2cad-clip")
+
+        # pymesh pathway: trimesh face_adjacency gives edge-based connected
+        # components directly — no need for intersection edge detection.
+        # After pymesh resolve + vertex dedup, surfaces share vertices at
+        # intersection boundaries but not edges, so edge-based CC naturally
+        # separates inner/outer regions (same as mesh_postprocessing.py).
+        tri_resolved = trimesh.Trimesh(vertices=VV, faces=FF, process=False)
+        connected_labels = trimesh.graph.connected_component_labels(
+            edges=tri_resolved.face_adjacency,
+            node_count=len(FF)
+        )
+    else:
+        raise RuntimeError("mesh_clipping requires either igl (with igl.copyleft.cgal) or pymesh")
+
     unique_labels = [item[0] for item in Counter(connected_labels).most_common()]
     print(f"[p2cad-clip] {len(unique_labels)} connected components")
 
@@ -327,56 +405,73 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
     -------
     clipped : list of open3d.geometry.TriangleMesh, one per cluster
     """
-    # Merge all meshes into one, tracking face provenance
-    mesh_list = []
-    for m in o3d_meshes:
-        V_i, F_i = o3d_mesh_to_numpy(m)
-        mesh_list.append((V_i.astype(np.float64), F_i.astype(np.int32)))
-    V_merged, F_merged, face_sources_merged = _merge_meshes(mesh_list)
-    print(f"[bfs-clip] Merged: {len(V_merged)} vertices, {len(F_merged)} faces")
+    if _has_igl():
+        # Merge all meshes into one, tracking face provenance
+        import igl
+        import igl.copyleft.cgal
 
-    # J[i] = merged face that resolved face i came from (one-level provenance)
-    # IM[i] = canonical vertex index for vertex i (deduplication map)
-    VV_raw, FF_raw, _IF, J, IM = igl.copyleft.cgal.remesh_self_intersections(
-        V_merged, F_merged.astype(np.int32)
-    )
-    face_provenance = face_sources_merged[J].astype(np.int32)
+        mesh_list = []
+        for m in o3d_meshes:
+            V_i, F_i = o3d_mesh_to_numpy(m)
+            mesh_list.append((V_i.astype(np.float64), F_i.astype(np.int32)))
+        V_merged, F_merged, face_sources_merged = _merge_meshes(mesh_list)
+        print(f"[bfs-clip] Merged: {len(V_merged)} vertices, {len(F_merged)} faces")
 
-    FF_dedup = IM[FF_raw]
-    VV, FF_clean, _I, _J2 = igl.remove_unreferenced(VV_raw, FF_dedup)
-    FF = FF_clean.astype(np.int64)
-    print(f"[bfs-clip] Resolved: {len(VV)} vertices, {len(FF)} faces")
+        VV_raw, FF_raw, _IF, J, IM = igl.copyleft.cgal.remesh_self_intersections(
+            V_merged, F_merged.astype(np.int32)
+        )
+        face_provenance = face_sources_merged[J].astype(np.int32)
 
-    # Build edge → [face indices] map on the resolved mesh
-    edge_to_faces = _build_edge_face_map(FF)
-    intersection_edges = _find_intersection_edges(FF, face_provenance, len(VV))
+        FF_dedup = IM[FF_raw]
+        VV, FF_clean, _I, _J2 = igl.remove_unreferenced(VV_raw, FF_dedup)
+        FF = FF_clean.astype(np.int64)
+        print(f"[bfs-clip] Resolved: {len(VV)} vertices, {len(FF)} faces")
 
-    # Log adjacent surface pairs detected from cross-provenance edges
-    adj_pairs = set()
-    for face_list in edge_to_faces.values():
-        provs = {face_provenance[fi] for fi in face_list}
-        if len(provs) > 1:
-            provs_sorted = sorted(provs)
-            for i in range(len(provs_sorted)):
-                for j in range(i + 1, len(provs_sorted)):
-                    adj_pairs.add((provs_sorted[i], provs_sorted[j]))
-    for a, b in sorted(adj_pairs):
-        print(f"[bfs-clip] adjacent surfaces: {a} ({surface_types[a]}) ↔ "
-              f"{b} ({surface_types[b]})")
+        # Build edge → [face indices] map on the resolved mesh
+        edge_to_faces = _build_edge_face_map(FF)
+        intersection_edges = _find_intersection_edges(FF, face_provenance, len(VV))
 
-    # Per-face adjacency: exclude intersection boundary edges (detected via
-    # vertex provenance) and non-manifold edges. BFS cannot cross these.
-    n_faces = len(FF)
-    face_adj = [[] for _ in range(n_faces)]
-    for edge, face_list in edge_to_faces.items():
-        if len(face_list) != 2:
-            continue
-        if edge in intersection_edges:
-            continue
-        fi, fj = face_list
-        if face_provenance[fi] == face_provenance[fj]:
-            face_adj[fi].append(fj)
-            face_adj[fj].append(fi)
+        # Log adjacent surface pairs detected from cross-provenance edges
+        adj_pairs = set()
+        for face_list in edge_to_faces.values():
+            provs = {face_provenance[fi] for fi in face_list}
+            if len(provs) > 1:
+                provs_sorted = sorted(provs)
+                for i in range(len(provs_sorted)):
+                    for j in range(i + 1, len(provs_sorted)):
+                        adj_pairs.add((provs_sorted[i], provs_sorted[j]))
+        for a, b in sorted(adj_pairs):
+            print(f"[bfs-clip] adjacent surfaces: {a} ({surface_types[a]}) ↔ "
+                  f"{b} ({surface_types[b]})")
+
+        # Per-face adjacency: exclude intersection boundary edges (detected via
+        # vertex provenance) and non-manifold edges. BFS cannot cross these.
+        n_faces = len(FF)
+        face_adj = [[] for _ in range(n_faces)]
+        for edge, face_list in edge_to_faces.items():
+            if len(face_list) != 2:
+                continue
+            if edge in intersection_edges:
+                continue
+            fi, fj = face_list
+            if face_provenance[fi] == face_provenance[fj]:
+                face_adj[fi].append(fj)
+                face_adj[fj].append(fi)
+    elif _has_pymesh():
+        VV, FF, face_provenance = _resolve_intersections_pymesh(o3d_meshes, tag="bfs-clip")
+
+        # pymesh pathway: surfaces don't share edges at intersection boundaries,
+        # so trimesh face_adjacency naturally stops BFS at surface boundaries.
+        # Build face_adj from trimesh face_adjacency, restricted to same-provenance.
+        tri_resolved = trimesh.Trimesh(vertices=VV, faces=FF, process=False)
+        n_faces = len(FF)
+        face_adj = [[] for _ in range(n_faces)]
+        for fi, fj in tri_resolved.face_adjacency:
+            if face_provenance[fi] == face_provenance[fj]:
+                face_adj[fi].append(fj)
+                face_adj[fj].append(fi)
+    else:
+        raise RuntimeError("mesh_clipping requires either igl (with igl.copyleft.cgal) or pymesh")
 
     # Face centroids: mean of the 3 vertex positions for each resolved face
     centroids = VV[FF].mean(axis=1)  # (n_faces, 3)

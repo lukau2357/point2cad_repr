@@ -34,6 +34,121 @@ def rotation_matrix_a_to_b(A, B):
 
     return R
 
+def alpha_shape_trimming(uv_points, size_u, size_v, uv_bb_min, uv_bb_max, alpha=10.0):
+    """Keep mesh cells whose center falls inside the alpha shape of the UV point cloud.
+
+    Computes a Delaunay triangulation of uv_points, filters triangles by
+    circumradius < 1/alpha, then tests whether each cell center lies inside
+    any surviving triangle.
+
+    Parameters
+    ----------
+    uv_points   : (N, 2) array — UV coordinates from the encoder
+    size_u, size_v : grid dimensions
+    uv_bb_min, uv_bb_max : (2,) arrays — UV bounding box used for mesh sampling
+    alpha       : alpha parameter (larger = tighter boundary, 0 = convex hull)
+
+    Returns
+    -------
+    mask : (size_u - 1, size_v - 1) bool tensor
+    """
+    from scipy.spatial import Delaunay
+    from matplotlib.path import Path
+
+    uv = np.asarray(uv_points, dtype=np.float64)
+
+    if alpha <= 0:
+        # Convex hull — use Delaunay, all simplices are valid
+        tri = Delaunay(uv)
+        valid_simplices = tri.simplices
+    else:
+        tri = Delaunay(uv)
+        # Filter triangles by circumradius < 1/alpha
+        valid = []
+        for simplex in tri.simplices:
+            a, b, c = uv[simplex[0]], uv[simplex[1]], uv[simplex[2]]
+            ab = np.linalg.norm(b - a)
+            bc = np.linalg.norm(c - b)
+            ca = np.linalg.norm(a - c)
+            area = abs(np.cross(b - a, c - a)) / 2.0
+            if area < 1e-15:
+                continue
+            circumradius = (ab * bc * ca) / (4.0 * area)
+            if circumradius < 1.0 / alpha:
+                valid.append(simplex)
+        if len(valid) == 0:
+            # Fallback: keep all triangles
+            valid_simplices = tri.simplices
+        else:
+            valid_simplices = np.array(valid)
+
+    # Extract boundary edges of the alpha shape
+    from collections import Counter
+    edge_count = Counter()
+    for simplex in valid_simplices:
+        for i in range(3):
+            edge = tuple(sorted((simplex[i], simplex[(i + 1) % 3])))
+            edge_count[edge] += 1
+    boundary_edges = [e for e, cnt in edge_count.items() if cnt == 1]
+
+    # Build ordered boundary polygon
+    if len(boundary_edges) < 3:
+        # Fallback: no trimming
+        return torch.ones((size_u - 1, size_v - 1), dtype=torch.bool)
+
+    adj = {}
+    for e in boundary_edges:
+        adj.setdefault(e[0], []).append(e[1])
+        adj.setdefault(e[1], []).append(e[0])
+
+    # Walk the boundary — may have multiple loops, take the longest
+    visited_global = set()
+    loops = []
+    for start in adj:
+        if start in visited_global:
+            continue
+        loop = [start]
+        visited_global.add(start)
+        current = start
+        while True:
+            neighbors = [n for n in adj[current] if n not in visited_global]
+            if not neighbors:
+                break
+            nxt = neighbors[0]
+            loop.append(nxt)
+            visited_global.add(nxt)
+            current = nxt
+        if len(loop) >= 3:
+            loops.append(loop)
+
+    if not loops:
+        return torch.ones((size_u - 1, size_v - 1), dtype=torch.bool)
+
+    # Use the longest loop as the boundary polygon
+    longest = max(loops, key=len)
+    boundary_pts = uv[longest]
+    path = Path(boundary_pts)
+
+    # Cell centers on the UV grid
+    u_grid = np.linspace(float(uv_bb_min[0]), float(uv_bb_max[0]), size_u)
+    v_grid = np.linspace(float(uv_bb_min[1]), float(uv_bb_max[1]), size_v)
+    # Cell centers are at midpoints between grid lines
+    u_centers = (u_grid[:-1] + u_grid[1:]) / 2
+    v_centers = (v_grid[:-1] + v_grid[1:]) / 2
+    uu, vv = np.meshgrid(u_centers, v_centers, indexing='ij')
+    cell_centers = np.column_stack([uu.ravel(), vv.ravel()])
+
+    inside = path.contains_points(cell_centers)
+    mask = torch.tensor(inside.reshape(size_u - 1, size_v - 1), dtype=torch.bool)
+
+    n_total = (size_u - 1) * (size_v - 1)
+    n_kept = int(mask.sum())
+    print(f"  [alpha-trim] alpha={alpha}, boundary={len(longest)} pts, "
+          f"kept {n_kept}/{n_total} cells ({100*n_kept/n_total:.1f}%)")
+
+    return mask
+
+
 def grid_trimming(cluster, vertices, size_u, size_v, device,
                    threshold_multiplier=3.0, spacing_percentile=90,
                    spacing=None, absolute_threshold=None):
