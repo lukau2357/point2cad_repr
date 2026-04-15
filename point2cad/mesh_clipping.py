@@ -231,8 +231,9 @@ def _resolve_intersections(o3d_meshes, tag="clip"):
 
 def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
                       cluster_trees=None, spacings=None,
-                      area_multiplier=2,
-                      post_filter_threshold=None):
+                      area_multiplier=2.0,
+                      post_filter_threshold=None,
+                      cluster_ids=None):
     """
     Point2CAD-style mesh clipping: connected components of the resolved mesh
     filtered by area-per-supporting-point ratio.
@@ -259,6 +260,9 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
     -------
     clipped : list of open3d.geometry.TriangleMesh, one per cluster
     """
+    if cluster_ids is None:
+        cluster_ids = list(range(len(clusters)))
+
     if post_filter_threshold is not None and (cluster_trees is None or spacings is None):
         raise ValueError("post_filter_threshold requires cluster_trees and spacings")
 
@@ -322,7 +326,7 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
         subs = [sub for sub, sid in zip(submeshes, submesh_surface) if sid == s]
 
         if len(subs) == 0:
-            print(f"[p2cad-clip] surface {s} ({surface_types[s]}): no components")
+            print(f"[p2cad-clip] cluster {cluster_ids[s]} ({surface_types[s]}): no components")
             clipped.append(o3d.geometry.TriangleMesh())
             continue
 
@@ -333,12 +337,13 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
             axis=1
         )
         counter = Counter(nearest).most_common()
+
         area_per_point = np.array([subs[idx].area / count
                                    for idx, count in counter])
 
         nonzero = np.nonzero(area_per_point)[0]
         if len(nonzero) == 0:
-            print(f"[p2cad-clip] surface {s} ({surface_types[s]}): all zero-area components")
+            print(f"[p2cad-clip] cluster {cluster_ids[s]} ({surface_types[s]}): all zero-area components")
             clipped.append(o3d.geometry.TriangleMesh())
             continue
 
@@ -347,9 +352,24 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
             (area_per_point < best * area_multiplier) & (area_per_point != 0)
         ]
 
+        # Post-APP vote filter: drop survivors with < 5% of the top vote count
+        votes_by_idx = {idx: count for idx, count in counter}
+        max_votes = max(votes_by_idx[i] for i in keep_idx)
+        vote_min = 0.05 * max_votes
+        dropped = [i for i in keep_idx if votes_by_idx[i] < vote_min]
+        if dropped:
+            for i in dropped:
+                print(f"[p2cad-clip] cluster {cluster_ids[s]}: dropping cc {i} "
+                      f"(votes={votes_by_idx[i]}, < 5% of max={max_votes})")
+        keep_idx = np.array([i for i in keep_idx if votes_by_idx[i] >= vote_min])
+
         kept = trimesh.util.concatenate([subs[i] for i in keep_idx])
-        print(f"[p2cad-clip] surface {s} ({surface_types[s]}): "
-              f"{len(keep_idx)}/{len(subs)} components kept")
+        print(f"[p2cad-clip] cluster {cluster_ids[s]} ({surface_types[s]}): "
+              f"{len(keep_idx)}/{len(subs)} components kept (best_app={best:.6f})")
+        if len(keep_idx) <= 20:
+            app_by_idx = {idx: subs[idx].area / count for idx, count in counter}
+            for i in keep_idx:
+                print(f"    cc {i}: app={app_by_idx[i]:.6f}, votes={votes_by_idx[i]}")
 
         kept_vertices = np.array(kept.vertices)
         kept_faces    = np.array(kept.faces)
@@ -364,7 +384,7 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
         #     mask = bar_dists <= thr
         #     n_before = len(kept_faces)
         #     kept_faces = kept_faces[mask]
-        #     print(f"[p2cad-clip] surface {s} ({surface_types[s]}): "
+        #     print(f"[p2cad-clip] cluster {cluster_ids[s]} ({surface_types[s]}): "
         #           f"post-filter kept {len(kept_faces)}/{n_before} faces "
         #           f"(thr={thr:.5f})")
 
@@ -381,7 +401,8 @@ def clip_meshes_p2cad(o3d_meshes, clusters, surface_types,
 
 def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
                     cluster_trees, spacings,
-                    post_filter_threshold=1.0):
+                    post_filter_threshold=1.0,
+                    cluster_ids=None):
     """
     Trim each surface mesh to its correct region using BFS flood-fill on the
     CGAL-resolved unified mesh, stopping at cross-provenance edges.
@@ -405,6 +426,9 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
     -------
     clipped : list of open3d.geometry.TriangleMesh, one per cluster
     """
+    if cluster_ids is None:
+        cluster_ids = list(range(len(clusters)))
+
     if _has_igl():
         # Merge all meshes into one, tracking face provenance
         import igl
@@ -441,8 +465,8 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
                     for j in range(i + 1, len(provs_sorted)):
                         adj_pairs.add((provs_sorted[i], provs_sorted[j]))
         for a, b in sorted(adj_pairs):
-            print(f"[bfs-clip] adjacent surfaces: {a} ({surface_types[a]}) ↔ "
-                  f"{b} ({surface_types[b]})")
+            print(f"[bfs-clip] adjacent clusters: {cluster_ids[a]} ({surface_types[a]}) ↔ "
+                  f"{cluster_ids[b]} ({surface_types[b]})")
 
         # Per-face adjacency: exclude intersection boundary edges (detected via
         # vertex provenance) and non-manifold edges. BFS cannot cross these.
@@ -482,7 +506,7 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
         prov_faces = np.where(prov_mask)[0]
 
         if len(prov_faces) == 0:
-            print(f"[bfs-clip] surface {s} ({surface_types[s]}): "
+            print(f"[bfs-clip] cluster {cluster_ids[s]} ({surface_types[s]}): "
                   f"no faces after resolution")
             clipped.append(o3d.geometry.TriangleMesh())
             continue
@@ -504,7 +528,7 @@ def clip_meshes_bfs(o3d_meshes, clusters, surface_types,
                     queue.append(fj)
 
         kept_faces = FF[list(visited)]
-        print(f"[bfs-clip] surface {s} ({surface_types[s]}): "
+        print(f"[bfs-clip] cluster {cluster_ids[s]} ({surface_types[s]}): "
               f"{len(visited)}/{len(prov_faces)} faces after BFS")
 
         # Optional post-BFS distance filter: keep only faces whose barycenter

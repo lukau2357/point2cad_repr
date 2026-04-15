@@ -247,16 +247,17 @@ class INRNetwork(torch.nn.Module):
 
         # Alpha shape trimming only for fully open surfaces — closed coordinates
         # have a seam at ±1 that creates artificial gaps in the alpha shape
-        if uv_points is not None and not self.is_u_closed and not self.is_v_closed:
-            from .primitive_fitting_utils import alpha_shape_trimming
-            uv_length = uv_bb_max - uv_bb_min
-            uv_min_ext = uv_bb_min - uv_length * uv_margin
-            uv_max_ext = uv_bb_max + uv_length * uv_margin
-            mask = alpha_shape_trimming(uv_points, mesh_dim, mesh_dim, uv_min_ext, uv_max_ext, alpha=alpha)
-        else:
-            mask = None
+        # if uv_points is not None and not self.is_u_closed and not self.is_v_closed:
+        #     from .primitive_fitting_utils import alpha_shape_trimming
+        #     uv_length = uv_bb_max - uv_bb_min
+        #     uv_min_ext = uv_bb_min - uv_length * uv_margin
+        #     uv_max_ext = uv_bb_max + uv_length * uv_margin
+        #     mask = alpha_shape_trimming(uv_points, mesh_dim, mesh_dim, uv_min_ext, uv_max_ext, alpha=alpha)
+        # else:
+        #     mask = None
 
-        mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device, threshold_multiplier = threshold_multiplier, spacing = spacing)
+        mask = None
+        # mask = grid_trimming(cluster, points.cpu().numpy(), mesh_dim, mesh_dim, device, threshold_multiplier = threshold_multiplier, spacing = spacing)
         meshes = triangulate_and_mesh(points.cpu().numpy(), mesh_dim, mesh_dim, "inr", mask = mask)
         return meshes
     
@@ -351,12 +352,13 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
     return result
 
 def fit_inr(cluster, network_parameters, device = "cuda:0",
-            max_steps = 1000, 
-            warmup_steps_ratio = 0.05, 
-            initial_lr = 1e-2, 
+            max_steps = 1000,
+            warmup_steps_ratio = 0.05,
+            initial_lr = 1e-2,
             max_memory_mb = 10,
             noise_magnitude_3d = 0.005,
-            noise_magnitude_uv = 0.005):
+            noise_magnitude_uv = 0.005,
+            seed = 42):
     
     # TODO: Correct??
     if not torch.cuda.is_available():
@@ -378,20 +380,29 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
     cluster_scale_torch = torch.tensor(cluster_scale, dtype = torch.float32).to(device)
     cluster = torch.tensor(cluster, device = device)
     dataset = TensorDataset(cluster)
-    # TODO: Implement reproducibility for the DataLoader!
-    dl = DataLoader(dataset, batch_size = batch_size, drop_last = False, shuffle = True)
-
-    def get_next_item():
-        while True:
-            for X in dl:
-                yield X
-
     best_model = None
 
-    dl_generator = get_next_item()
+    torch.backends.cudnn.deterministic = True
+
     inr_t0 = time.time()
     for u in [True, False]:
         for v in [True, False]:
+            # Global seed — same init, noise, and batch order for all combos;
+            # only the (u, v) closedness configuration differs.
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+            dl_gen = torch.Generator()
+            dl_gen.manual_seed(seed)
+            dl = DataLoader(dataset, batch_size = batch_size, drop_last = False, shuffle = True, generator = dl_gen)
+
+            def get_next_item():
+                while True:
+                    for X in dl:
+                        yield X
+
+            dl_generator = get_next_item()
             current_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,
                                            is_u_closed = u, 
                                            is_v_closed = v,

@@ -30,11 +30,17 @@ def _merge_part_dirs(part_dirs, unified_dir):
     """
     os.makedirs(unified_dir, exist_ok=True)
 
-    all_snames, all_colors = [], []
+    all_snames, all_colors, all_labels = [], [], []
     for dir_path, offset, n in part_dirs:
         meta = np.load(os.path.join(dir_path, "metadata.npz"), allow_pickle=True)
         all_snames.extend(meta["surface_names"].tolist())
         all_colors.extend(meta["cluster_colors"].tolist())
+        part_idx = int(os.path.basename(dir_path).split("_")[1])
+        for cid in meta["cluster_ids"]:
+            if len(part_dirs) == 1:
+                all_labels.append(f"cluster_{cid}")
+            else:
+                all_labels.append(f"part_{part_idx}/cluster_{cid}")
 
     clip_method = "unknown"
     if part_dirs:
@@ -46,6 +52,7 @@ def _merge_part_dirs(part_dirs, unified_dir):
              n_clusters=len(all_snames),
              surface_names=np.array(all_snames),
              cluster_colors=np.array(all_colors),
+             cluster_labels=np.array(all_labels),
              clip_method=clip_method)
 
     unified_combined = o3d.geometry.TriangleMesh()
@@ -54,24 +61,25 @@ def _merge_part_dirs(part_dirs, unified_dir):
         mean = meta["norm_mean"]
         R = meta["norm_R"]
         scale = float(meta["norm_scale"])
+        cluster_ids = meta["cluster_ids"]
 
         part_combined = o3d.geometry.TriangleMesh()
-        for i in range(n):
+        for out_idx, cid in enumerate(cluster_ids):
             # Clusters (.npy)
-            src = os.path.join(dir_path, f"cluster_{i}.npy")
+            src = os.path.join(dir_path, f"cluster_{cid}.npy")
             if os.path.exists(src):
                 pts = np.load(src)
-                np.save(os.path.join(unified_dir, f"cluster_{i + offset}.npy"),
+                np.save(os.path.join(unified_dir, f"cluster_{out_idx + offset}.npy"),
                         _denorm_points(pts, mean, R, scale))
 
             # Surface meshes and trimmed meshes (.npz with vertices/triangles)
             for prefix in ("surface_mesh", "trimmed_mesh"):
-                src = os.path.join(dir_path, f"{prefix}_{i}.npz")
+                src = os.path.join(dir_path, f"{prefix}_{cid}.npz")
                 if not os.path.exists(src):
                     continue
                 d = np.load(src)
                 verts = _denorm_points(d["vertices"], mean, R, scale)
-                np.savez(os.path.join(unified_dir, f"{prefix}_{i + offset}.npz"),
+                np.savez(os.path.join(unified_dir, f"{prefix}_{out_idx + offset}.npz"),
                          vertices=verts, triangles=d["triangles"])
 
                 if prefix == "trimmed_mesh" and len(verts) > 0:
@@ -195,9 +203,9 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
 
         clusters = []
         o3d_meshes = []
-        for idx in range(n_clusters):
-            clusters.append(np.load(os.path.join(out_dir, f"cluster_{idx}.npy")))
-            d = np.load(os.path.join(out_dir, f"surface_mesh_{idx}.npz"))
+        for cid in unique_clusters:
+            clusters.append(np.load(os.path.join(out_dir, f"cluster_{cid}.npy")))
+            d = np.load(os.path.join(out_dir, f"surface_mesh_{cid}.npz"))
             mesh = o3d.geometry.TriangleMesh()
             mesh.vertices = o3d.utility.Vector3dVector(d["vertices"])
             mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
@@ -243,8 +251,8 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
             cluster_counts  = np.array([cnt for cnt, k in zip(cluster_counts, keep_mask) if k])
             n_clusters      = len(clusters)
 
-        for idx in range(len(clusters)):
-            np.save(os.path.join(out_dir, f"cluster_{idx}.npy"), clusters[idx])
+        for idx, cid in enumerate(unique_clusters):
+            np.save(os.path.join(out_dir, f"cluster_{cid}.npy"), clusters[idx])
 
         cluster_trees, spacings = build_cluster_trees(clusters, args.spacing_percentile)
 
@@ -264,10 +272,11 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
                 spacing=spacings[idx],
                 cluster_tree=cluster_trees[idx],
                 inr_fit_kwargs={
-                    "max_steps": 1500,
+                    "max_steps": 3000,
                     "noise_magnitude_3d": 0.05,
                     "noise_magnitude_uv": 0.05,
                     "initial_lr": 1e-1,
+                    "seed": args.seed,
                 },
                 plane_mesh_kwargs={"mesh_dim": 200, "threshold_multiplier": tm,
                                    "plane_sampling_deviation": 2, "spacing": spacings[idx],
@@ -299,7 +308,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
 
             verts = np.asarray(res["mesh"].vertices)
             tris  = np.asarray(res["mesh"].triangles)
-            np.savez(os.path.join(out_dir, f"surface_mesh_{idx}.npz"),
+            np.savez(os.path.join(out_dir, f"surface_mesh_{cid}.npz"),
                      vertices=verts, triangles=tris)
         fit_time = time.perf_counter() - t_fit
 
@@ -308,14 +317,16 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
         print("[mesh] Running BFS flood-fill trimming ...")
         clipped_meshes = clip_meshes_bfs(o3d_meshes, clusters, surface_type_names,
                                          cluster_trees, spacings,
-                                         post_filter_threshold=args.post_filter_threshold)
+                                         post_filter_threshold=args.post_filter_threshold,
+                                         cluster_ids=unique_clusters)
     else:
         print("[mesh] Running Point2CAD-style trimming ...")
         clipped_meshes = clip_meshes_p2cad(o3d_meshes, clusters, surface_type_names,
                                            cluster_trees=cluster_trees,
                                            spacings=spacings,
                                            area_multiplier=args.area_multiplier,
-                                           post_filter_threshold=args.post_filter_threshold)
+                                           post_filter_threshold=args.post_filter_threshold,
+                                           cluster_ids=unique_clusters)
     clip_time = time.perf_counter() - t_clip
 
     print(f"[timing]   fit:  {fit_time:.2f}s")
@@ -330,9 +341,10 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
 
     combined = o3d.geometry.TriangleMesh()
     for idx, mesh in enumerate(clipped_meshes):
+        cid = int(unique_clusters[idx])
         verts = np.asarray(mesh.vertices)
         tris  = np.asarray(mesh.triangles)
-        np.savez(os.path.join(out_dir, f"trimmed_mesh_{idx}.npz"),
+        np.savez(os.path.join(out_dir, f"trimmed_mesh_{cid}.npz"),
                  vertices=verts, triangles=tris)
         combined += mesh
     combined.compute_vertex_normals()
@@ -386,6 +398,7 @@ def run_visualize(args):
     n_clusters     = int(meta["n_clusters"])
     cluster_colors = meta["cluster_colors"]
     surface_names  = meta["surface_names"]
+    cluster_labels = meta["cluster_labels"] if "cluster_labels" in meta else None
     clip_method    = str(meta["clip_method"]) if "clip_method" in meta else "unknown"
 
     pcd_combined     = o3d.geometry.PointCloud()
@@ -413,7 +426,8 @@ def run_visualize(args):
             mesh.compute_vertex_normals()
             mesh.paint_uniform_color(scolor)
             surface_meshes.append(mesh)
-            surface_labels.append(f"cluster_{i} ({stype})")
+            label = str(cluster_labels[i]) if cluster_labels is not None else f"cluster_{i}"
+            surface_labels.append(f"{label} ({stype})")
 
         tm_path = os.path.join(unified_dir, f"trimmed_mesh_{i}.npz")
         if os.path.exists(tm_path):

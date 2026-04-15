@@ -340,11 +340,11 @@ def fit_surface(cluster,
     simple_min = np.argmin(errors)
 
     # Plane check first — if plane is good enough, use it unconditionally.
-    if errors[SURFACE_PLANE] < simple_error_threshold:
-        mesh = resolve_mesh(SURFACE_PLANE, results[SURFACE_PLANE], cluster, np_rng, device,
-                    plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
-                    radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
-        return {"surface_id": SURFACE_PLANE, "result": results[SURFACE_PLANE], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
+    # if errors[SURFACE_PLANE] < simple_error_threshold / 2:
+    #     mesh = resolve_mesh(SURFACE_PLANE, results[SURFACE_PLANE], cluster, np_rng, device,
+    #                 plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
+    #                 radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
+    #     return {"surface_id": SURFACE_PLANE, "result": results[SURFACE_PLANE], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
 
     if errors[simple_min] < simple_error_threshold:
         if simple_min == SURFACE_CONE:
