@@ -214,6 +214,8 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
         print(f"[mesh] Loaded {n_clusters} clusters and meshes from {out_dir}/")
         cluster_trees, spacings = build_cluster_trees(clusters, args.spacing_percentile)
         fit_time = 0.0
+        primitive_fit_time = 0.0
+        freeform_fit_time = 0.0
     else:
         if os.path.exists(out_dir):
             shutil.rmtree(out_dir)
@@ -260,6 +262,8 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
         surface_type_names = []
 
         t_fit = time.perf_counter()
+        primitive_fit_time = 0.0
+        freeform_fit_time = 0.0
         for idx, (cid, c_count) in enumerate(zip(unique_clusters, cluster_counts)):
             cluster = clusters[idx]
 
@@ -306,6 +310,9 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
             o3d_meshes.append(res["mesh"])
             surface_type_names.append(stype)
 
+            primitive_fit_time += res.get("primitive_fit_time", 0.0)
+            freeform_fit_time += res.get("freeform_fit_time", 0.0)
+
             verts = np.asarray(res["mesh"].vertices)
             tris  = np.asarray(res["mesh"].triangles)
             np.savez(os.path.join(out_dir, f"surface_mesh_{cid}.npz"),
@@ -329,13 +336,16 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
                                            cluster_ids=unique_clusters)
     clip_time = time.perf_counter() - t_clip
 
-    print(f"[timing]   fit:  {fit_time:.2f}s")
+    print(f"[timing]   fit:  {fit_time:.2f}s  "
+          f"(primitive: {primitive_fit_time:.2f}s, freeform: {freeform_fit_time:.2f}s)")
     print(f"[timing]   clip: {clip_time:.2f}s")
     print(f"[timing]   sum:  {fit_time + clip_time:.2f}s")
 
     import json as _json
     with open(os.path.join(out_dir, "timing.json"), "w") as _f:
         _json.dump({"fit_time": fit_time,
+                    "primitive_fit_time": primitive_fit_time,
+                    "freeform_fit_time": freeform_fit_time,
                     "clip_time": clip_time,
                     "total_time": fit_time + clip_time}, _f, indent=2)
 
@@ -523,14 +533,28 @@ def run_visualize(args):
         return (f"{label:>16}: {_fmt(ts.get('fit_time')):>8} "
                 f"{_fmt(ts.get('clip_time')):>8} {_fmt(ts.get('total_time')):>8}")
 
+    def _breakdown(ts):
+        # Mine-only breakdown: primitive vs freeform time inside the fit phase.
+        # Original Point2CAD doesn't record this split, so it's shown only for mine.
+        if ts is None:
+            return None
+        prim = ts.get("primitive_fit_time")
+        free = ts.get("freeform_fit_time")
+        if prim is None and free is None:
+            return None
+        return f"{'(mine breakdown)':>16}  primitive: {_fmt(prim)}  freeform: {_fmt(free)}"
+
     print("\n[timing] === per-part timings ===")
     print(f"{'':>16}  {'fit':>8} {'clip':>8} {'total':>8}")
-    mine_tot = {"fit": 0.0, "clip": 0.0, "sum": 0.0}
+    mine_tot = {"fit": 0.0, "prim": 0.0, "free": 0.0, "clip": 0.0, "sum": 0.0}
     orig_tot = {"fit": 0.0, "clip": 0.0, "sum": 0.0}
     for (pd, mt), (_, ot) in zip(mine_timings, orig_timings):
         print(f"  {pd}")
         print("  " + _row("mine", mt))
         print("  " + _row("orig p2cad", ot))
+        br = _breakdown(mt)
+        if br is not None:
+            print("  " + br)
         if mt and ot:
             mt_sum = mt.get("total_time") or 0.0
             ot_sum = ot.get("total_time") or 0.0
@@ -538,6 +562,8 @@ def run_visualize(args):
                 print(f"  {'speedup':>16}: {ot_sum / mt_sum:.2f}x (orig/mine)")
         if mt:
             mine_tot["fit"]  += mt.get("fit_time", 0.0) or 0.0
+            mine_tot["prim"] += mt.get("primitive_fit_time", 0.0) or 0.0
+            mine_tot["free"] += mt.get("freeform_fit_time", 0.0) or 0.0
             mine_tot["clip"] += mt.get("clip_time", 0.0) or 0.0
             mine_tot["sum"]  += mt.get("total_time", 0.0) or 0.0
         if ot:
@@ -547,6 +573,7 @@ def run_visualize(args):
     print(f"\n  {'TOTAL':>16}")
     print(f"  {'mine':>16}: {mine_tot['fit']:7.2f}s {mine_tot['clip']:7.2f}s {mine_tot['sum']:7.2f}s")
     print(f"  {'orig p2cad':>16}: {orig_tot['fit']:7.2f}s {orig_tot['clip']:7.2f}s {orig_tot['sum']:7.2f}s")
+    print(f"  {'(mine breakdown)':>16}  primitive: {mine_tot['prim']:7.2f}s  freeform: {mine_tot['free']:7.2f}s")
     if orig_tot['sum'] > 0 and mine_tot['sum'] > 0:
         print(f"  speedup (orig/mine): {orig_tot['sum'] / mine_tot['sum']:.2f}x")
     print()

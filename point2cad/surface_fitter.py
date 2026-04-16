@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import open3d as o3d
 import trimesh
@@ -329,10 +331,12 @@ def fit_surface(cluster,
 
     # Fit all registered primitives in surface-ID order.
     # results[sid] holds the fit dict; errors[sid] = reconstruction error.
+    _t_prim = time.perf_counter()
     results = {
         sid: PRIMITIVE_FITTERS[sid](cluster, **fitter_kwargs[sid])
         for sid in sorted(PRIMITIVE_FITTERS)
     }
+    primitive_fit_time = time.perf_counter() - _t_prim
     errors = np.array([results[sid]["error"] for sid in range(len(PRIMITIVE_FITTERS))])
     # Collect all primitive errors for diagnostics (INR added later if fitted)
     _all_errors = {SURFACE_NAMES[sid]: float(results[sid]["error"])
@@ -355,18 +359,22 @@ def fit_surface(cluster,
                             plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
                             radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
 
-                return {"surface_id": cone_results, "result": results[cone_results], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
+                return {"surface_id": cone_results, "result": results[cone_results], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors,
+                        "primitive_fit_time": primitive_fit_time, "freeform_fit_time": 0.0}
 
         else:
             mesh = resolve_mesh(simple_min, results[simple_min], cluster, np_rng, device,
             plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
             radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
-            return {"surface_id": simple_min, "result": results[simple_min], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
+            return {"surface_id": simple_min, "result": results[simple_min], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors,
+                    "primitive_fit_time": primitive_fit_time, "freeform_fit_time": 0.0}
         
     errors_str = "  ".join(f"{SURFACE_NAMES[sid]}={errors[sid]:.6f}" for sid in range(len(PRIMITIVE_FITTERS)))
     print(f"  [surface fitter] no primitive below threshold ({simple_error_threshold:.4f}), "
           f"best={SURFACE_NAMES[simple_min]} ({errors[simple_min]:.6f})")
     print(f"  [surface fitter] primitive errors: {errors_str}")
+
+    _t_freeform = time.perf_counter()
 
     if freeform_method == "bpa":
         assert spacing is not None, "spacing must be provided for BPA freeform method"
@@ -385,7 +393,9 @@ def fit_surface(cluster,
             "params": {},
         }
         _all_errors["bpa"] = bpa_error
-        return {"surface_id": SURFACE_INR, "result": bpa_result, "mesh": bpa_mesh, "trimesh_mesh": bpa_trimesh, "all_errors": _all_errors}
+        freeform_fit_time = time.perf_counter() - _t_freeform
+        return {"surface_id": SURFACE_INR, "result": bpa_result, "mesh": bpa_mesh, "trimesh_mesh": bpa_trimesh, "all_errors": _all_errors,
+                "primitive_fit_time": primitive_fit_time, "freeform_fit_time": freeform_fit_time}
 
     if freeform_method == "spectral":
         print(f"  [surface fitter] fitting spectral RBF (spectral embedding → RBF) ...")
@@ -396,7 +406,9 @@ def fit_surface(cluster,
             "params": {},
         }
         _all_errors["spectral"] = spec_error
-        return {"surface_id": SURFACE_INR, "result": spec_result, "mesh": spec_mesh, "trimesh_mesh": spec_trimesh, "all_errors": _all_errors}
+        freeform_fit_time = time.perf_counter() - _t_freeform
+        return {"surface_id": SURFACE_INR, "result": spec_result, "mesh": spec_mesh, "trimesh_mesh": spec_trimesh, "all_errors": _all_errors,
+                "primitive_fit_time": primitive_fit_time, "freeform_fit_time": freeform_fit_time}
 
     print(f"  [surface fitter] fitting INR ...")
     inr_result = fit_inr(cluster, inr_network_parameters, device = device, **inr_fit_kwargs)
@@ -421,8 +433,11 @@ def fit_surface(cluster,
         elif resulting_min == SURFACE_PLANE or resulting_min == SURFACE_SPHERE:
             resulting_min = plane_sphere_arbitration(errors[:-1], plane_sphere_ratio_threshold)
 
+    freeform_fit_time = time.perf_counter() - _t_freeform
+
     mesh = resolve_mesh(resulting_min, results[resulting_min], cluster, np_rng, device,
                         plane_mesh_kwargs, sphere_mesh_kwargs, cylinder_mesh_kwargs, cone_mesh_kwargs, inr_mesh_kwargs,
                         radius_inflation=radius_inflation, angle_inflation_deg=angle_inflation_deg)
 
-    return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors}
+    return {"surface_id": resulting_min, "result": results[resulting_min], "mesh": mesh[0], "trimesh_mesh": mesh[1], "all_errors": _all_errors,
+            "primitive_fit_time": primitive_fit_time, "freeform_fit_time": freeform_fit_time}

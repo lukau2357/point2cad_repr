@@ -43,16 +43,39 @@ def inr_error(data_loader, model, cluster_mean, cluster_scale):
     # Explicit training loss definition: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L319
     # Error inference: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L835
     # We will try to use L1 for now in both places...
-    batch_errors = []
+    #
+    # Old per-batch CPU-sync version (kept for reference):
+    # batch_errors = []
+    # with torch.no_grad():
+    #     for batch in data_loader:
+    #         X = batch[0]
+    #         Xhat, _ = model.forward(X)
+    #         X_orig = X * cluster_scale + cluster_mean
+    #         Xhat_orig = Xhat * cluster_scale + cluster_mean
+    #         # L1 (previous): per-point sum of absolute coordinate deltas — inconsistent
+    #         # with the other primitives which report Euclidean point-to-surface distance.
+    #         # current_error = inr_recon_loss(X_orig, Xhat_orig)
+    #         # L2: per-point Euclidean distance — consistent with the other primitive errors.
+    #         current_error = torch.linalg.norm(X_orig - Xhat_orig, dim=-1)
+    #         batch_errors.append(current_error.cpu().numpy())
+    # return np.array(batch_errors).mean()
+    #
+    # GPU-side accumulation: cluster_mean is a pure translation so it cancels in
+    # (X + m) - (Xhat + m); cluster_scale is a positive scalar that factors out of
+    # the per-point norm. So we can compute the norm in the normalized space and
+    # rescale once at the end, avoiding per-batch device→host syncs.
+    total_error = None
+    total_points = 0
     with torch.no_grad():
         for batch in data_loader:
             X = batch[0]
             Xhat, _ = model.forward(X)
-            # Measure INR error on original data, consistent with error measuring for cannonical algorithms
-            current_error = inr_recon_loss(X * cluster_scale + cluster_mean, Xhat * cluster_scale + cluster_mean)
-            batch_errors.append(current_error.cpu().numpy())
-    
-    return np.array(batch_errors).mean()
+            per_point = torch.linalg.norm(X - Xhat, dim=-1)
+            batch_sum = per_point.sum()
+            total_error = batch_sum if total_error is None else total_error + batch_sum
+            total_points += per_point.shape[0]
+
+    return ((total_error / total_points) * cluster_scale).item()
     
 '''
 3N = (free * (1 - memory_margin))
@@ -288,11 +311,12 @@ class LinearWarmupCosineAnnealingLR(_LRScheduler):
         ]
 
 def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, cluster_scale,
+            steps_per_epoch,
             is_u_closed = False,
             is_v_closed = False,
-            max_steps = 1000, 
-            warmup_steps_ratio = 0.05, 
-            initial_lr = 1e-2, 
+            max_steps = 1000,
+            warmup_steps_ratio = 0.05,
+            initial_lr = 1e-2,
             noise_magnitude_3d = 0.005,
             noise_magnitude_uv = 0.005):
     start = time.time()
@@ -306,9 +330,15 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
     loop = tqdm.tqdm(range(max_steps), desc="Training the INR network",
                      disable=not sys.stderr.isatty())
 
-    best_error = float("inf")
+    best_proxy = float("inf")
     best_state_dict = None
     best_step = -1
+    # GPU-side accumulator; synced only at epoch boundaries.
+    epoch_loss_sum = torch.zeros((), device=device)
+    epoch_step_count = 0
+    # Old per-step L2-eval tracking (kept for reference):
+    # best_error = float("inf")
+    # eval_every = 3
 
     for i, _ in enumerate(loop):
         noise_schedule = (max_steps - 1 - i) / (max_steps - 1)
@@ -336,21 +366,40 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
         optimizer.step()
         scheduler.step()
 
-        step_error = inr_error(dl, model, cluster_mean, cluster_scale)
-        if step_error < best_error:
-            best_error = step_error
-            best_step = i
-            best_state_dict = copy.deepcopy(model.state_dict())
+        epoch_loss_sum = epoch_loss_sum + recon_loss.detach()
+        epoch_step_count += 1
+
+        is_epoch_end = (epoch_step_count == steps_per_epoch)
+        is_last_step = (i == max_steps - 1)
+        if is_epoch_end or is_last_step:
+            epoch_mean_loss = (epoch_loss_sum / epoch_step_count).item()
+            if epoch_mean_loss < best_proxy:
+                best_proxy = epoch_mean_loss
+                best_step = i
+                best_state_dict = copy.deepcopy(model.state_dict())
+            epoch_loss_sum = torch.zeros((), device=device)
+            epoch_step_count = 0
+
+        # Old per-step L2-eval loop (superseded by epoch-mean L1 proxy above):
+        # if i % eval_every == 0 or i == max_steps - 1:
+        #     step_error = inr_error(dl, model, cluster_mean, cluster_scale)
+        #     if step_error < best_error:
+        #         best_error = step_error
+        #         best_step = i
+        #         best_state_dict = copy.deepcopy(model.state_dict())
         # loop.set_postfix(recon_loss = f"{recon_loss:.4f}")
 
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
-        print(f"  [inr] best_error={best_error:.6f} at step {best_step}/{max_steps - 1}")
 
     torch.cuda.synchronize()
     end = time.time()
 
+    # One true L2 evaluation on the best-proxy model — this is the value that
+    # feeds cross-combo selection and downstream reporting.
     error = inr_error(dl, model, cluster_mean, cluster_scale)
+    if best_state_dict is not None:
+        tqdm.tqdm.write(f"  [inr] best_proxy={best_proxy:.6f}  best_error={error:.6f}  at step {best_step}/{max_steps - 1}")
 
     result = {
         "surface_type": "inr",
@@ -381,7 +430,8 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
 
     N = cluster.shape[0]
     batch_size = automatic_batch_size(N, max_memory_mb = max_memory_mb)
-    print(f"  [inr] batch_size={batch_size}")
+    steps_per_epoch = math.ceil(N / batch_size)
+    tqdm.tqdm.write(f"  [inr] batch_size={batch_size}  steps_per_epoch={steps_per_epoch}")
 
     cluster_mean = cluster.mean(axis = 0)
     cluster_std = cluster.std(axis = 0)
@@ -419,7 +469,8 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
 
             dl_generator = get_next_item()
             current_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,
-                                           is_u_closed = u, 
+                                           steps_per_epoch,
+                                           is_u_closed = u,
                                            is_v_closed = v,
                                            max_steps = max_steps,
                                            warmup_steps_ratio = warmup_steps_ratio,
@@ -427,7 +478,7 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
                                            noise_magnitude_3d = noise_magnitude_3d,
                                            noise_magnitude_uv = noise_magnitude_uv)
             fit_time = current_model["metadata"]["fitting_time_seconds"]
-            print(f"  [inr] u_closed={u}  v_closed={v}  error={current_model['error']:.6f}  time={fit_time:.2f}s")
+            tqdm.tqdm.write(f"  [inr] u_closed={u}  v_closed={v}  error={current_model['error']:.6f}  time={fit_time:.2f}s")
             if best_model is None or best_model["error"] > current_model["error"]:
                 best_model = current_model  
     # best_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,
@@ -439,7 +490,7 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
     #                             noise_magnitude_3d = noise_magnitude_3d,
     #                             noise_magnitude_uv = noise_magnitude_uv)
     inr_total = time.time() - inr_t0
-    print(f"  [inr] best: error={best_model['error']:.6f}  total_time={inr_total:.2f}s")
+    tqdm.tqdm.write(f"  [inr] best: error={best_model['error']:.6f}  total_time={inr_total:.2f}s")
     best_model["params"]["cluster_mean"] = cluster_mean
     best_model["params"]["cluster_scale"] = cluster_scale
     model = best_model["params"]["model"]

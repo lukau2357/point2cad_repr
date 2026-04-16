@@ -202,3 +202,5 @@ uv_alpha... Improve mesh for freeforms...
 
 Automatic Reconstruction of Topology Optimization to Editable CAD Models - What about this paper?
 BrepGaussian - What about this paper?
+
+Loss regularizer experiment: Do not forget weight annealing!
