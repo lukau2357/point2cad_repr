@@ -1,3 +1,4 @@
+import copy
 import torch
 import numpy as np
 import math
@@ -28,7 +29,7 @@ def uv_to_decoder(output, is_closed):
         # but zero padding during training!!!
         # Function definition: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L758
         # Training loop chunk: https://github.com/prs-eth/point2cad/blob/81e15bfa952aee62cf06cdf4b0897c552fe4fb3a/point2cad/fitting_one_surface.py#L592
-        res = torch.cat([output, output], dim = -1)
+        res = torch.cat([output, torch.zeros_like(output)], dim = -1)
     
     return res
 
@@ -305,6 +306,10 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
     loop = tqdm.tqdm(range(max_steps), desc="Training the INR network",
                      disable=not sys.stderr.isatty())
 
+    best_error = float("inf")
+    best_state_dict = None
+    best_step = -1
+
     for i, _ in enumerate(loop):
         noise_schedule = (max_steps - 1 - i) / (max_steps - 1)
 
@@ -314,7 +319,7 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
         X_original = X[0]
         if noise_magnitude_3d == 0:
             X_noised = X_original
-        
+
         else:
             noise_x = torch.randn(size = X_original.shape, device = device)
             X_noised = X_original + noise_magnitude_3d * noise_schedule * noise_x
@@ -324,14 +329,24 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
         if noise_magnitude_uv != 0:
             noise_uv = torch.randn(size = uv.shape, device = device)
             uv = uv + noise_magnitude_uv * noise_schedule * noise_uv
-        
+
         Xhat = model.forward_decoder(uv)
         recon_loss = inr_recon_loss(X_original, Xhat).mean()
         recon_loss.backward()
         optimizer.step()
         scheduler.step()
+
+        step_error = inr_error(dl, model, cluster_mean, cluster_scale)
+        if step_error < best_error:
+            best_error = step_error
+            best_step = i
+            best_state_dict = copy.deepcopy(model.state_dict())
         # loop.set_postfix(recon_loss = f"{recon_loss:.4f}")
-    
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+        print(f"  [inr] best_error={best_error:.6f} at step {best_step}/{max_steps - 1}")
+
     torch.cuda.synchronize()
     end = time.time()
 
