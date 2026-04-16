@@ -199,7 +199,12 @@ uv_alpha... Improve mesh for freeforms...
 - 00417 - tangent surfaces
 - 00475 - Showcase meshes, mine vs Point2CAD
 - 40024 - Interesting freeform, perhaps good for INR experimentation?
+- 40050 - Probably my algorithm will produce a better mesh than original Point2CAD
 
+More models to showcase where time and mesh generation is better for my algorithm:
+- 40038
+- 40037
+- 
 Automatic Reconstruction of Topology Optimization to Editable CAD Models - What about this paper?
 BrepGaussian - What about this paper?
 

@@ -276,7 +276,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
                 spacing=spacings[idx],
                 cluster_tree=cluster_trees[idx],
                 inr_fit_kwargs={
-                    "max_steps": 3000,
+                    "max_steps": 5000,
                     "noise_magnitude_3d": 0.05,
                     "noise_magnitude_uv": 0.05,
                     "initial_lr": 1e-1,
