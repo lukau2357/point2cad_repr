@@ -198,14 +198,26 @@ uv_alpha... Improve mesh for freeforms...
 - 00470 - tangent intersection curves
 - 00417 - tangent surfaces
 - 00475 - Showcase meshes, mine vs Point2CAD
-- 40024 - Interesting freeform, perhaps good for INR experimentation?
-- 40050 - Probably my algorithm will produce a better mesh than original Point2CAD
-
-More models to showcase where time and mesh generation is better for my algorithm:
-- 40038
-- 40037
-- 
 Automatic Reconstruction of Topology Optimization to Editable CAD Models - What about this paper?
 BrepGaussian - What about this paper?
 
-Loss regularizer experiment: Do not forget weight annealing!
+Notes for today's meeting:
+  - Best I can do is proxy STEP files, it remains to be seen if they are useful.
+  - Showcase mine vs original Point2CAD for primitives-only, implementation speedup.
+  - Showcase mine vs original point2cad on freeforms. I noticed that INR was undertrained so I increased
+    the number of training steps. Have an idea how to regularize the INR for mesh generation, but after training
+    it sufficiently so far I have not observed mesh deviatiosn in unexplored UV areas.
+  - Also mention that original Point2CAD cloned from github can suffer OOM, another drawback of inefficient implementation.
+  - Compare with original Point2CAD results.
+
+  - More models to showcase where time and mesh generation is better for my algorithm:
+    - 00475 (primitives only, much faster and more mathematically principled fitting + better mesh)
+    - 40024 (slower mesh generation due to increased time of INR training, but much better mesh overall)
+    - 40038 (primitives only)
+    - 40037 (primitives only)
+    - 40050 (freeform of original point2cad is more consistent with the original point cloud, although there are strange mesh artifacts)
+    - 40052 (primitives only, both good but my algorithm is faster)
+    - 40060 (primitives only)
+    - 
+
+  https://grabcad.com/library/engine-by-inventor-1

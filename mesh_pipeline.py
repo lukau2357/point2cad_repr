@@ -178,7 +178,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
 
     np_rng = np.random.default_rng(args.seed)
     tm = args.threshold_multiplier
-    abs_th = 0.1 if args.trimming_mode == "absolute" else None
+    abs_th = 0.1
 
     out_dir = os.path.join(args.output_dir, args.model_id, f"part_{part_idx}")
 
@@ -276,7 +276,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
                 spacing=spacings[idx],
                 cluster_tree=cluster_trees[idx],
                 inr_fit_kwargs={
-                    "max_steps": 5000,
+                    "max_steps": args.inr_max_steps,
                     "noise_magnitude_3d": 0.05,
                     "noise_magnitude_uv": 0.05,
                     "initial_lr": 1e-1,
@@ -294,7 +294,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
                 cone_mesh_kwargs={"dim_theta": 200, "dim_height": 200,
                                   "threshold_multiplier": tm, "cone_height_margin": 0.5, "spacing": spacings[idx],
                                   "absolute_threshold": abs_th},
-                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": 0.1, "threshold_multiplier": tm, "spacing": spacings[idx]},
+                inr_mesh_kwargs={"mesh_dim": 200, "uv_margin": args.inr_uv_margin, "threshold_multiplier": tm, "spacing": spacings[idx]},
                 radius_inflation=0.001
             )
 
@@ -430,14 +430,15 @@ def run_visualize(args):
         sm_path = os.path.join(unified_dir, f"surface_mesh_{i}.npz")
         if os.path.exists(sm_path):
             d = np.load(sm_path)
-            mesh = o3d.geometry.TriangleMesh()
-            mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
-            mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
-            mesh.compute_vertex_normals()
-            mesh.paint_uniform_color(scolor)
-            surface_meshes.append(mesh)
-            label = str(cluster_labels[i]) if cluster_labels is not None else f"cluster_{i}"
-            surface_labels.append(f"{label} ({stype})")
+            if len(d["vertices"]) > 0:
+                mesh = o3d.geometry.TriangleMesh()
+                mesh.vertices  = o3d.utility.Vector3dVector(d["vertices"])
+                mesh.triangles = o3d.utility.Vector3iVector(d["triangles"])
+                mesh.compute_vertex_normals()
+                mesh.paint_uniform_color(scolor)
+                surface_meshes.append(mesh)
+                label = str(cluster_labels[i]) if cluster_labels is not None else f"cluster_{i}"
+                surface_labels.append(f"{label} ({stype})")
 
         tm_path = os.path.join(unified_dir, f"trimmed_mesh_{i}.npz")
         if os.path.exists(tm_path):
@@ -719,6 +720,10 @@ if __name__ == "__main__":
                         help="Octree depth for screened Poisson reconstruction (higher = finer detail)")
     parser.add_argument("--poisson_density_quantile", type=float, default=0.02,
                         help="Remove Poisson vertices below this density quantile (trims outer artifacts)")
+    parser.add_argument("--inr_max_steps", type=int, default=5000,
+                        help="Number of training steps per INR (u,v) closedness combo")
+    parser.add_argument("--inr_uv_margin", type=float, default=0.1,
+                        help="Fractional UV margin used when sampling the INR mesh beyond the encoded UV bounding box")
     args = parser.parse_args()
 
     if args.visualize:

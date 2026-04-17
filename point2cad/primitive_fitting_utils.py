@@ -151,12 +151,12 @@ def alpha_shape_trimming(uv_points, size_u, size_v, uv_bb_min, uv_bb_max, alpha=
 
 def grid_trimming(cluster, vertices, size_u, size_v, device,
                    threshold_multiplier=3.0, spacing_percentile=90,
-                   spacing=None, absolute_threshold=None):
+                   spacing=None, absolute_threshold=0.1):
     """Keep mesh cells whose mean lies within threshold of the cluster.
 
-    If ``absolute_threshold`` is provided, it is used directly as the distance
-    cutoff (Point2CAD uses 0.1 for all surface types).  Otherwise the adaptive
-    formula ``threshold = threshold_multiplier * spacing`` is used.
+    Uses min(absolute_threshold, threshold_multiplier * spacing) as the cutoff.
+    The absolute ceiling (default 0.1, matching Point2CAD's fixed threshold)
+    guards against right-tilted NN distributions inflating the adaptive value.
     """
     grid = vertices.reshape(size_u, size_v, -1)
     grid = grid[:, :, np.newaxis, :]
@@ -168,15 +168,7 @@ def grid_trimming(cluster, vertices, size_u, size_v, device,
     cell_means = cell_means.permute(2, 3, 1, 0).squeeze(-2)
     cluster = torch.tensor(cluster, dtype = torch.float32, device = device)
 
-    if absolute_threshold is not None:
-        threshold = absolute_threshold
-    else:
-        if spacing is None:
-            cluster_dists = torch.cdist(cluster, cluster)
-            cluster_dists.fill_diagonal_(float("inf"))
-            nn_dists = cluster_dists.min(dim = -1).values
-            spacing = torch.quantile(nn_dists, spacing_percentile / 100.0).item()
-        threshold = threshold_multiplier * spacing
+    threshold = min(absolute_threshold, threshold_multiplier * spacing)
 
     cell_means = cell_means.reshape((-1, 3))
     D = torch.cdist(cell_means, cluster)
@@ -225,7 +217,12 @@ def triangulate_and_mesh(vertices, size_u, size_v, surface_type, mask = None):
     color = get_surface_color(surface_type)
     mesh.paint_uniform_color(color)
 
-    trimesh_mesh = trimesh.Trimesh(vertices, triangles)
+    # Build trimesh from o3d's post-prune buffers so both copies share the same
+    # vertex/triangle indexing; otherwise _inflate_mesh sees mismatched shapes
+    # when grid_trimming rejects most cells (e.g. tiny clusters on a 200x200 grid).
+    # trimesh_mesh = trimesh.Trimesh(vertices, triangles)
+    trimesh_mesh = trimesh.Trimesh(np.asarray(mesh.vertices),
+                                   np.asarray(mesh.triangles))
     return mesh, trimesh_mesh
 
 def plane_error(points, a, d):
