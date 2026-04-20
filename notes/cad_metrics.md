@@ -10,22 +10,37 @@ All metrics computed in **normalized space** (per-part PCA + unit cube), with th
 
 ---
 
-## 1. P-coverage (global, ParseNet / Point2CAD style)
+## 1. P-coverage (both directions, ParseNet / Point2CAD style + reverse)
 
-$$P_{\text{cov}} = \frac{1}{|P|} \sum_{k=1}^{|P|} \mathbb{I}\!\left[d(p_k,\, S^r) \leq r\right], \qquad r = 0.01$$
+Two thresholded directions at the same radius $r = 0.01$, computed in normalized space.
+
+### 1a. PC → Mesh (standard)
+
+$$P^{\text{p2m}}_{\text{cov}} = \frac{1}{|P|} \sum_{k=1}^{|P|} \mathbb{I}\!\left[d(p_k,\, M) \leq r\right]$$
 
 - $P$ = input point cloud (all clusters merged).
-- $S^r$ = **union of all clipped reconstructed meshes** — label-free.
-- $d(p_k, S^r) = \min_{T \in F_{\text{union}}} d(p_k, T)$, exact point-to-triangle.
-- Computed via `igl.point_mesh_squared_distance(input_pts, V_union, F_union)`, take square root, threshold at $r$.
+- $M$ = **union of all clipped reconstructed meshes** — label-free.
+- $d(p_k, M) = \min_{T \in F_M} d(p_k, T)$, exact point-to-triangle distance.
+- Computed via `trimesh.proximity.closest_point(M, P)` which uses an AABB-accelerated per-triangle closest-point query and returns Euclidean (not squared) distances directly — thresholded at $r$ without an extra square-root step.
+
+### 1b. Mesh → PC (reverse — hallucination rate)
+
+$$P^{\text{m2p}}_{\text{cov}} = \frac{1}{N} \sum_{i=1}^{N} \mathbb{I}\!\left[\min_{p \in P} \|q_i - p\|_2 \leq r\right]$$
+
+- $\{q_i\}_{i=1}^N$ = uniform-area samples from $M$ (same sample set used for the Mesh→PC Chamfer term, §3).
+- Interpretation: fraction of mesh surface within $r$ of any input point. The complement $1 - P^{\text{m2p}}_{\text{cov}}$ is the share of mesh area that lives far from the input cloud — spurious lobes / overfitting bumps.
+- Not in the ParseNet / Point2CAD formulation; added here because the standard (PC→Mesh) direction rewards meshes that overfit to noisy input. On 40024 Point2CAD scores $P^{\text{p2m}}_{\text{cov}} \approx 0.999$ but $P^{\text{m2p}}_{\text{cov}} \approx 0.517$ — almost half its mesh surface does not correspond to any input point.
 
 ### Why global, not per-cluster
 
 ParseNet's formulation is unambiguous: $\mathbb{I}[\min_{k=1..K} D(p_i, s_k) < \varepsilon]$ — explicit minimum over all $K$ fitted surfaces, i.e. distance to the union. Point2CAD follows ParseNet but drops the index in the formula; the prose ("$S$ is all CAD reconstruction surfaces") confirms the global reading. A per-cluster variant was considered and rejected: it would be nearly redundant with per-cluster residual error (same correspondence, just thresholded vs averaged) and would collapse the only label-free signal in the suite.
 
-### What it catches
+### What each catches
 
-Under-coverage of the input cloud — regions where no reconstructed surface comes within $r$. Robust to label/cluster permutations because labels are not used.
+- **PC→Mesh**: under-coverage — input regions no reconstructed surface reached.
+- **Mesh→PC**: over-extension / hallucination — mesh area that doesn't correspond to any input point.
+
+Robust to label/cluster permutations because labels are not used.
 
 ---
 
@@ -36,7 +51,8 @@ $$\text{Err}_i = \frac{1}{N_i} \sum_{s_{i,k} \in S_i^{gt}} d(s_{i,k},\, S_i^r), 
 - $S_i^{gt}$ proxied by **input cloud points labeled $i$** (no GT mesh available).
 - $S_i^r$ = the reconstructed mesh for cluster $i$ only — **not** the union.
 - $N_i$ = number of input points in cluster $i$.
-- Final scalar: per-cluster mean, then averaged uniformly over clusters (not weighted by point count).
+- $d(s_{i,k}, S_i^r)$ = exact point-to-triangle distance via `trimesh.proximity.closest_point(mesh_i, pts_i)` (Euclidean, AABB-accelerated).
+- Final scalar: per-cluster mean, then averaged uniformly over clusters (not weighted by point count). Clusters with a missing or empty reconstructed mesh are dropped from the average and reported separately.
 
 ### Honest disclosure
 
@@ -60,19 +76,21 @@ where $M$ = union of clipped meshes, $\{q_i\}_{i=1}^{N}$ are uniform area-weight
 
 **PC → Mesh** (left term): exact, no mesh sampling needed.
 
-$$\frac{1}{|P|}\sum_{p \in P} d(p, M) \quad\text{via}\quad \texttt{igl.point\_mesh\_squared\_distance}$$
+$$\frac{1}{|P|}\sum_{p \in P} d(p, M) \quad\text{via}\quad \texttt{trimesh.proximity.closest\_point}$$
 
-This direction is closed-form because point-to-triangle distance has a closed form (see below). `igl` accelerates the per-triangle search with an AABB tree.
+This direction is closed-form because point-to-triangle distance has a closed form (see below). `trimesh` accelerates the per-triangle search with an AABB tree and returns Euclidean distances directly — the same distance vector is reused for the PC→Mesh P-coverage threshold (§1a).
 
 **Mesh → PC** (right term): Monte Carlo approximation of the surface integral.
 
 $$\frac{1}{\text{Area}(M)} \int_M \min_{p \in P} \|q - p\|_2 \, dq \;\approx\; \frac{1}{N}\sum_{i=1}^{N} \min_{p \in P} \|q_i - p\|_2$$
 
-This integral has no closed form because $\min_{p \in P}\|q - p\|$ is piecewise-defined (Voronoi cells of $P$). Approximated by sampling $M$ uniformly via `trimesh.sample.sample_surface_even(M, N)` (Poisson-disk variant, lower variance than plain area-weighted) and KD-tree nearest neighbor in $P$.
+This integral has no closed form because $\min_{p \in P}\|q - p\|$ is piecewise-defined (Voronoi cells of $P$). Since $P$ is a discrete point set (not a mesh), the inner minimum is a point-to-point distance and is computed via `scipy.spatial.cKDTree(P).query(samples, k=1)` — not a point-to-triangle distance.
+
+The sample set $\{q_i\}$ is drawn by `trimesh.sample.sample_surface_even(M, N)` (Poisson-disk variant, lower variance than plain area-weighted); if the even sampler returns zero samples (can happen on degenerate meshes), the code falls back to `trimesh.sample.sample_surface(M, N)`. The same sample set is reused for the Mesh→PC P-coverage threshold (§1b).
 
 ### Sample count
 
-$N = \max(|P|,\, 100\,000)$, **same $N$ for both pipelines**. Variance of the Monte Carlo estimator is $O(1/N)$; in practice doubling $N$ should not change the reported number meaningfully.
+$N = 30\,000$, **same $N$ for both pipelines**. Variance of the Monte Carlo estimator is $O(1/N)$; doubling $N$ should not change the reported number meaningfully.
 
 ### What it catches
 
@@ -93,7 +111,7 @@ The infimum is achieved (mesh is closed) and reduces to a minimum over triangles
 3. If all barycentrics $\in [0,1]$, the projection lies inside the triangle and $d(p,T) = \|p - p'\|$.
 4. Otherwise the closest point is on an edge or vertex; clamp the barycentrics and recompute.
 
-`igl.point_mesh_squared_distance` does this with an AABB tree so the per-query cost is logarithmic in $|F|$ rather than linear. **Exact, no discretization error** — the only place sampling enters the metric suite is the Mesh→PC chamfer direction, and that's a Monte Carlo integral over the surface, not a discretization of the distance function.
+`trimesh.proximity.closest_point` does this with an AABB tree so the per-query cost is logarithmic in $|F|$ rather than linear, and returns Euclidean distances directly (no squared-distance intermediate). **Exact, no discretization error** — the only places sampling enters the metric suite are the Mesh→PC chamfer direction and the Mesh→PC P-coverage direction, both of which use the same surface Monte Carlo samples.
 
 ---
 
@@ -101,7 +119,8 @@ The infimum is achieved (mesh is closed) and reduces to a minimum over triangles
 
 | Metric | Label-aware? | Continuous? | Direction | Catches |
 |---|---|---|---|---|
-| P-coverage | No (union) | No (binary) | PC → mesh | Under-coverage of input cloud |
+| P-coverage (PC→Mesh) | No (union) | No (binary) | PC → mesh | Under-coverage of input cloud |
+| P-coverage (Mesh→PC) | No (union) | No (binary) | mesh → PC | Over-extension / hallucination (spurious mesh regions) |
 | Per-cluster residual | Yes | Yes | PC → cluster mesh | Per-surface fit quality, mis-clipping |
 | Symmetric chamfer | No (union) | Yes | Both | Under- and over-extension of reconstruction |
 
@@ -118,9 +137,10 @@ Discarded alternatives:
 
 ## Reporting checklist
 
-- All 3 metrics computed in normalized space (unit cube), same per-part normalization on both pipelines.
-- State $r = 0.01$ for P-coverage.
-- State $N$ (mesh sample count) for chamfer.
+- All metrics computed in normalized space (unit cube), same per-part normalization on both pipelines.
+- State $r = 0.01$ for both P-coverage directions.
+- Report both P-coverage directions (PC→Mesh and Mesh→PC); the asymmetry is part of the story.
+- State $N = 30\,000$ (mesh sample count) for Chamfer and Mesh→PC P-coverage (same samples).
 - For residual error, disclose GT-proxy = segmented input points.
 - Report per-part numbers and dataset averages.
 - Symmetric chamfer reported as the average of the two directions (state explicitly that it's the average, not the sum).

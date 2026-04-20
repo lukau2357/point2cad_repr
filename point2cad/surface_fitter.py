@@ -1,8 +1,14 @@
 import time
 
+import igl
 import numpy as np
 import open3d as o3d
 import trimesh
+from scipy.interpolate import (
+    LinearNDInterpolator, NearestNDInterpolator, RectBivariateSpline,
+)
+from scipy.spatial import cKDTree
+from scipy.spatial.distance import pdist, squareform
 
 from .inr_fitting import fit_inr
 from .primitive_fitting import fit_plane_numpy, fit_sphere_numpy, fit_cylinder_optimized, fit_cone
@@ -215,75 +221,123 @@ def generate_bpa_mesh(cluster, spacing):
     return bpa_mesh, trimesh_mesh
 
 
-def generate_spectral_rbf_mesh(cluster, mesh_dim=50, uv_margin=0.1, rbf_kernel="thin_plate_spline"):
-    """Spectral embedding → RBF interpolation → mesh.
+def generate_bpa_bspline_mesh(cluster, spacing, grid_dim=50, output_dim=50,
+                              kx=3, ky=3, smoothing=0):
+    """BPA mesh -> LSCM UV -> grid resample -> tensor-product B-spline -> mesh.
 
-    1. SpectralEmbedding on the raw 3D point cloud → (u, v) per point
-    2. RBFInterpolator: (u, v) → (x, y, z), uses all points, no downsampling
-    3. Evaluate on extended UV grid → mesh
+    Pipeline:
+      1. Ball-pivoting mesh from the cluster (radii = [d, 2d, 4d])
+      2. Largest connected component; require disk topology (single boundary loop)
+      3. LSCM parameterization with two farthest boundary verts pinned
+      4. Regular UV grid covering the LSCM range
+         -> 3D via LinearNDInterpolator (barycentric) inside the UV convex hull,
+            NearestNDInterpolator for cells outside the hull (so the grid is full
+            for the tensor-product spline fit)
+      5. RectBivariateSpline per XYZ channel
+      6. Evaluate on the same grid for the output mesh; drop triangles whose
+         UV corners lie outside the LSCM convex hull.
     """
-    from scipy.spatial import cKDTree
-    from scipy.interpolate import RBFInterpolator
-    from sklearn.manifold import SpectralEmbedding
+    bpa_mesh, _ = generate_bpa_mesh(cluster, spacing)
+    V = np.asarray(bpa_mesh.vertices)
+    F = np.asarray(bpa_mesh.triangles)
 
-    n_pts = len(cluster)
+    tm = trimesh.Trimesh(V, F, process=False)
+    components = tm.split(only_watertight=False)
+    if len(components) == 0:
+        raise RuntimeError("BPA produced no valid components")
+    largest = max(components, key=lambda m: len(m.vertices))
+    V = np.asarray(largest.vertices, dtype=np.float64)
+    F = np.asarray(largest.faces, dtype=np.int32)
 
-    # Step 1: Spectral embedding → UV parameterization
-    print(f"  [spectral] step 1/3: spectral embedding ({n_pts} pts) ...", flush=True)
-    se = SpectralEmbedding(n_components=2, n_neighbors=min(20, n_pts - 1))
-    uv = se.fit_transform(cluster)
-    print(f"  [spectral] UV range: u=[{uv[:, 0].min():.6f}, {uv[:, 0].max():.6f}]  "
-          f"v=[{uv[:, 1].min():.6f}, {uv[:, 1].max():.6f}]")
+    boundary = igl.boundary_loop(F)
+    if boundary is None or len(boundary) == 0:
+        raise RuntimeError("Mesh has no boundary loop — not disk topology")
 
-    # Step 2: RBF interpolation (u, v) → (x, y, z)
-    print(f"  [spectral] step 2/3: RBF fitting (kernel={rbf_kernel}, {n_pts} pts) ...", flush=True)
-    rbf = RBFInterpolator(uv, cluster, kernel=rbf_kernel)
+    # Pin the two farthest boundary vertices at (0,0) and (1,0).
+    b_pts = V[boundary]
+    dmat = squareform(pdist(b_pts))
+    i_max, j_max = np.unravel_index(np.argmax(dmat), dmat.shape)
+    b = np.array([boundary[i_max], boundary[j_max]], dtype=np.int32)
+    bc = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
 
-    fitted = rbf(uv)
-    residual = np.mean(np.linalg.norm(fitted - cluster, axis=1))
-    print(f"  [spectral] fit residual: {residual:.6f}")
+    result = igl.lscm(V, F, b, bc)
+    uv = result[0] if isinstance(result, tuple) else result
+    if hasattr(uv, "toarray"):
+        uv = uv.toarray()
+    uv = np.asarray(uv, dtype=np.float64)
+    if uv.shape != (V.shape[0], 2):
+        raise RuntimeError(
+            f"igl.lscm returned unexpected UV shape {uv.shape}; expected ({V.shape[0]}, 2)"
+        )
 
-    # Step 3: Evaluate on extended UV grid for mesh
-    print(f"  [spectral] step 3/3: generating mesh (dim={mesh_dim}, uv_margin={uv_margin}) ...", flush=True)
     u_min, u_max = float(uv[:, 0].min()), float(uv[:, 0].max())
     v_min, v_max = float(uv[:, 1].min()), float(uv[:, 1].max())
-    u_span = u_max - u_min
-    v_span = v_max - v_min
-
-    u_eval = np.linspace(u_min - u_span * uv_margin, u_max + u_span * uv_margin, mesh_dim)
-    v_eval = np.linspace(v_min - v_span * uv_margin, v_max + v_span * uv_margin, mesh_dim)
-    uu, vv = np.meshgrid(u_eval, v_eval, indexing='ij')
+    u_1d = np.linspace(u_min, u_max, grid_dim)
+    v_1d = np.linspace(v_min, v_max, grid_dim)
+    uu, vv = np.meshgrid(u_1d, v_1d, indexing="ij")
     grid_uv = np.column_stack([uu.ravel(), vv.ravel()])
 
-    vertices = rbf(grid_uv)
+    lin = LinearNDInterpolator(uv, V)
+    grid_xyz = lin(grid_uv)
+    nan_mask_flat = np.isnan(grid_xyz).any(axis=1)
+    if nan_mask_flat.any():
+        near = NearestNDInterpolator(uv, V)
+        grid_xyz[nan_mask_flat] = near(grid_uv[nan_mask_flat])
+    grid_xyz_2d = grid_xyz.reshape(grid_dim, grid_dim, 3)
 
-    # Triangulate the regular grid
+    spline_x = RectBivariateSpline(u_1d, v_1d, grid_xyz_2d[:, :, 0], kx=kx, ky=ky, s=smoothing)
+    spline_y = RectBivariateSpline(u_1d, v_1d, grid_xyz_2d[:, :, 1], kx=kx, ky=ky, s=smoothing)
+    spline_z = RectBivariateSpline(u_1d, v_1d, grid_xyz_2d[:, :, 2], kx=kx, ky=ky, s=smoothing)
+
+    u_out = np.linspace(u_min, u_max, output_dim)
+    v_out = np.linspace(v_min, v_max, output_dim)
+    X = spline_x(u_out, v_out, grid=True)
+    Y = spline_y(u_out, v_out, grid=True)
+    Z = spline_z(u_out, v_out, grid=True)
+    verts = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+
+    uu_o, vv_o = np.meshgrid(u_out, v_out, indexing="ij")
+    out_uv = np.column_stack([uu_o.ravel(), vv_o.ravel()])
+    # Drop UV cells outside the LSCM convex hull (NaN from LinearNDInterpolator).
+    hull_vals = lin(out_uv)
+    out_mask_flat = np.isnan(hull_vals).any(axis=1)
+
     triangles = []
-    for i in range(mesh_dim - 1):
-        for j in range(mesh_dim - 1):
-            v0 = i * mesh_dim + j
-            v1 = (i + 1) * mesh_dim + j
-            v2 = (i + 1) * mesh_dim + (j + 1)
-            v3 = i * mesh_dim + (j + 1)
+    for i in range(output_dim - 1):
+        for j in range(output_dim - 1):
+            v0 = i * output_dim + j
+            v1 = (i + 1) * output_dim + j
+            v2 = (i + 1) * output_dim + (j + 1)
+            v3 = i * output_dim + (j + 1)
+            if (out_mask_flat[v0] or out_mask_flat[v1]
+                    or out_mask_flat[v2] or out_mask_flat[v3]):
+                continue
             triangles.append([v0, v1, v2])
             triangles.append([v0, v2, v3])
-    triangles = np.array(triangles)
+    triangles = (np.array(triangles, dtype=np.int64)
+                 if len(triangles) > 0 else np.zeros((0, 3), dtype=np.int64))
 
     o3d_mesh = o3d.geometry.TriangleMesh()
-    o3d_mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    o3d_mesh.vertices = o3d.utility.Vector3dVector(verts)
     o3d_mesh.triangles = o3d.utility.Vector3iVector(triangles)
     o3d_mesh.remove_unreferenced_vertices()
     o3d_mesh.compute_vertex_normals()
-    color = get_surface_color("inr")
+    color = get_surface_color("bspline")
     o3d_mesh.paint_uniform_color(color)
 
-    trimesh_mesh = trimesh.Trimesh(vertices, triangles)
+    kept_verts = np.asarray(o3d_mesh.vertices)
+    kept_faces = np.asarray(o3d_mesh.triangles)
+    trimesh_mesh = trimesh.Trimesh(kept_verts, kept_faces, process=False)
 
-    # Error: cluster → mesh
-    mesh_tree = cKDTree(vertices)
-    dists, _ = mesh_tree.query(cluster)
-    error = float(np.mean(dists))
-    print(f"  [spectral] error={error:.6f}")
+    if len(kept_verts) > 0 and len(kept_faces) > 0:
+        # cluster -> nearest point on the mesh surface (per-triangle projection),
+        # not just nearest vertex. Matches the "perpendicular distance to surface"
+        # direction used by the primitive and INR error metrics.
+        _, dists, _ = trimesh.proximity.closest_point(trimesh_mesh, cluster)
+        error = float(np.mean(dists))
+    else:
+        error = float("inf")
+    print(f"  [bpa_bspline] error={error:.6f}")
 
     return o3d_mesh, trimesh_mesh, error
 
@@ -382,7 +436,6 @@ def fit_surface(cluster,
         print(f"  [surface fitter] generating BPA mesh ...")
         bpa_mesh, bpa_trimesh = generate_bpa_mesh(cluster, spacing)
         mesh_verts = np.asarray(bpa_mesh.vertices)
-        from scipy.spatial import cKDTree
         mesh_tree = cKDTree(mesh_verts)
         dists, _ = mesh_tree.query(cluster)
         bpa_error = float(np.mean(dists))
@@ -397,17 +450,18 @@ def fit_surface(cluster,
         return {"surface_id": SURFACE_INR, "result": bpa_result, "mesh": bpa_mesh, "trimesh_mesh": bpa_trimesh, "all_errors": _all_errors,
                 "primitive_fit_time": primitive_fit_time, "freeform_fit_time": freeform_fit_time}
 
-    if freeform_method == "spectral":
-        print(f"  [surface fitter] fitting spectral RBF (spectral embedding → RBF) ...")
-        spec_mesh, spec_trimesh, spec_error = generate_spectral_rbf_mesh(cluster)
-        spec_result = {
-            "surface_type": "spectral",
-            "error": spec_error,
+    if freeform_method == "bpa_bspline":
+        assert spacing is not None, "spacing must be provided for bpa_bspline freeform method"
+        print(f"  [surface fitter] fitting BPA + LSCM + B-spline ...")
+        bs_mesh, bs_trimesh, bs_error = generate_bpa_bspline_mesh(cluster, spacing)
+        bs_result = {
+            "surface_type": "bpa_bspline",
+            "error": bs_error,
             "params": {},
         }
-        _all_errors["spectral"] = spec_error
+        _all_errors["bpa_bspline"] = bs_error
         freeform_fit_time = time.perf_counter() - _t_freeform
-        return {"surface_id": SURFACE_INR, "result": spec_result, "mesh": spec_mesh, "trimesh_mesh": spec_trimesh, "all_errors": _all_errors,
+        return {"surface_id": SURFACE_INR, "result": bs_result, "mesh": bs_mesh, "trimesh_mesh": bs_trimesh, "all_errors": _all_errors,
                 "primitive_fit_time": primitive_fit_time, "freeform_fit_time": freeform_fit_time}
 
     print(f"  [surface fitter] fitting INR ...")

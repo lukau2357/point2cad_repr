@@ -218,6 +218,5 @@ Notes for today's meeting:
     - 40050 (freeform of original point2cad is more consistent with the original point cloud, although there are strange mesh artifacts)
     - 40052 (primitives only, both good but my algorithm is faster)
     - 40060 (primitives only)
-    - 
 
   https://grabcad.com/library/engine-by-inventor-1

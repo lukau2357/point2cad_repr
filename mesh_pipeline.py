@@ -3,12 +3,16 @@ Mesh generation pipeline: fit surfaces, generate meshes, clip (BFS or p2cad-styl
 """
 import argparse
 import glob as _glob
+import json
 import os
 import shutil
 import time
 
 import numpy as np
 import open3d as o3d
+import trimesh
+
+from point2cad.evaluation import compute_part_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +284,8 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
                     "noise_magnitude_3d": 0.05,
                     "noise_magnitude_uv": 0.05,
                     "initial_lr": 1e-1,
+                    "polish": args.inr_polish,
+                    "polish_reg_peak": args.inr_polish_reg_peak,
                     "seed": args.seed,
                 },
                 plane_mesh_kwargs={"mesh_dim": 200, "threshold_multiplier": tm,
@@ -341,13 +347,13 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
     print(f"[timing]   clip: {clip_time:.2f}s")
     print(f"[timing]   sum:  {fit_time + clip_time:.2f}s")
 
-    import json as _json
+    timing_dict = {"fit_time": fit_time,
+                   "primitive_fit_time": primitive_fit_time,
+                   "freeform_fit_time": freeform_fit_time,
+                   "clip_time": clip_time,
+                   "total_time": fit_time + clip_time}
     with open(os.path.join(out_dir, "timing.json"), "w") as _f:
-        _json.dump({"fit_time": fit_time,
-                    "primitive_fit_time": primitive_fit_time,
-                    "freeform_fit_time": freeform_fit_time,
-                    "clip_time": clip_time,
-                    "total_time": fit_time + clip_time}, _f, indent=2)
+        json.dump(timing_dict, _f, indent=2)
 
     combined = o3d.geometry.TriangleMesh()
     for idx, mesh in enumerate(clipped_meshes):
@@ -361,6 +367,48 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
     stl_path = os.path.join(out_dir, "trimmed.stl")
     o3d.io.write_triangle_mesh(stl_path, combined)
     print(f"[mesh] Exported {stl_path}")
+
+    # ---- evaluation metrics (normalized space) ---------------------------
+    if args.clip_only:
+        raw = np.loadtxt(sample_path)
+        pts_world = raw[:, :3]
+        eval_points = ((part_R @ (pts_world - part_mean).T).T / part_scale).astype(np.float32)
+        eval_labels = raw[:, -1].astype(int)
+    else:
+        eval_points = data[:, :3].astype(np.float32)
+        eval_labels = data[:, -1].astype(int)
+
+    tm_meshes = {}
+    for idx, o3d_mesh in enumerate(clipped_meshes):
+        cid = int(unique_clusters[idx])
+        V = np.asarray(o3d_mesh.vertices)
+        F = np.asarray(o3d_mesh.triangles)
+        if len(V) == 0 or len(F) == 0:
+            tm_meshes[cid] = None
+        else:
+            tm_meshes[cid] = trimesh.Trimesh(V, F, process=False)
+
+    surface_types_dict = {int(unique_clusters[i]): surface_type_names[i]
+                          for i in range(len(unique_clusters))}
+
+    metrics = compute_part_metrics(
+        input_points=eval_points,
+        input_labels=eval_labels,
+        cluster_meshes=tm_meshes,
+        surface_types=surface_types_dict,
+        timing=timing_dict,
+        model_id=args.model_id,
+        part_idx=part_idx,
+        seed=args.seed,
+    )
+    with open(os.path.join(out_dir, "metrics.json"), "w") as _f:
+        json.dump(metrics, _f, indent=2)
+    m = metrics["metrics"]
+    print(f"[eval] p_cov_p2m={m['p_coverage']:.4f}  "
+          f"p_cov_m2p={m['p_coverage_mesh_to_pc']:.4f}  "
+          f"resid_mean={m['residual_mean']}  "
+          f"chamfer_sym={m['chamfer_sym']}  "
+          f"primitive_only={metrics['is_primitive_only']}")
 
     cluster_colors = np.array([get_surface_color(stype) for stype in surface_type_names])
     np.savez(os.path.join(out_dir, "metadata.npz"),
@@ -451,9 +499,9 @@ def run_visualize(args):
                 mesh.paint_uniform_color(scolor)
                 clipped_combined += mesh
 
-    # ---- Per-part timings (mine + original Point2CAD if present) ---------
+    # ---- Per-part timings + metrics (mine + original Point2CAD if present) ---
     import json as _json
-    def _load_timing(path):
+    def _load_json(path):
         if os.path.isfile(path):
             try:
                 with open(path) as f:
@@ -467,12 +515,15 @@ def run_visualize(args):
         if d.startswith("part_") and os.path.isdir(os.path.join(model_root, d))
     )
     mine_timings, orig_timings = [], []
+    mine_metrics, orig_metrics = [], []
     orig_root = os.path.join("..", "point2cad", "output_p2cad_orig", args.model_id)
 
     for pd in part_dirs:
         part_dir = os.path.join(model_root, pd)
-        mine_timings.append((pd, _load_timing(os.path.join(part_dir, "timing.json"))))
-        orig_timings.append((pd, _load_timing(os.path.join(orig_root, pd, "timing.json"))))
+        mine_timings.append((pd, _load_json(os.path.join(part_dir, "timing.json"))))
+        orig_timings.append((pd, _load_json(os.path.join(orig_root, pd, "timing.json"))))
+        mine_metrics.append((pd, _load_json(os.path.join(part_dir, "metrics.json"))))
+        orig_metrics.append((pd, _load_json(os.path.join(orig_root, pd, "metrics.json"))))
 
     # ---- Original Point2CAD outputs (per-cluster plys + types.json) ------
     def _load_orig(kind):
@@ -578,6 +629,32 @@ def run_visualize(args):
     if orig_tot['sum'] > 0 and mine_tot['sum'] > 0:
         print(f"  speedup (orig/mine): {orig_tot['sum'] / mine_tot['sum']:.2f}x")
     print()
+
+    # ---- Per-part fidelity metrics ---------------------------------------
+    def _mfmt(v, width=10, prec=4):
+        if v is None:
+            return "-".rjust(width)
+        return f"{v:{width}.{prec}f}"
+
+    def _metric_row(label, mj):
+        if mj is None:
+            dash = "-".rjust(10)
+            return f"{label:>16}: {dash} {dash} {dash} {dash}"
+        m = mj.get("metrics", {})
+        return (f"{label:>16}: "
+                f"{_mfmt(m.get('p_coverage'), 10, 4)} "
+                f"{_mfmt(m.get('p_coverage_mesh_to_pc'), 10, 4)} "
+                f"{_mfmt(m.get('residual_mean'), 10, 6)} "
+                f"{_mfmt(m.get('chamfer_sym'), 10, 6)}")
+
+    if any(mj is not None for _, mj in mine_metrics + orig_metrics):
+        print("[metrics] === per-part fidelity metrics ===")
+        print(f"{'':>16}   {'p_cov_p2m':>10} {'p_cov_m2p':>10} {'resid_mean':>10} {'chamfer_sym':>10}")
+        for (pd, mj), (_, oj) in zip(mine_metrics, orig_metrics):
+            print(f"  {pd}")
+            print("  " + _metric_row("mine", mj))
+            print("  " + _metric_row("orig p2cad", oj))
+        print()
 
     # ---- N/P cycling over `surface_meshes` -------------------------------
     _highlight = {"idx": -1}
@@ -698,9 +775,10 @@ if __name__ == "__main__":
                         help="Percentile of intra-cluster NN distances used as spacing "
                              "for the post-BFS filter (default 100 = max NN distance)")
     parser.add_argument("--freeform_method", type=str, default="inr",
-                        choices=["inr", "bpa", "spectral"],
+                        choices=["inr", "bpa", "bpa_bspline"],
                         help="How to handle freeform clusters: 'inr' (neural autoencoder), "
-                             "'bpa' (Ball Pivoting Algorithm), or 'spectral' (spectral embedding → bisplrep B-spline)")
+                             "'bpa' (Ball Pivoting mesh only), or 'bpa_bspline' "
+                             "(BPA -> LSCM -> RectBivariateSpline tensor-product B-spline)")
     parser.add_argument("--seed", type=int, default=41,
                         help="Reproducibility seed")
     parser.add_argument("--clip_method", type=str, default="p2cad",
@@ -724,6 +802,11 @@ if __name__ == "__main__":
                         help="Number of training steps per INR (u,v) closedness combo")
     parser.add_argument("--inr_uv_margin", type=float, default=0.1,
                         help="Fractional UV margin used when sampling the INR mesh beyond the encoded UV bounding box")
+    parser.add_argument("--inr_polish", action="store_true",
+                        help="Run a post-training polish phase on the best INR "
+                             "with Taylor-smoothness regularization over the UV margin / alpha-shape reject region")
+    parser.add_argument("--inr_polish_reg_peak", type=float, default=0.01,
+                        help="Peak regularization weight at the end of the polish ramp (0 -> reg_peak)")
     args = parser.parse_args()
 
     if args.visualize:

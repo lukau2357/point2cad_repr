@@ -7,9 +7,10 @@ import tqdm
 import time
 import trimesh
 
+from scipy.spatial import cKDTree
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import TensorDataset, DataLoader
-from .primitive_fitting_utils import triangulate_and_mesh, grid_trimming
+from .primitive_fitting_utils import triangulate_and_mesh, grid_trimming, alpha_shape_trimming
 
 def encoder_to_uv(output, is_closed):
     # [B, 2] => [B, 1], depending on open/closed parameter configuration
@@ -64,16 +65,25 @@ def inr_error(data_loader, model, cluster_mean, cluster_scale):
     # (X + m) - (Xhat + m); cluster_scale is a positive scalar that factors out of
     # the per-point norm. So we can compute the norm in the normalized space and
     # rescale once at the end, avoiding per-batch device→host syncs.
+    # Own the mode switch: BN must use running stats during eval, and training
+    # forwards must not be polluted by eval-time batch-stat updates. Restore the
+    # caller's prior mode on exit so this is safe to call mid-training.
+    was_training = model.training
+    model.eval()
     total_error = None
     total_points = 0
-    with torch.no_grad():
-        for batch in data_loader:
-            X = batch[0]
-            Xhat, _ = model.forward(X)
-            per_point = torch.linalg.norm(X - Xhat, dim=-1)
-            batch_sum = per_point.sum()
-            total_error = batch_sum if total_error is None else total_error + batch_sum
-            total_points += per_point.shape[0]
+    try:
+        with torch.no_grad():
+            for batch in data_loader:
+                X = batch[0]
+                Xhat, _ = model.forward(X)
+                per_point = torch.linalg.norm(X - Xhat, dim=-1)
+                batch_sum = per_point.sum()
+                total_error = batch_sum if total_error is None else total_error + batch_sum
+                total_points += per_point.shape[0]
+    finally:
+        if was_training:
+            model.train()
 
     return ((total_error / total_points) * cluster_scale).item()
     
@@ -318,7 +328,8 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
             warmup_steps_ratio = 0.05,
             initial_lr = 1e-2,
             noise_magnitude_3d = 0.005,
-            noise_magnitude_uv = 0.005):
+            noise_magnitude_uv = 0.005,
+            eval_every = 5):
     start = time.time()
 
     model = INRNetwork(**network_parameters, is_u_closed = is_u_closed, is_v_closed = is_v_closed)
@@ -327,18 +338,25 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
     warmup_steps = int(max_steps * warmup_steps_ratio)
     scheduler = LinearWarmupCosineAnnealingLR(optimizer, warmup_steps, max_steps)
 
+    # Dedicated eval loader. shuffle=False + no generator so mid-training eval
+    # passes do not perturb `dl`'s shared torch.Generator (which drives the
+    # infinite training iterator via dl_generator).
+    eval_dl = DataLoader(dl.dataset, batch_size=dl.batch_size,
+                         shuffle=False, drop_last=False)
+
     loop = tqdm.tqdm(range(max_steps), desc="Training the INR network",
                      disable=not sys.stderr.isatty())
 
-    best_proxy = float("inf")
+    # Old epoch-mean L1-on-noised-inputs proxy — biased by the noise schedule
+    # (anneals to 0 at the last step, which almost always wins). Replaced with
+    # periodic L2-on-clean-inputs eval over the full cluster.
+    # best_proxy = float("inf")
+    # epoch_loss_sum = torch.zeros((), device=device)
+    # epoch_step_count = 0
+
+    best_error = float("inf")
     best_state_dict = None
     best_step = -1
-    # GPU-side accumulator; synced only at epoch boundaries.
-    epoch_loss_sum = torch.zeros((), device=device)
-    epoch_step_count = 0
-    # Old per-step L2-eval tracking (kept for reference):
-    # best_error = float("inf")
-    # eval_every = 3
 
     for i, _ in enumerate(loop):
         noise_schedule = (max_steps - 1 - i) / (max_steps - 1)
@@ -366,28 +384,26 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
         optimizer.step()
         scheduler.step()
 
-        epoch_loss_sum = epoch_loss_sum + recon_loss.detach()
-        epoch_step_count += 1
-
-        is_epoch_end = (epoch_step_count == steps_per_epoch)
-        is_last_step = (i == max_steps - 1)
-        if is_epoch_end or is_last_step:
-            epoch_mean_loss = (epoch_loss_sum / epoch_step_count).item()
-            if epoch_mean_loss < best_proxy:
-                best_proxy = epoch_mean_loss
-                best_step = i
-                best_state_dict = copy.deepcopy(model.state_dict())
-            epoch_loss_sum = torch.zeros((), device=device)
-            epoch_step_count = 0
-
-        # Old per-step L2-eval loop (superseded by epoch-mean L1 proxy above):
-        # if i % eval_every == 0 or i == max_steps - 1:
-        #     step_error = inr_error(dl, model, cluster_mean, cluster_scale)
-        #     if step_error < best_error:
-        #         best_error = step_error
+        # Old proxy update (epoch-mean L1 on noised inputs):
+        # epoch_loss_sum = epoch_loss_sum + recon_loss.detach()
+        # epoch_step_count += 1
+        # is_epoch_end = (epoch_step_count == steps_per_epoch)
+        # is_last_step = (i == max_steps - 1)
+        # if is_epoch_end or is_last_step:
+        #     epoch_mean_loss = (epoch_loss_sum / epoch_step_count).item()
+        #     if epoch_mean_loss < best_proxy:
+        #         best_proxy = epoch_mean_loss
         #         best_step = i
         #         best_state_dict = copy.deepcopy(model.state_dict())
-        # loop.set_postfix(recon_loss = f"{recon_loss:.4f}")
+        #     epoch_loss_sum = torch.zeros((), device=device)
+        #     epoch_step_count = 0
+
+        if i % eval_every == 0 or i == max_steps - 1:
+            step_error = inr_error(eval_dl, model, cluster_mean, cluster_scale)
+            if step_error < best_error:
+                best_error = step_error
+                best_step = i
+                best_state_dict = copy.deepcopy(model.state_dict())
 
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
@@ -395,11 +411,10 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
     torch.cuda.synchronize()
     end = time.time()
 
-    # One true L2 evaluation on the best-proxy model — this is the value that
-    # feeds cross-combo selection and downstream reporting.
-    error = inr_error(dl, model, cluster_mean, cluster_scale)
+    # Sanity check: should match best_error exactly (same state, same eval path).
+    error = inr_error(eval_dl, model, cluster_mean, cluster_scale)
     if best_state_dict is not None:
-        tqdm.tqdm.write(f"  [inr] best_proxy={best_proxy:.6f}  best_error={error:.6f}  at step {best_step}/{max_steps - 1}")
+        tqdm.tqdm.write(f"  [inr] best_error={best_error:.6f}  final_error={error:.6f}  at step {best_step}/{max_steps - 1}")
 
     result = {
         "surface_type": "inr",
@@ -415,6 +430,142 @@ def fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean, c
 
     return result
 
+def polish_inr(model, X, uv_points, uv_bb_min, uv_bb_max,
+               cluster_scale, device,
+               is_u_closed, is_v_closed,
+               polish_steps,
+               polish_lr,
+               reg_peak=0.5,
+               uv_margin=0.1,
+               alpha=10.0,
+               N_ext=256,
+               reg_grid=101,
+               seed=None):
+    polish_t0 = time.time()
+    np_rng = np.random.default_rng(seed)
+
+    for p in model.encoder.parameters():
+        p.requires_grad = False
+    model.encoder.eval()
+    model.decoder.eval()
+    optimizer = torch.optim.Adam(model.decoder.parameters(), lr=polish_lr)
+
+    uv_length = uv_bb_max - uv_bb_min
+    outer_bb_min = (uv_bb_min - uv_margin * uv_length).astype(np.float64)
+    outer_bb_max = (uv_bb_max + uv_margin * uv_length).astype(np.float64)
+    if is_u_closed:
+        outer_bb_min[0] = max(outer_bb_min[0], -1.0)
+        outer_bb_max[0] = min(outer_bb_max[0], 1.0)
+    if is_v_closed:
+        outer_bb_min[1] = max(outer_bb_min[1], -1.0)
+        outer_bb_max[1] = min(outer_bb_max[1], 1.0)
+
+    u_edges = np.linspace(outer_bb_min[0], outer_bb_max[0], reg_grid)
+    v_edges = np.linspace(outer_bb_min[1], outer_bb_max[1], reg_grid)
+    u_width = float(u_edges[1] - u_edges[0])
+    v_width = float(v_edges[1] - v_edges[0])
+
+    # Reg-region cells: outside the alpha shape of encoded UVs (covers both margin
+    # shell and interior holes). For closed axes, the alpha shape is unreliable
+    # near the seam — fall back to "outside inner bbox only" on those.
+    use_alpha = (not is_u_closed) and (not is_v_closed)
+    if use_alpha:
+        alpha_mask = alpha_shape_trimming(
+            uv_points, reg_grid, reg_grid, outer_bb_min, outer_bb_max, alpha=alpha
+        )
+        reject_cells = np.argwhere((~alpha_mask).numpy())
+    else:
+        u_centers = (u_edges[:-1] + u_edges[1:]) / 2
+        v_centers = (v_edges[:-1] + v_edges[1:]) / 2
+        uu, vv = np.meshgrid(u_centers, v_centers, indexing="ij")
+        inside_inner = (
+            (uu >= uv_bb_min[0]) & (uu <= uv_bb_max[0]) &
+            (vv >= uv_bb_min[1]) & (vv <= uv_bb_max[1])
+        )
+        reject_cells = np.argwhere(~inside_inner)
+
+    K = len(reject_cells)
+    tqdm.tqdm.write(f"  [polish] reg_cells={K}/{(reg_grid-1)**2}  use_alpha={use_alpha}")
+
+    X_np = X.detach().cpu().numpy()
+    kdtree = cKDTree(X_np)
+    uv_points_t = torch.tensor(uv_points, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        Xhat_pre, _ = model.forward(X)
+        err_before = (torch.linalg.norm(X - Xhat_pre, dim=-1).mean() * cluster_scale).item()
+    tqdm.tqdm.write(f"  [polish] pre: error={err_before:.6f}")
+
+    loop = tqdm.tqdm(range(polish_steps), desc="Polishing INR",
+                     disable=not sys.stderr.isatty())
+    for i in loop:
+        optimizer.zero_grad()
+
+        uv = model.forward_encoder(X)
+        Xhat = model.forward_decoder(uv)
+        recon = inr_recon_loss(X, Xhat).mean()
+
+        if K == 0:
+            reg = torch.zeros((), device=device)
+        else:
+            sel = np_rng.choice(K, size=N_ext, replace=(K < N_ext))
+            cells = reject_cells[sel]
+            u_ext_np = np.stack([
+                u_edges[cells[:, 0]] + np_rng.uniform(0.0, u_width, N_ext),
+                v_edges[cells[:, 1]] + np_rng.uniform(0.0, v_width, N_ext),
+            ], axis=1)
+            u_ext = torch.tensor(u_ext_np, dtype=torch.float32, device=device)
+
+            with torch.no_grad():
+                Xhat_ext_det = model.forward_decoder(u_ext)
+            _, k_idx = kdtree.query(Xhat_ext_det.detach().cpu().numpy(), k=1)
+            u_k = uv_points_t[k_idx]
+
+            u_k_grad = u_k.detach().clone().requires_grad_(True)
+            Xhat_k = model.forward_decoder(u_k_grad)
+            delta = (u_ext - u_k).detach()
+
+            J_delta = torch.zeros_like(Xhat_k)
+            for j in range(3):
+                grad_out = torch.zeros_like(Xhat_k)
+                grad_out[:, j] = 1.0
+                grad_u = torch.autograd.grad(
+                    Xhat_k, u_k_grad,
+                    grad_outputs=grad_out,
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]
+                J_delta[:, j] = (grad_u * delta).sum(dim=-1)
+
+            Xhat_ext = model.forward_decoder(u_ext)
+            residual = Xhat_ext - Xhat_k - J_delta
+            reg = residual.abs().sum(dim=-1).mean()
+
+        reg_weight = reg_peak * (i / max(polish_steps - 1, 1))
+        loss = recon + reg_weight * reg
+
+        recon_item = recon.item()
+        reg_item = float(reg.item()) if isinstance(reg, torch.Tensor) else float(reg)
+        if i % 50 == 0 or i == polish_steps - 1:
+            tqdm.tqdm.write(
+                f"  [polish] step {i:4d}: recon={recon_item:.6f}  "
+                f"reg={reg_item:.6f}  reg_weight={reg_weight:.5f}"
+            )
+
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        Xhat_post, _ = model.forward(X)
+        err_after = (torch.linalg.norm(X - Xhat_post, dim=-1).mean() * cluster_scale).item()
+    polish_time = time.time() - polish_t0
+    tqdm.tqdm.write(
+        f"  [polish] post: error={err_after:.6f} "
+        f"(delta {err_after - err_before:+.6f})  time={polish_time:.2f}s"
+    )
+
+    return err_after
+
 def fit_inr(cluster, network_parameters, device = "cuda:0",
             max_steps = 1000,
             warmup_steps_ratio = 0.05,
@@ -422,6 +573,8 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
             max_memory_mb = 10,
             noise_magnitude_3d = 0.005,
             noise_magnitude_uv = 0.005,
+            polish = False,
+            polish_reg_peak = 0.01,
             seed = 42):
     
     # TODO: Correct??
@@ -510,5 +663,25 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
     best_model["params"]["uv_bb_min"] = uv_bb_min
     best_model["params"]["uv_bb_max"] = uv_bb_max
     best_model["params"]["uv_points"] = uvs
+
+    if polish:
+        polish_steps = max_steps // 2
+        polish_lr = initial_lr * 0.1
+        err_after = polish_inr(
+            model=model,
+            X=cluster,
+            uv_points=uvs,
+            uv_bb_min=uv_bb_min,
+            uv_bb_max=uv_bb_max,
+            cluster_scale=cluster_scale_torch,
+            device=device,
+            is_u_closed=model.is_u_closed,
+            is_v_closed=model.is_v_closed,
+            polish_steps=polish_steps,
+            polish_lr=polish_lr,
+            reg_peak=polish_reg_peak,
+            seed=seed,
+        )
+        best_model["error"] = err_after
 
     return best_model
