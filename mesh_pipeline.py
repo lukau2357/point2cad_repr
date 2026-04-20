@@ -764,7 +764,7 @@ if __name__ == "__main__":
                         help="Model ID (subdirectory under input_dir / output_dir)")
     parser.add_argument("--input_dir", type=str, default="sample_clouds",
                         help="Root directory for input point cloud subdirs")
-    parser.add_argument("--output_dir", type=str, default="output_bfs",
+    parser.add_argument("--output_dir", type=str, default="output_mesh",
                         help="Root directory for saved results")
     parser.add_argument("--part", type=int, default=None,
                         help="Process only this part index (0-based). Default: all parts")

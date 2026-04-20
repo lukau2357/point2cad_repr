@@ -631,7 +631,7 @@ def fit_inr(cluster, network_parameters, device = "cuda:0",
                                            noise_magnitude_3d = noise_magnitude_3d,
                                            noise_magnitude_uv = noise_magnitude_uv)
             fit_time = current_model["metadata"]["fitting_time_seconds"]
-            tqdm.tqdm.write(f"  [inr] u_closed={u}  v_closed={v}  error={current_model['error']:.6f}  time={fit_time:.2f}s")
+            tqdm.tqdm.write(f"  [inr] u_closed={u}  v_closed={v}  best_error={current_model['error']:.6f}  time={fit_time:.2f}s")
             if best_model is None or best_model["error"] > current_model["error"]:
                 best_model = current_model  
     # best_model = fit_inr_single(network_parameters, device, dl, dl_generator, cluster_mean_torch, cluster_scale_torch,
