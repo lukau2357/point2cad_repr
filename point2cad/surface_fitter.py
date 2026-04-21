@@ -364,7 +364,8 @@ def fit_surface(cluster,
                 cone_mesh_kwargs = None,
                 inr_mesh_kwargs = None,
                 radius_inflation = 0.0,
-                angle_inflation_deg = 0.0):
+                angle_inflation_deg = 0.0,
+                classify_only = False):
 
     sphere_fit_kwargs = sphere_fit_kwargs or {}
     cylinder_fit_kwargs = cylinder_fit_kwargs or {}
@@ -396,6 +397,22 @@ def fit_surface(cluster,
     _all_errors = {SURFACE_NAMES[sid]: float(results[sid]["error"])
                    for sid in sorted(PRIMITIVE_FITTERS)}
     simple_min = np.argmin(errors)
+
+    if classify_only:
+        # Mirror the primitive-vs-INR decision at the *invocation* point.
+        # A cluster is "primitive" iff the pipeline would NOT invoke INR for
+        # it — which requires both (a) best primitive below the threshold and
+        # (b) if that best is a cone, cone_special_handling accepting it.
+        if errors[simple_min] < simple_error_threshold:
+            if simple_min == SURFACE_CONE:
+                cone_results = cone_special_handling(
+                    results, errors, simple_error_threshold,
+                    plane_cone_ratio_threshold, cone_theta_tolerance_degrees,
+                )
+                if cone_results == -1:
+                    return "freeform"
+            return "primitive"
+        return "freeform"
 
     # Plane check first — if plane is good enough, use it unconditionally.
     # if errors[SURFACE_PLANE] < simple_error_threshold / 2:

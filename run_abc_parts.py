@@ -17,6 +17,7 @@ import argparse
 import glob
 import json
 import os
+import shutil
 import subprocess
 import time
 
@@ -29,7 +30,7 @@ import tqdm
 #   point2cad orig:             ["python", "-m", "point2cad.main"] + "output_p2cad_orig"
 # OUTPUT_DIR must match the pipeline's own --output_dir default so paths
 # constructed here line up with what the subprocess writes on disk.
-PIPELINE_CMD = ["python", "mesh_pipeline.py"]
+PIPELINE_CMD = ["python", "-u", "mesh_pipeline.py"]
 OUTPUT_DIR = "output_mesh"
 # ---------------------------------------------------------------------------
 
@@ -73,7 +74,14 @@ def run_one_part(model_id, part_idx, input_dir):
         tqdm.tqdm.write(f"[wrapper] {model_id} part {part_idx}: already processed, skipping")
         return
 
-    os.makedirs(part_dir, exist_ok=True)
+    # Clean + recreate part_dir ourselves so the subprocess doesn't have to.
+    # We pass --no_clean_output to the pipeline so it preserves the log files
+    # we are about to open in this directory; otherwise the pipeline's rmtree
+    # unlinks them while our file handles are still open and the logs vanish
+    # when the subprocess exits.
+    if os.path.exists(part_dir):
+        shutil.rmtree(part_dir)
+    os.makedirs(part_dir)
     stdout_log = os.path.join(part_dir, "stdout.log")
     stderr_log = os.path.join(part_dir, "stderr.log")
 
@@ -85,6 +93,7 @@ def run_one_part(model_id, part_idx, input_dir):
         "--input_dir", input_dir,
         "--output_dir", OUTPUT_DIR,
         "--part", str(part_idx),
+        "--no_clean_output",
     ]
     tqdm.tqdm.write(f"[wrapper] {model_id} part {part_idx}: launching {' '.join(cmd)}")
 

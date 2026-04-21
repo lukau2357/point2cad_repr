@@ -13,6 +13,12 @@ def rotation_matrix_a_to_b(A, B):
     """
     cos = np.dot(A, B)
     sin = np.linalg.norm(np.cross(B, A))
+    # Degenerate: A parallel/antiparallel to B -> v, w are zero, division
+    # produces NaN. Identity is correct for A==B; for A==-B it is a 0° (not
+    # 180°) stand-in, harmless here because the only caller (normalize_points)
+    # feeds the result into sign-invariant bbox math.
+    if sin < 1e-12:
+        return np.eye(3, dtype=np.float32)
     u = A
     v = B - np.dot(A, B) * A
     v = v / (np.linalg.norm(v))

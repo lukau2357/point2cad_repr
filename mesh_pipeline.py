@@ -221,10 +221,13 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
         primitive_fit_time = 0.0
         freeform_fit_time = 0.0
     else:
-        if os.path.exists(out_dir):
-            shutil.rmtree(out_dir)
-            print(f"Removed old results: {out_dir}")
-        os.makedirs(out_dir)
+        if not args.no_clean_output:
+            if os.path.exists(out_dir):
+                shutil.rmtree(out_dir)
+                print(f"Removed old results: {out_dir}")
+            os.makedirs(out_dir)
+        else:
+            os.makedirs(out_dir, exist_ok=True)
 
         print(f"\n{'='*60}")
         print(f"Part {part_idx}: {os.path.basename(sample_path)}  →  {out_dir}")
@@ -807,6 +810,11 @@ if __name__ == "__main__":
                              "with Taylor-smoothness regularization over the UV margin / alpha-shape reject region")
     parser.add_argument("--inr_polish_reg_peak", type=float, default=0.01,
                         help="Peak regularization weight at the end of the polish ramp (0 -> reg_peak)")
+    parser.add_argument("--no_clean_output", action="store_true",
+                        help="Skip wiping the per-part output directory at startup. "
+                             "Use when an external invoker (e.g. a wrapper script) "
+                             "has already prepared a clean part_dir and placed files "
+                             "(such as log files) that should be preserved.")
     args = parser.parse_args()
 
     if args.visualize:

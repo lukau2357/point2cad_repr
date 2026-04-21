@@ -11,11 +11,26 @@ from typing import Tuple, Optional, Dict
 
 def fit_plane_numpy(points : np.ndarray):
     start = time.time()
-    
+
     c = points.mean(axis = 0)
     X = points - c
 
-    U, S, Vh = np.linalg.svd(X, full_matrices = False)
+    try:
+        U, S, Vh = np.linalg.svd(X, full_matrices = False)
+    except np.linalg.LinAlgError:
+        end = time.time()
+        return {
+            "surface_type": "plane",
+            "error": float("inf"),
+            "params": {
+                "a": np.array([1.0, 0.0, 0.0]),
+                "d": 0.0,
+            },
+            "metadata": {
+                "fitting_time_seconds": end - start,
+                "svd_converged": False,
+            },
+        }
     # Right eigenspace is 3x3
     # Normal vector of plane spanned by first two eigenvectors is exactly the third, reamining eigenvector!
     a = Vh[-1]
@@ -34,7 +49,7 @@ def fit_plane_numpy(points : np.ndarray):
             "fitting_time_seconds": end - start
         }
     }
-    
+
     return res
 
 def fit_sphere_numpy(points: np.ndarray, rcond : float = 1e-6):
@@ -43,7 +58,22 @@ def fit_sphere_numpy(points: np.ndarray, rcond : float = 1e-6):
     start = time.time()
     A = np.concatenate((2 * points, np.ones((points.shape[0], 1))), axis = 1)
     y = (points ** 2).sum(axis = 1)
-    w, _, rank, _ = np.linalg.lstsq(A, y, rcond = rcond)
+    try:
+        w, _, rank, _ = np.linalg.lstsq(A, y, rcond = rcond)
+    except np.linalg.LinAlgError:
+        end = time.time()
+        return {
+            "surface_type": "sphere",
+            "error": float("inf"),
+            "params": {
+                "center": np.zeros(3),
+                "radius": 0.0,
+            },
+            "metadata": {
+                "fitting_time_seconds": end - start,
+                "lstsq_converged": False,
+            },
+        }
 
     center = w[:3]
     radius = w[3] + (center ** 2).sum()
@@ -177,6 +207,19 @@ def fit_cylinder(data, guess_angles = None):
             best_score = fitted.fun
             best_fit = fitted
 
+    # Powell can return NaN for every start on degenerate clusters
+    # (trace(A_hat @ A) ~ 0). `NaN < inf` is False so best_fit stays None;
+    # return fitness=inf so downstream selection avoids cylinder.
+    if best_fit is None:
+        end = time.time()
+        return (
+            np.array([1.0, 0.0, 0.0]),
+            np.zeros(3),
+            0.0,
+            float("inf"),
+            end - start,
+        )
+
     w = direction(best_fit.x[0], best_fit.x[1])
     end = time.time()
 
@@ -224,13 +267,13 @@ def fit_cylinder_optimized(data, guess_angles = None):
         ])
         
         A_hat = S @ A @ S.T # [3, 3]
-        
+
         trace_AA_hat = np.trace(A_hat @ A)
         u = Y_norm_sq.mean()
-        
+
         weighted_Y = X.T @ Y_norm_sq  # [3,]
         v = A_hat @ weighted_Y / trace_AA_hat # [3,]
-        
+
         residuals = Y_norm_sq - u - 2 * (X @ v)
         
         # Original implementation does not scale residuals by 1 / n.
@@ -284,7 +327,28 @@ def fit_cylinder_optimized(data, guess_angles = None):
         if fitted.fun < best_score:
             best_score = fitted.fun
             best_fit = fitted
-    
+
+    # Powell can return NaN for every start on degenerate clusters
+    # (trace_AA_hat ~ 0). `NaN < inf` is False so best_fit stays None;
+    # return error=inf so downstream selection avoids cylinder.
+    if best_fit is None:
+        end = time.time()
+        return {
+            "surface_type": "cylinder",
+            "error": float("inf"),
+            "params": {
+                "a": np.array([1.0, 0.0, 0.0]),
+                "center": np.zeros(3),
+                "radius": 0.0,
+            },
+            "metadata": {
+                "best_fit": float("inf"),
+                "optimizer_iterations": 0,
+                "fitting_time_seconds": end - start,
+                "optimizer_converged": False,
+            },
+        }
+
     w = direction(best_fit.x[0], best_fit.x[1])
     center = C_vectorized(w, X) + t
     radius = r_vectorized(w, X)
