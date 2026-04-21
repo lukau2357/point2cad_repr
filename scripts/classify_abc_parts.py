@@ -109,7 +109,10 @@ def classify_model(model_id, input_dir, device, np_rng):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap = argparse.ArgumentParser(
+        description=__doc__.splitlines()[1],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     ap.add_argument("--ids_file", required=True,
                     help="Path to a .txt file with one ABC model ID per line")
     ap.add_argument("--input_dir", default="../sample_clouds_abc_parts",

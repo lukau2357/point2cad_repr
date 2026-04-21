@@ -60,7 +60,10 @@ def extract_pc_id(input_name):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description = "Point2CAD reproduction pipeline")
+    parser = argparse.ArgumentParser(
+        description = "Point2CAD reproduction pipeline",
+        formatter_class = argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--input", type = str, required = False, help = "Path to .xyzc input file")
     parser.add_argument("--output_dir", type = str, default = "output", help = "Output directory")
     parser.add_argument("--visualize", action = "store_true", help = "Visualize the results of the algorithm in the output directory")

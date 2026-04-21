@@ -47,7 +47,8 @@ RUN pip install --no-cache-dir \
     tqdm \
     trimesh \
     rtree \
-    h5py
+    h5py \
+    seaborn
 
 # Verify imports
 RUN python -c "from OCC.Core.gp import gp_Pnt; print('OCC OK')"

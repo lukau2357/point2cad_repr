@@ -164,19 +164,20 @@ def cone_special_handling(results, errors, simple_error_threshold, plane_cone_ra
     if ratio(errors[SURFACE_PLANE], errors[SURFACE_CONE]) < plane_cone_ratio_threshold:
         return SURFACE_PLANE
 
-    cone_angle = results[SURFACE_CONE]["params"]["theta"]
-    cone_theta_tolerance_rad = cone_theta_tolerance_degrees * (np.pi / 180)
-
-    # If cone is near a degenerate cone, try the next best simple surface
-    cone_diff_pi2 = abs(cone_angle - np.pi / 2)
-    cone_diff_0 = cone_angle
-    
-    if cone_diff_pi2 < cone_theta_tolerance_rad or cone_diff_0 < cone_theta_tolerance_rad:
-        simple_min = np.argmin(errors[:-1])
-
-        return simple_min if errors[simple_min] < simple_error_threshold else -1
-    
     return SURFACE_CONE
+    # cone_angle = results[SURFACE_CONE]["params"]["theta"]
+    # cone_theta_tolerance_rad = cone_theta_tolerance_degrees * (np.pi / 180)
+
+    # # If cone is near a degenerate cone, try the next best simple surface
+    # cone_diff_pi2 = abs(cone_angle - np.pi / 2)
+    # cone_diff_0 = cone_angle
+    
+    # if cone_diff_pi2 < cone_theta_tolerance_rad or cone_diff_0 < cone_theta_tolerance_rad:
+    #     simple_min = np.argmin(errors[:-1])
+
+    #     return simple_min if errors[simple_min] < simple_error_threshold else -1
+    
+    # return SURFACE_CONE
         
 
 def plane_sphere_arbitration(errors, plane_sphere_ratio_threshold):
@@ -348,9 +349,9 @@ def fit_surface(cluster,
                 device,
                 simple_error_threshold = 8e-3,
                 simple_inr_ratio_threshold = 1.5,
-                plane_cone_ratio_threshold = 1.5,
-                plane_sphere_ratio_threshold = 2.5,
-                cone_theta_tolerance_degrees = 5,
+                plane_cone_ratio_threshold = 2.5,
+                plane_sphere_ratio_threshold = 1.5,
+                cone_theta_tolerance_degrees = 15,
                 freeform_method = "inr",
                 spacing = None,
                 cluster_tree = None,
@@ -498,10 +499,8 @@ def fit_surface(cluster,
             # In that case, use INR.
             if resulting_min == -1:
                 resulting_min = global_min
-            
-            elif resulting_min == SURFACE_PLANE:
-                resulting_min = plane_sphere_arbitration(errors[:-1], plane_sphere_ratio_threshold)
-        elif resulting_min == SURFACE_PLANE or resulting_min == SURFACE_SPHERE:
+
+        if resulting_min == SURFACE_SPHERE:
             resulting_min = plane_sphere_arbitration(errors[:-1], plane_sphere_ratio_threshold)
 
     freeform_fit_time = time.perf_counter() - _t_freeform

@@ -10,9 +10,42 @@ import time
 
 import numpy as np
 import open3d as o3d
+import torch
 import trimesh
 
 from point2cad.evaluation import compute_part_metrics
+
+
+def _save_fitted_surface(out_dir, cid, surface_id, result):
+    """Serialize a fitted surface so brep_pipeline can skip refitting.
+    Primitives -> surface_params_{cid}.npz ; INR -> surface_inr_{cid}.pt.
+    bpa / bpa_bspline skipped: the fitted mesh in surface_mesh_{cid}.npz
+    is the entire representation — no parametric form to serialize.
+    """
+    stype = result.get("surface_type")
+    if stype in ("bpa", "bpa_bspline"):
+        return
+    if stype == "inr":
+        model = result["params"]["model"]
+        payload = {
+            "surface_id": int(surface_id),
+            "error": float(result["error"]),
+            "network_parameters": result["params"]["network_parameters"],
+            "is_u_closed": bool(model.is_u_closed),
+            "is_v_closed": bool(model.is_v_closed),
+            "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "cluster_mean": np.asarray(result["params"]["cluster_mean"]),
+            "cluster_scale": float(result["params"]["cluster_scale"]),
+            "uv_bb_min": np.asarray(result["params"]["uv_bb_min"]),
+            "uv_bb_max": np.asarray(result["params"]["uv_bb_max"]),
+        }
+        torch.save(payload, os.path.join(out_dir, f"surface_inr_{cid}.pt"))
+        return
+    # plane / sphere / cylinder / cone
+    payload = {k: np.asarray(v) for k, v in result["params"].items()}
+    payload["surface_id"] = np.int32(surface_id)
+    payload["error"] = np.float64(result["error"])
+    np.savez(os.path.join(out_dir, f"surface_params_{cid}.npz"), **payload)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +359,7 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
             tris  = np.asarray(res["mesh"].triangles)
             np.savez(os.path.join(out_dir, f"surface_mesh_{cid}.npz"),
                      vertices=verts, triangles=tris)
+            _save_fitted_surface(out_dir, int(cid), sid, res["result"])
         fit_time = time.perf_counter() - t_fit
 
     t_clip = time.perf_counter()
@@ -421,6 +455,11 @@ def _run_compute_part(args, sample_path, part_idx, normalize_points, DEVICE):
              surface_names=np.array(surface_type_names),
              clip_method=args.clip_method,
              norm_mean=part_mean, norm_R=part_R, norm_scale=part_scale)
+
+    types_map = {int(unique_clusters[i]): surface_type_names[i]
+                 for i in range(len(unique_clusters))}
+    with open(os.path.join(out_dir, "surface_types.json"), "w") as _f:
+        json.dump(types_map, _f, indent=2)
 
     print(f"[mesh] Saved to {out_dir}/")
 
