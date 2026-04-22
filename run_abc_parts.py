@@ -9,32 +9,23 @@ that model internally and does its own unified/ merge.  Stdout and stderr
 of each subprocess are captured to per-model log files under `{OUTPUT_DIR}/
 {model_id}/stdout.log` and `stderr.log`.
 
-Skip rule on re-run (a model is "done" iff both hold):
-  (1) `{OUTPUT_DIR}/{model_id}/unified/.merge_ok` exists — written by THIS
-      wrapper after observing rc=0 from the subprocess.
-  (2) every part file `{input_dir}/{model_id}/*.xyzc` has a corresponding
-      `{OUTPUT_DIR}/{model_id}/part_N/wrapper_status.json` — written by the
-      pipeline (guarded by `--write_part_status`).
+Skip rule: main scans OUTPUT_DIR up front and collects the set of model IDs
+whose every expected part has a `wrapper_status.json` with status == 'ok'.
+Those IDs are subtracted from the input ID lists; the set difference is
+what actually runs.  Any model with a missing or non-ok part — whether
+interrupted, OOM'd, or hit a deterministic pipeline bug — is absent from
+the done set by construction and falls into the to-process set, where it
+is rmtree'd and re-run from scratch.
 
-If either is missing the whole model is redone from scratch: the entire
-`{model_id}/` tree is rmtree'd, then the pipeline is re-invoked.  This
-handles the 'pipeline interrupted mid-merge' case cleanly: marker is
-absent, model is re-run.  Cost: we redo parts that previously succeeded.
-Benefit: no partial-merge ambiguity, no model-level orchestration state.
-
-Interrupt semantics:
-- The pipeline wraps `_run_compute_part` in `try/except Exception`.  SIGINT
-  -> KeyboardInterrupt, which is NOT a subclass of Exception, so KI
-  propagates; no status file is written for the in-flight part.  On re-run
-  the model will be redone (marker missing) and that part is re-attempted.
-- A deterministic pipeline bug on one part writes `status=failed`, the
-  other parts in the same model still run, merge runs over the successful
-  parts, and the wrapper writes `.merge_ok` — the model is considered
-  'done with some failed parts' and is not re-attempted.
+Interrupt semantics: SIGINT -> KeyboardInterrupt propagates out of
+subprocess.run (Popen's context manager kills the child and re-raises).
+The in-flight part's status file is never written, so the model falls out
+of the done set on the next invocation and gets re-run.
 """
 
 import argparse
 import glob
+import json
 import os
 import shutil
 import subprocess
@@ -71,47 +62,52 @@ def part_indices_for(model_id, input_dir):
     return sorted(int(os.path.splitext(os.path.basename(p))[0]) for p in paths)
 
 
-def model_is_done(model_id, input_dir):
-    """True iff the prior run finished AND its merge committed.  Specifically:
-    (1) unified/.merge_ok is present (wrapper-written on rc=0), and
-    (2) every input part has its own wrapper_status.json (pipeline-written).
-    """
-    model_dir = os.path.join(OUTPUT_DIR, model_id)
-    if not os.path.isfile(os.path.join(model_dir, "unified", ".merge_ok")):
-        return False
-    for pi in part_indices_for(model_id, input_dir):
-        if not os.path.isfile(os.path.join(model_dir, f"part_{pi}",
-                                           "wrapper_status.json")):
-            return False
-    return True
-
-
-def _atomic_touch(path):
-    """Create an empty file at `path` atomically via tmp + os.replace."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        pass
-    os.replace(tmp, path)
+def _read_completed_ids(output_dir, input_dir):
+    """Set of model IDs whose every expected part has a wrapper_status.json
+    with status == 'ok'.  Cross-references input_dir so a model is only
+    counted as done if *all* its input parts are represented on disk — not
+    just the ones the pipeline managed to finish before crashing."""
+    done = set()
+    if not os.path.isdir(output_dir):
+        return done
+    for mid in os.listdir(output_dir):
+        mdir = os.path.join(output_dir, mid)
+        if not os.path.isdir(mdir):
+            continue
+        indices = part_indices_for(mid, input_dir)
+        if not indices:
+            continue
+        all_ok = True
+        for pi in indices:
+            wp = os.path.join(mdir, f"part_{pi}", "wrapper_status.json")
+            if not os.path.isfile(wp):
+                all_ok = False
+                break
+            try:
+                with open(wp) as f:
+                    if json.load(f).get("status") != "ok":
+                        all_ok = False
+                        break
+            except (OSError, json.JSONDecodeError):
+                all_ok = False
+                break
+        if all_ok:
+            done.add(mid)
+    return done
 
 
 def run_one_model(model_id, input_dir):
     """Invoke the pipeline for one model and return an outcome dict for the
     main process to log.  Workers must not call tqdm.tqdm.write — a worker's
-    tqdm state is detached from the main bar, so writes bypass the bar's
+    tqdm state is detached from the main bar and writes bypass the bar's
     output-locking logic and corrupt its line.  All logging is done from
     main() after fut.result().
 
-    Returns: {"outcome": "skipped"|"ok"|"failed",
-              "rc": int|None, "duration_s": float|None}
+    Returns: {"outcome": "ok"|"failed", "rc": int, "duration_s": float}
 
     KI during subprocess.run propagates out of this function (subprocess.run's
-    Popen context kills the child and re-raises).  No .merge_ok is written,
-    so the model is redone from scratch on the next wrapper invocation.
+    Popen context kills the child and re-raises).
     """
-    if model_is_done(model_id, input_dir):
-        return {"outcome": "skipped", "rc": None, "duration_s": None}
-
     model_dir = os.path.join(OUTPUT_DIR, model_id)
     if os.path.exists(model_dir):
         shutil.rmtree(model_dir)
@@ -128,19 +124,12 @@ def run_one_model(model_id, input_dir):
     ]
 
     t0 = time.perf_counter()
-    # `with` on the log handles + subprocess.run guarantees the child is
-    # reaped before we leave this block.  If KI fires inside run(), Popen's
-    # context manager kills the child and re-raises -> we never reach the
-    # marker write below and the `with` blocks still flush+close.
     with open(stdout_log, "w") as out, open(stderr_log, "w") as err:
         proc = subprocess.run(cmd, stdout=out, stderr=err)
     dt = time.perf_counter() - t0
 
-    if proc.returncode == 0:
-        _atomic_touch(os.path.join(model_dir, "unified", ".merge_ok"))
-        return {"outcome": "ok", "rc": 0, "duration_s": dt}
-    else:
-        return {"outcome": "failed", "rc": proc.returncode, "duration_s": dt}
+    outcome = "ok" if proc.returncode == 0 else "failed"
+    return {"outcome": outcome, "rc": proc.returncode, "duration_s": dt}
 
 
 def main():
@@ -167,17 +156,29 @@ def main():
     print(f"[wrapper] primitive: {len(prim_ids)} IDs  freeform: {len(free_ids)} IDs",
           flush=True)
 
+    # Set difference: anything not fully-ok on disk (missing, failed,
+    # OOM'd, interrupted) falls into the to-process set automatically.
+    done = _read_completed_ids(OUTPUT_DIR, args.input_dir)
+    prim_to_run = [m for m in prim_ids if m not in done]
+    free_to_run = [m for m in free_ids if m not in done]
+    n_skipped = (len(prim_ids) - len(prim_to_run)) + (len(free_ids) - len(free_to_run))
+    if n_skipped:
+        print(f"[wrapper] skipping {n_skipped} models already done on disk",
+              flush=True)
+
     total = len(prim_ids) + len(free_ids)
-    bar = tqdm.tqdm(total=total, desc="models", unit="model", dynamic_ncols=True)
-    counts = {"ok": 0, "failed": 0, "skipped": 0}
+    # `initial` pre-seeds the counter without contaminating elapsed time,
+    # so rate / ETA reflect actual processing speed from the first real
+    # completion rather than being skewed by the big-jump pre-update.
+    bar = tqdm.tqdm(total=total, initial=n_skipped, desc="models",
+                    unit="model", dynamic_ncols=True)
+    counts = {"ok": 0, "failed": 0, "skipped": n_skipped}
 
     def _log(mid, result):
         """Run in main only — tqdm.tqdm.write coordinates with bar redraw."""
         outcome = result["outcome"]
         counts[outcome] += 1
-        if outcome == "skipped":
-            msg = f"[wrapper] {mid}: already done, skipping"
-        elif outcome == "ok":
+        if outcome == "ok":
             msg = f"[wrapper] {mid}: ok ({result['duration_s']:.1f}s)"
         else:
             stderr_log = os.path.join(OUTPUT_DIR, mid, "stderr.log")
@@ -190,13 +191,13 @@ def main():
         # workers==1 skips the pool entirely — direct in-process calls.
         # Avoids pickling, subprocess fork for the worker, and as_completed
         # bookkeeping.  Useful as a second-pass retry after an OOM'd parallel
-        # run: failed models have no .merge_ok, so they get redone here with
+        # run: failed models fall out of `done` and get redone here with
         # full memory headroom.
-        if prim_ids:
+        if prim_to_run:
             if args.workers == 1:
-                tqdm.tqdm.write(f"[wrapper] primitive phase: {len(prim_ids)} models "
+                tqdm.tqdm.write(f"[wrapper] primitive phase: {len(prim_to_run)} models "
                                 f"(sequential, no pool)")
-                for mid in prim_ids:
+                for mid in prim_to_run:
                     bar.set_postfix_str(mid, refresh=True)
                     try:
                         result = run_one_model(mid, args.input_dir)
@@ -207,12 +208,12 @@ def main():
                         _log(mid, result)
                     bar.update(1)
             else:
-                tqdm.tqdm.write(f"[wrapper] primitive phase: {len(prim_ids)} models "
+                tqdm.tqdm.write(f"[wrapper] primitive phase: {len(prim_to_run)} models "
                                 f"across {args.workers} worker(s)")
                 with ProcessPoolExecutor(max_workers=args.workers) as ex:
                     try:
                         futs = {ex.submit(run_one_model, mid, args.input_dir): mid
-                                for mid in prim_ids}
+                                for mid in prim_to_run}
                         for fut in as_completed(futs):
                             mid = futs[fut]
                             try:
@@ -230,10 +231,10 @@ def main():
                         raise
 
         # ---- freeform phase: sequential ----------------------------------
-        if free_ids:
-            tqdm.tqdm.write(f"[wrapper] freeform phase: {len(free_ids)} models "
+        if free_to_run:
+            tqdm.tqdm.write(f"[wrapper] freeform phase: {len(free_to_run)} models "
                             f"(sequential)")
-            for mid in free_ids:
+            for mid in free_to_run:
                 bar.set_postfix_str(mid, refresh=True)
                 try:
                     result = run_one_model(mid, args.input_dir)
