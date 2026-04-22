@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import time
+import traceback
 
 import numpy as np
 import open3d as o3d
@@ -14,6 +15,21 @@ import torch
 import trimesh
 
 from point2cad.evaluation import compute_part_metrics
+
+
+def _write_part_status(part_dir, status):
+    """Atomic write of per-part wrapper_status.json.  Only the run_abc_parts
+    wrapper reads this file; direct `python mesh_pipeline.py` invocations
+    default to --write_part_status=False and this is never written.  The
+    payload is intentionally minimal (just 'ok' or 'failed') — failure
+    details live in the wrapper's captured stderr.log, not here.
+    """
+    os.makedirs(part_dir, exist_ok=True)
+    path = os.path.join(part_dir, "wrapper_status.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"status": status}, f)
+    os.replace(tmp, path)
 
 
 def _save_fitted_surface(out_dir, cid, surface_id, result):
@@ -185,17 +201,38 @@ def run_compute(args):
     t_total = time.perf_counter()
     for part_idx in part_indices:
         t_part = time.perf_counter()
-        _run_compute_part(args, xyzc_files[part_idx], part_idx, normalize_points,
-                          DEVICE)
+        out_dir = os.path.join(args.output_dir, args.model_id, f"part_{part_idx}")
+        # try/except Exception — deliberately NOT BaseException — so that
+        # KeyboardInterrupt propagates unhandled and the wrapper never sees a
+        # 'failed' status for an interrupted part.  A real pipeline bug (any
+        # subclass of Exception) is caught, its traceback is printed to
+        # stderr (where the wrapper captures it into stderr.log), the part is
+        # marked 'failed' in its wrapper_status.json if the wrapper asked for
+        # status files, and processing continues to the remaining parts.
+        failed = False
+        try:
+            _run_compute_part(args, xyzc_files[part_idx], part_idx,
+                              normalize_points, DEVICE)
+        except Exception:
+            failed = True
+            print(f"[mesh] part {part_idx} FAILED (see stderr for traceback)",
+                  flush=True)
+            traceback.print_exc()
         dt_part = time.perf_counter() - t_part
         part_times.append((part_idx, dt_part))
         print(f"[timing] part {part_idx}: {dt_part:.2f}s")
-        out_dir = os.path.join(args.output_dir, args.model_id, f"part_{part_idx}")
-        meta_path = os.path.join(out_dir, "metadata.npz")
-        if os.path.exists(meta_path):
-            n = int(np.load(meta_path, allow_pickle=True)["n_clusters"])
-            part_dirs.append((out_dir, cluster_offset, n))
-            cluster_offset += n
+
+        if not failed:
+            meta_path = os.path.join(out_dir, "metadata.npz")
+            if os.path.exists(meta_path):
+                n = int(np.load(meta_path, allow_pickle=True)["n_clusters"])
+                part_dirs.append((out_dir, cluster_offset, n))
+                cluster_offset += n
+            if args.write_part_status:
+                _write_part_status(out_dir, "ok")
+        else:
+            if args.write_part_status:
+                _write_part_status(out_dir, "failed")
 
     if part_dirs:
         unified_dir = os.path.join(args.output_dir, args.model_id, "unified")
@@ -854,6 +891,12 @@ if __name__ == "__main__":
                              "Use when an external invoker (e.g. a wrapper script) "
                              "has already prepared a clean part_dir and placed files "
                              "(such as log files) that should be preserved.")
+    parser.add_argument("--write_part_status", action="store_true",
+                        help="Write per-part wrapper_status.json ('ok' or 'failed') "
+                             "after each _run_compute_part call.  Used by the "
+                             "run_abc_parts.py wrapper for resume bookkeeping. "
+                             "Default off so direct invocations don't litter the "
+                             "output tree with wrapper-only files.")
     args = parser.parse_args()
 
     if args.visualize:
