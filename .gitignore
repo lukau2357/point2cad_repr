@@ -22,3 +22,4 @@ sample_clouds_abc_parts
 output_mesh
 abc_parts_val_splits
 cadrecode_scripts/output
+scripts/aggregator_output/

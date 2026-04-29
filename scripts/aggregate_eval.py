@@ -11,24 +11,26 @@ counted as "ok" on a given side iff either:
     is present.
 Everything else is a failure on that side.
 
-Metric/timing summaries are computed over the **intersection** of successes —
-parts where BOTH sides ran to completion — so the comparison is apples to
-apples. Failure counts are reported separately (mine-only, orig-only, both).
+Every per-split statistic — per-side mean/median/std/CI, paired delta, and
+speedup — is computed on the same paired subset: parts where BOTH sides ran
+to completion AND both emitted a non-None value for the metric/timing in
+question. This guarantees that within a split, `mine`, `orig`, and `paired`
+blocks all reduce over the exact same set of parts per field, so means,
+standard errors, and deltas are directly comparable. Failure counts are
+reported separately at the top level (mine-only, orig-only, both).
 
-Stats per split:
-  metrics (global, primitive_only, has_freeform):
-    per side -> mean, median, std, 95% normal CI
+Stats per split (all / primitive_only / has_freeform):
+  metrics:
+    per side -> mean, median, std, 95% normal CI  (paired subset)
     paired   -> delta = mine - orig, mean+CI, frac_mine_better
   timings (primitive_only, has_freeform only):
     per side -> same as above
-    speedup  -> geomean of orig/mine ratios with normal CI on log-ratios
+    speedup  -> arithmetic mean of orig/mine ratios with normal CI
+                (see note below about geomean plot inconsistency)
 
 Plots (saved under {out_dir}/plots):
-  violin+box  per (metric, split)
-  delta hist  per (metric, split)   — delta = mine - orig
-  paired scat per (metric, split)   — mine on x, orig on y, y=x diagonal
-  timing bar  per split             — fit/clip/total, mean ± CI
-  speedup hist per split            — orig/mine ratios
+  paired scatter per (metric, split)   — mine on x, orig on y, y=x diagonal
+  timing scatter per split             — mine on x, orig on y
 
 Uniform convention: delta = mine - orig everywhere. METRIC_DIRECTION says
 which sign of delta means "mine wins" (used in plot captions + frac calc).
@@ -51,7 +53,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
 
 
 plt.style.use("ggplot")
@@ -261,33 +262,45 @@ def _summarize_values(values):
                 "ci95_lo": None, "ci95_hi": None, "n": 0}
     arr = np.asarray(clean, dtype=np.float64)
     mean, lo, hi = _ci95_normal(arr)
+    std = float(arr.std(ddof=1)) if arr.size >= 2 else 0.0
     return {
         "mean": mean,
         "median": float(np.median(arr)),
-        "std": float(arr.std(ddof=0)),
+        "std": std,
         "ci95_lo": lo,
         "ci95_hi": hi,
         "n": int(arr.size),
     }
 
 
-def summarize(side_dict, keys):
-    """Per-side aggregate over `keys`."""
-    ok_keys = [k for k in keys if k in side_dict and side_dict[k].get("metrics") is not None]
-    agg = {"n_parts": len(ok_keys)}
+def summarize_paired(mine, orig, keys):
+    """Per-split aggregate for BOTH sides, restricted per metric/timing to
+    the paired subset of `keys` where both sides have the value.
+
+    Returns (mine_agg, orig_agg). Within each metric, the two sides are
+    computed on the same key set, so means and standard errors are directly
+    comparable and consistent with the paired-delta block.
+    """
+    mine_agg = {"n_parts": len(keys)}
+    orig_agg = {"n_parts": len(keys)}
     for f in METRIC_FIELDS:
-        agg[f] = _summarize_values(
-            [side_dict[k]["metrics"]["metrics"].get(f) for k in ok_keys]
-        )
+        mv, ov = _collect_paired(mine, orig, keys, f)
+        mine_agg[f] = _summarize_values(mv.tolist())
+        orig_agg[f] = _summarize_values(ov.tolist())
     for f in TIMING_FIELDS:
-        vals = [side_dict[k]["metrics"].get("timing", {}).get(f) for k in ok_keys]
-        clean = [v for v in vals if v is not None]
-        agg["timing_" + f] = {
-            "mean": float(np.mean(clean)) if clean else None,
-            "total": float(np.sum(clean)) if clean else None,
-            "n": len(clean),
+        mv, ov = _collect_paired_timing(mine, orig, keys, f)
+        ml, ol = mv.tolist(), ov.tolist()
+        mine_agg["timing_" + f] = {
+            "mean": float(np.mean(ml)) if ml else None,
+            "total": float(np.sum(ml)) if ml else None,
+            "n": len(ml),
         }
-    return agg
+        orig_agg["timing_" + f] = {
+            "mean": float(np.mean(ol)) if ol else None,
+            "total": float(np.sum(ol)) if ol else None,
+            "n": len(ol),
+        }
+    return mine_agg, orig_agg
 
 
 def _collect_paired(mine, orig, keys, metric_field):
@@ -487,21 +500,6 @@ def print_summary_table(summary):
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
-def _plot_violinbox(mine_vals, orig_vals, metric, split, out_path, direction, labels):
-    if mine_vals.size == 0:
-        return
-    fig, ax = plt.subplots(figsize=(5, 4))
-    values = np.concatenate([mine_vals, orig_vals])
-    side = [_T(labels, "mine")] * len(mine_vals) + [_T(labels, "orig")] * len(orig_vals)
-    sns.violinplot(x=side, y=values, inner="box", ax=ax, cut=0, hue=side, legend=False)
-    ax.set_title(f"{_metric_label(labels, metric)} — {_split_label(labels, split)} "
-                 f"({_direction_label(labels, direction)})")
-    ax.set_ylabel(_metric_label(labels, metric))
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-
-
 def _plot_paired_scatter(mine_vals, orig_vals, metric, split, out_path, direction, labels):
     if mine_vals.size == 0:
         return
@@ -545,14 +543,6 @@ def _plot_timing_paired(mine, orig, keys, split, out_path, labels,
     lo = float(min(mt.min(), ot.min()))
     hi = float(max(mt.max(), ot.max()))
     ax.plot([lo, hi], [lo, hi], "k--", lw=1, label=_T(labels, "label.diagonal"))
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    # ggplot style only draws major gridlines; on a log axis spanning less
-    # than a decade (happens with n=3 freeform times), major ticks can fall
-    # outside the data range and the grid disappears. Force both major and
-    # minor gridlines so the panel always has a visible grid.
-    ax.grid(True, which="both", alpha=0.6)
-    ax.grid(True, which="minor", alpha=0.3)
     ax.set_xlabel(f"{_T(labels, 'mine')}  {_metric_label(labels, timing_field)}  [s]")
     ax.set_ylabel(f"{_T(labels, 'orig')}  {_metric_label(labels, timing_field)}  [s]")
     ax.set_title(
@@ -563,87 +553,6 @@ def _plot_timing_paired(mine, orig, keys, split, out_path, labels,
         fontsize=9,
     )
     ax.set_aspect("equal", adjustable="box")
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-
-
-def _plot_delta_hist(mine_vals, orig_vals, metric, split, out_path, direction, labels):
-    if mine_vals.size == 0:
-        return
-    deltas = mine_vals - orig_vals
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.hist(deltas, bins=30, edgecolor="white")
-    ax.axvline(0, color="k", lw=1)
-    mean, lo, hi = _ci95_normal(deltas)
-    ax.axvline(mean, color="C1", lw=1.2, ls="--",
-               label=_T(labels, "label.mean_delta", mean=mean, lo=lo, hi=hi))
-    if direction == "higher_is_better":
-        frac = float(np.mean(deltas > 0))
-    else:
-        frac = float(np.mean(deltas < 0))
-    ax.set_xlabel(f"{_T(labels, 'axis.delta_prefix')}  ({_metric_label(labels, metric)})")
-    ax.set_ylabel(_T(labels, "axis.count"))
-    ax.set_title(f"{_T(labels, 'title.delta')} — {_metric_label(labels, metric)} "
-                 f"({_direction_label(labels, direction)})\n"
-                 f"{_split_label(labels, split)} · "
-                 f"{_T(labels, 'label.frac_ours', pct=frac)}")
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-
-
-def _plot_timing_bar(mine, orig, keys, split, out_path, labels):
-    means_m, means_o, err_m, err_o = [], [], [], []
-    n_max = 0
-    for f in TIMING_PLOT_FIELDS:
-        mt, ot = _collect_paired_timing(mine, orig, keys, f)
-        if mt.size == 0:
-            means_m.append(0); means_o.append(0)
-            err_m.append(0); err_o.append(0)
-            continue
-        mm, ml, mh = _ci95_normal(mt)
-        oo, ol, oh = _ci95_normal(ot)
-        means_m.append(mm); means_o.append(oo)
-        err_m.append(mh - mm); err_o.append(oh - oo)
-        n_max = max(n_max, mt.size)
-    if n_max == 0:
-        return
-    x = np.arange(len(TIMING_PLOT_FIELDS))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(x - width / 2, means_m, width, yerr=err_m, capsize=3,
-           label=_T(labels, "mine"))
-    ax.bar(x + width / 2, means_o, width, yerr=err_o, capsize=3,
-           label=_T(labels, "orig"))
-    ax.set_xticks(x)
-    ax.set_xticklabels([_metric_label(labels, f) for f in TIMING_PLOT_FIELDS])
-    ax.set_ylabel(_T(labels, "axis.seconds_ci"))
-    ax.set_title(f"{_T(labels, 'title.timings')} — {_split_label(labels, split)}  (n={n_max})")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-
-
-def _plot_speedup_hist(mine, orig, keys, split, out_path, labels, timing_field="total_time"):
-    mt, ot = _collect_paired_timing(mine, orig, keys, timing_field)
-    if mt.size == 0:
-        return
-    ratios = ot / mt
-    log_r = np.log(ratios)
-    m, lo, hi = _ci95_normal(log_r)
-    gm, gm_lo, gm_hi = float(np.exp(m)), float(np.exp(lo)), float(np.exp(hi))
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.hist(ratios, bins=30, edgecolor="white")
-    ax.axvline(1.0, color="k", lw=1, label=_T(labels, "label.parity"))
-    ax.axvline(gm, color="C1", lw=1.2, ls="--",
-               label=_T(labels, "label.geomean", mean=gm, lo=gm_lo, hi=gm_hi))
-    ax.set_xlabel(_T(labels, "axis.speedup"))
-    ax.set_ylabel(_T(labels, "axis.count"))
-    ax.set_title(f"{_T(labels, 'title.speedup')} — {_split_label(labels, split)}  (n={mt.size})")
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
@@ -724,17 +633,15 @@ def main():
         return classify_from_mine(mine.get(k)) or classify_from_mine(orig.get(k))
     class_of = {k: _classify_any(k) for k in all_attempted}
 
-    # Paired (intersection) splits drive plots and paired stats.
+    # Every split is restricted to the paired intersection of successes —
+    # both sides completed that part. Per-metric, further restricted to
+    # pairs where both sides emitted a non-None value (see summarize_paired).
     prim_c, free_c, unk_c = split_keys_by_class(class_of, common_ok)
-    # Per-side splits drive each side's independent summary (n reflects
-    # that side's own success count, not the intersection).
-    prim_m, free_m, unk_m = split_keys_by_class(class_of, mine_ok)
-    prim_o, free_o, unk_o = split_keys_by_class(class_of, orig_ok)
 
     splits_spec = {
-        "all":            {"common": common_ok, "mine": mine_ok, "orig": orig_ok},
-        "primitive_only": {"common": prim_c,    "mine": prim_m,  "orig": prim_o},
-        "has_freeform":   {"common": free_c,    "mine": free_m,  "orig": free_o},
+        "all":            common_ok,
+        "primitive_only": prim_c,
+        "has_freeform":   free_c,
     }
 
     def _paired_block(keys):
@@ -750,15 +657,16 @@ def main():
         return out
 
     splits = {}
-    for name, spec in splits_spec.items():
+    for name, keys in splits_spec.items():
+        mine_agg, orig_agg = summarize_paired(mine, orig, keys)
         entry = {
-            "mine":     summarize(mine, spec["mine"]),
-            "orig":     summarize(orig, spec["orig"]),
-            "paired":   _paired_block(spec["common"]),
-            "n_paired": len(spec["common"]),
+            "mine":     mine_agg,
+            "orig":     orig_agg,
+            "paired":   _paired_block(keys),
+            "n_paired": len(keys),
         }
         if name in ("primitive_only", "has_freeform"):
-            entry["speedup"] = _speedup_block(spec["common"])
+            entry["speedup"] = _speedup_block(keys)
         splits[name] = entry
 
     n_mine_attempted = len(mine_attempted_set)
@@ -808,8 +716,7 @@ def main():
         json.dump(summary, f, indent=2)
 
     write_csv(csv_path, mine, orig, class_of, all_attempted)
-    plot_splits_keys = {name: spec["common"] for name, spec in splits_spec.items()}
-    generate_plots(plots_dir, mine, orig, plot_splits_keys, labels)
+    generate_plots(plots_dir, mine, orig, splits_spec, labels)
 
     print_summary_table(summary)
     print(f"\nWrote {summary_path}")

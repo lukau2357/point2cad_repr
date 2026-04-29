@@ -68,25 +68,21 @@ Per-surface fit quality and label/clipping mismatch. This is the diagnostic metr
 
 ## 3. Symmetric Chamfer distance
 
-$$\text{CD}_{\text{sym}}(P, M) \;=\; \frac{1}{2}\!\left( \frac{1}{|P|}\sum_{p \in P} d(p, M) \;+\; \frac{1}{N}\sum_{i=1}^{N} \min_{p \in P} \|q_i - p\|_2 \right)$$
+$$\text{CD}_{\text{sym}}(P, M) \;=\; \frac{1}{2}\!\left( \frac{1}{|P|}\sum_{p \in P} T(p, M) \;+\; \frac{1}{N}\sum_{i=1}^{N} \min_{p \in P} \|q_i - p\|_2 \right)$$
 
-where $M$ = union of clipped meshes, $\{q_i\}_{i=1}^{N}$ are uniform area-weighted samples from $M$.
+where $M$ = union of clipped meshes, $\{q_i\}_{i=1}^{N}$ are uniform area-weighted samples from $M$, and $T(p, M) = \min_{q \in M}\|p - q\|_2$ is the closed-form **point-to-triangle distance** (§2, "Mathematical foundation"). The two terms are **not** symmetric in computation: the PC→Mesh term queries the continuous mesh via triangle distance (exact), while the Mesh→PC term queries the discrete input cloud via point-to-point KDTree on mesh samples (sampled). They are both L2 Euclidean distances, but measured against different opposing geometries (continuous surface vs. discrete cloud), and so computed with different primitives.
 
 ### Two terms, two computations
 
-**PC → Mesh** (left term): exact, no mesh sampling needed.
+**PC → Mesh** (left term): for each $p \in P$, compute the point-to-triangle distance $T(p, M) = \min_j \min_{q \in T_j}\|p - q\|_2$ — the exact L2 distance from $p$ to the nearest point on the mesh surface, found by projecting $p$ onto each triangle's plane and clamping barycentrics. This is the **same primitive used by the per-cluster residual (§2)** and is computed via `trimesh.proximity.closest_point(M, P)` (AABB-accelerated). The returned distance vector is reused for the PC→Mesh P-coverage threshold (§1a).
 
-$$\frac{1}{|P|}\sum_{p \in P} d(p, M) \quad\text{via}\quad \texttt{trimesh.proximity.closest\_point}$$
+**Mesh → PC** (right term): for each mesh sample $q_i$, find the nearest point of the input cloud via KDTree, returning $\min_{p \in P}\|q_i - p\|_2$. This is a point-to-point Euclidean distance against a *discrete* target — there are no triangles on the $P$ side to query against, so the inner minimum is necessarily a finite-set min over $P$, and the outer average is a Monte Carlo estimate over samples of $M$ rather than an exact integral. Computed via `scipy.spatial.cKDTree(P).query(samples, k=1)` (default $p = 2$ → L2).
 
-This direction is closed-form because point-to-triangle distance has a closed form (see below). `trimesh` accelerates the per-triangle search with an AABB tree and returns Euclidean distances directly — the same distance vector is reused for the PC→Mesh P-coverage threshold (§1a).
+The Mesh→PC term is the Monte Carlo approximation of the surface integral
 
-**Mesh → PC** (right term): Monte Carlo approximation of the surface integral.
+$$\frac{1}{\text{Area}(M)} \int_M \min_{p \in P} \|q - p\|_2 \, dq \;\approx\; \frac{1}{N}\sum_{i=1}^{N} \min_{p \in P} \|q_i - p\|_2,$$
 
-$$\frac{1}{\text{Area}(M)} \int_M \min_{p \in P} \|q - p\|_2 \, dq \;\approx\; \frac{1}{N}\sum_{i=1}^{N} \min_{p \in P} \|q_i - p\|_2$$
-
-This integral has no closed form because $\min_{p \in P}\|q - p\|$ is piecewise-defined (Voronoi cells of $P$). Since $P$ is a discrete point set (not a mesh), the inner minimum is a point-to-point distance and is computed via `scipy.spatial.cKDTree(P).query(samples, k=1)` — not a point-to-triangle distance.
-
-The sample set $\{q_i\}$ is drawn by `trimesh.sample.sample_surface_even(M, N)` (Poisson-disk variant, lower variance than plain area-weighted); if the even sampler returns zero samples (can happen on degenerate meshes), the code falls back to `trimesh.sample.sample_surface(M, N)`. The same sample set is reused for the Mesh→PC P-coverage threshold (§1b).
+which has no closed form because $\min_{p \in P}\|q - p\|$ is piecewise-defined (Voronoi cells of $P$). The sample set $\{q_i\}$ is drawn by `trimesh.sample.sample_surface_even(M, N)` (Poisson-disk variant, lower variance than plain area-weighted); if the even sampler returns zero samples (can happen on degenerate meshes), the code falls back to `trimesh.sample.sample_surface(M, N)`. The same sample set is reused for the Mesh→PC P-coverage threshold (§1b).
 
 ### Sample count
 
