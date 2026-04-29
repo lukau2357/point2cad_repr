@@ -220,3 +220,17 @@ Notes for today's meeting:
     - 40060 (primitives only)
 
   https://grabcad.com/library/engine-by-inventor-1
+
+Tomorrow's meeting:
+- At the time of release, point2cad does claim state of the art, however their evaluation methodology is questionable, it is not even 
+  reproducible. Point2CAD is not directly comparable with CADRecode, because the result of a CAD query is a CADQuery model (convertable)
+  to a STEP file, and the result of Point2CAD is a mesh. We would require generating a mesh from the STEP file, but in my opinion
+  the point of the article is improving Point2CAD and showcasing that CADQuery is unstable for models for which the sequence of sketch/extrude
+  operations is missing. Point2CAD does compare itself to ComplexGen and ParseNet, but again I think incorporating these models in a paper
+  is pointless, since the main higlight is improving Point2CAD, and original Point2CAD already outperforms these models, at least judging
+  purely by their written paper. 
+
+- Models like SolidGen/BrepGen might sound promising in the name, but they are UNCONDITIONAL CAD model generation algorithms, so
+  puirely generative models, not conditionable on an input point cloud.
+
+- ComplexGen remains the most comprehensive paper, but is still outperformed my Point2CAD on mesh generation.

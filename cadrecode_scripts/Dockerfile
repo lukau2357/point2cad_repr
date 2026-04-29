@@ -13,7 +13,7 @@ RUN git clone https://github.com/isl-org/Open3D.git \
              -DUSE_SYSTEM_GLEW=OFF \
              -DUSE_SYSTEM_GLFW=OFF \
              .. \
-    && make -j8 \
+    && make -j2 \
     && make install-pip-package
 
 RUN pip install --no-deps \

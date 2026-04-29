@@ -238,4 +238,16 @@ python abc_preprocess.py --abc_dir ../../abc_dataset --model_id 00000077 --outpu
 # Most useful command
 docker run --rm -it --gpus all -v $(pwd):/work -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix point2cad_occt bash 
 docker run --rm -it --gpus all -v $(pwd):/work -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix point2cad-libigl bash
+docker run --rm -it --gpus all -v $(pwd):/work -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix cadrecode bash
+```
+
+Copy abc_dataset to SSD command:
+```
+# Dry run
+rsync -rt --dry-run --stats --human-readable ~/Desktop/abc_dataset/ /media/lukau/3448-A5CE/abc_dataset/
+
+# -r is recursive, -t preserves file modification times
+
+# Real copy
+rsync -rt --info=progress2 --partial --human-readable ~/Desktop/abc_dataset/ /media/lukau/3448-A5CE/abc_dataset/
 ```
